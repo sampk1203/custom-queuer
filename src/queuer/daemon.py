@@ -179,7 +179,7 @@ class Daemon:
                     remaining = MAX_LOG_BYTES - written
                     if remaining > 0:
                         f.write(chunk[:remaining])
-                    f.write(b"\n[queuer] log truncated at 50MB\n")
+                    f.write(f"\n[queuer] log truncated at {MAX_LOG_BYTES} bytes\n".encode())
                     truncated = True
                     written = MAX_LOG_BYTES
                 else:
@@ -311,6 +311,8 @@ class Daemon:
         try:
             line = await reader.readline()
             if not line:
+                writer.close()
+                await writer.wait_closed()
                 return
             req = json.loads(line.decode())
             resp = await self.handle_request(req)

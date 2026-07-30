@@ -39,6 +39,12 @@ def resolve_command(argv: list[str], cwd: str) -> list[str]:
 
 
 def _resolve_token(token: str, cwd: str, *, is_argv0: bool) -> str:
+    if token == "":
+        # Path(cwd) / "" == Path(cwd), which always exists -- without this
+        # guard an empty argument would get silently rewritten to the cwd's
+        # own absolute path by the "bare existing file" branch below.
+        return token
+
     # Explicit path (contains a separator) -> make absolute relative to cwd,
     # regardless of whether it currently exists. Uses abspath (not resolve())
     # deliberately: resolve() follows symlinks to their real target, which

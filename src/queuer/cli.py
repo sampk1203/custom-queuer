@@ -74,7 +74,14 @@ def add(
         None, "--timeout", help="Kill the job if it runs longer than this many seconds"
     ),
 ) -> None:
-    """Enqueue a job."""
+    """Enqueue a job.
+
+    Examples:
+      queuer add -- python train.py --epochs 5
+      queuer add --timeout 60 -- ./run.sh
+      queuer add --after 12 -- python eval.py
+      queuer add --before 12 -- python setup.py
+    """
     data = _call(
         "add",
         argv=cmd,
@@ -95,7 +102,13 @@ def list_jobs(
     full: bool = typer.Option(False, "--full", help="Show resolved absolute paths instead of what you typed"),
     as_json: bool = typer.Option(False, "--json", help="Print raw JSON instead of a table"),
 ) -> None:
-    """Show the currently running job, the queue, and the last 10 finished jobs."""
+    """Show the currently running job, the queue, and the last 10 finished jobs.
+
+    Examples:
+      queuer list
+      queuer list --full
+      queuer list --json
+    """
     data = _call("list")
 
     if as_json:
@@ -106,17 +119,19 @@ def list_jobs(
         console.print("[yellow]daemon is paused -- new jobs will not start[/yellow]\n")
 
     running = data["running"]
-    if running:
-        console.print(f"[bold green]Running:[/bold green] #{running['id']}  {_cmd_str(running, full)}")
-    else:
-        console.print("[dim]Running: (idle)[/dim]")
 
-    queue_table = Table(title="Queued", show_lines=False)
+    queue_table = Table(show_lines=False)
     queue_table.add_column("ID", justify="right")
     queue_table.add_column("Command")
+    if running:
+        queue_table.add_row(str(running["id"]), f"* {_cmd_str(running, full)}", style="bold green")
     for job in data["queue"]:
         queue_table.add_row(str(job["id"]), _cmd_str(job, full))
-    console.print(queue_table)
+
+    if running or data["queue"]:
+        console.print(queue_table)
+    else:
+        console.print("[dim](idle -- nothing running or queued)[/dim]")
 
     backlog_table = Table(title="Recent (last 10)", show_lines=False)
     backlog_table.add_column("ID", justify="right")
@@ -142,7 +157,12 @@ def list_jobs(
 
 @app.command()
 def status(as_json: bool = typer.Option(False, "--json")) -> None:
-    """Show only the currently running job."""
+    """Show only the currently running job.
+
+    Examples:
+      queuer status
+      queuer status --json
+    """
     data = _call("status")
     if as_json:
         console.print_json(json.dumps(data))
@@ -163,7 +183,12 @@ def status(as_json: bool = typer.Option(False, "--json")) -> None:
 
 @app.command()
 def show(job_id: int, as_json: bool = typer.Option(False, "--json")) -> None:
-    """Show full detail for one job: raw+resolved command, cwd, timestamps, exit code."""
+    """Show full detail for one job: raw+resolved command, cwd, timestamps, exit code.
+
+    Examples:
+      queuer show 12
+      queuer show 12 --json
+    """
     job = _call("show", id=job_id)
     if as_json:
         console.print_json(json.dumps(job))
@@ -193,35 +218,55 @@ def show(job_id: int, as_json: bool = typer.Option(False, "--json")) -> None:
 
 @app.command()
 def cancel() -> None:
-    """Kill the currently running job."""
+    """Kill the currently running job.
+
+    Example:
+      queuer cancel
+    """
     data = _call("cancel")
     console.print(f"Cancelled job [bold]{data['cancelled']}[/bold]")
 
 
 @app.command()
 def rm(job_id: int) -> None:
-    """Remove a job from the queue. Fails if it's currently running -- use cancel for that."""
+    """Remove a job from the queue. Fails if it's currently running -- use cancel for that.
+
+    Example:
+      queuer rm 12
+    """
     _call("rm", id=job_id)
     console.print(f"Removed job [bold]{job_id}[/bold]")
 
 
 @app.command()
 def requeue(job_id: int) -> None:
-    """Re-enqueue a finished job with its original command, cwd, and timeout."""
+    """Re-enqueue a finished job with its original command, cwd, and timeout.
+
+    Example:
+      queuer requeue 12
+    """
     data = _call("requeue", id=job_id)
     console.print(f"Requeued job {job_id} as new job [bold]{data['id']}[/bold]")
 
 
 @app.command()
 def pause() -> None:
-    """Stop the daemon from starting new jobs. The current job (if any) keeps running."""
+    """Stop the daemon from starting new jobs. The current job (if any) keeps running.
+
+    Example:
+      queuer pause
+    """
     _call("pause")
     console.print("[yellow]Paused[/yellow] -- new jobs will not start until you run `queuer resume`")
 
 
 @app.command()
 def resume() -> None:
-    """Resume pulling new jobs from the queue."""
+    """Resume pulling new jobs from the queue.
+
+    Example:
+      queuer resume
+    """
     _call("resume")
     console.print("[green]Resumed[/green]")
 
@@ -235,7 +280,12 @@ def logs(
     job_id: int,
     tail: bool = typer.Option(False, "--tail", help="Follow the log as it grows (Ctrl-C to stop)"),
 ) -> None:
-    """Read a job's log file directly from disk (works even if the daemon isn't running)."""
+    """Read a job's log file directly from disk (works even if the daemon isn't running).
+
+    Examples:
+      queuer logs 12
+      queuer logs 12 --tail
+    """
     log_path = _default_log_dir() / f"{job_id}.log"
     if not log_path.exists():
         typer.echo(f"Error: no log found for job {job_id} at {log_path}", err=True)
