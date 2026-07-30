@@ -3,6 +3,12 @@
 All functions take an open sqlite3.Connection as their first argument so
 they can be unit-tested against a throwaway DB file, and so the daemon can
 manage the connection lifecycle itself (see Phase 2).
+
+Channels: each job belongs to a channel (int, default 1). Queue position,
+the running slot, backlog, and paused state are all scoped per channel --
+channel N's queue never mixes with channel M's. A `channels` registry
+table gets a row the first time a job lands on that channel, so a channel
+"exists" (shows up in list_channels()) only once it's actually been used.
 """
 
 from __future__ import annotations
@@ -14,10 +20,12 @@ from pathlib import Path
 from typing import Any
 
 DEFAULT_DB_PATH = Path.home() / ".local" / "state" / "queuer" / "queuer.db"
+DEFAULT_CHANNEL = 1
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel       INTEGER NOT NULL DEFAULT 1,
     status        TEXT NOT NULL CHECK (status IN
                     ('queued','running','done','failed','cancelled')),
     position      INTEGER,
@@ -34,6 +42,11 @@ CREATE TABLE IF NOT EXISTS jobs (
     log_path      TEXT NOT NULL,
     note          TEXT,
     timeout_secs  INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS channels (
+    id            INTEGER PRIMARY KEY,
+    first_seen_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS daemon_state (
@@ -65,13 +78,34 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Queue ordering helpers
+# Channel registry
 # ---------------------------------------------------------------------------
 
 
-def _queued_ids_ordered(conn: sqlite3.Connection) -> list[int]:
+def register_channel(conn: sqlite3.Connection, channel: int) -> None:
+    """Mark a channel as seen. No-op if already registered."""
+    conn.execute(
+        "INSERT OR IGNORE INTO channels (id, first_seen_at) VALUES (?, ?)",
+        (channel, _now()),
+    )
+    conn.commit()
+
+
+def list_channels(conn: sqlite3.Connection) -> list[int]:
+    """Channels that have had at least one job enqueued, ascending."""
+    rows = conn.execute("SELECT id FROM channels ORDER BY id ASC").fetchall()
+    return [r["id"] for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Queue ordering helpers (scoped per channel)
+# ---------------------------------------------------------------------------
+
+
+def _queued_ids_ordered(conn: sqlite3.Connection, channel: int) -> list[int]:
     rows = conn.execute(
-        "SELECT id FROM jobs WHERE status = 'queued' ORDER BY position ASC"
+        "SELECT id FROM jobs WHERE status = 'queued' AND channel = ? ORDER BY position ASC",
+        (channel,),
     ).fetchall()
     return [r["id"] for r in rows]
 
@@ -95,28 +129,34 @@ def enqueue(
     resolved_cmd: list[str],
     cwd: str,
     log_path: str,
+    channel: int = DEFAULT_CHANNEL,
     env_extra: dict[str, str] | None = None,
     timeout_secs: int | None = None,
     before: int | None = None,
     after: int | None = None,
 ) -> int:
-    """Insert a new queued job. Returns the new job's id.
+    """Insert a new queued job on `channel`. Returns the new job's id.
 
     With neither `before` nor `after`, the job is appended to the end of
-    the queue. `before`/`after` are mutually exclusive and must reference
-    an id that is currently queued.
+    that channel's queue. `before`/`after` are mutually exclusive and must
+    reference an id currently queued on the *same* channel -- a stale id
+    or one from a different channel is rejected the same way (ValueError:
+    not currently queued).
     """
     if before is not None and after is not None:
         raise ValueError("before and after are mutually exclusive")
 
+    register_channel(conn, channel)
+
     cur = conn.execute(
         """
         INSERT INTO jobs
-            (status, position, raw_cmd, resolved_cmd, cwd, env_extra,
+            (channel, status, position, raw_cmd, resolved_cmd, cwd, env_extra,
              enqueued_at, log_path, timeout_secs)
-        VALUES ('queued', NULL, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, 'queued', NULL, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
+            channel,
             json.dumps(raw_cmd),
             json.dumps(resolved_cmd),
             cwd,
@@ -128,16 +168,16 @@ def enqueue(
     )
     new_id = cur.lastrowid
 
-    existing = [i for i in _queued_ids_ordered(conn) if i != new_id]
+    existing = [i for i in _queued_ids_ordered(conn, channel) if i != new_id]
 
     if before is not None:
         if before not in existing:
-            raise ValueError(f"job {before} is not currently queued")
+            raise ValueError(f"job {before} is not currently queued on channel {channel}")
         idx = existing.index(before)
         existing.insert(idx, new_id)
     elif after is not None:
         if after not in existing:
-            raise ValueError(f"job {after} is not currently queued")
+            raise ValueError(f"job {after} is not currently queued on channel {channel}")
         idx = existing.index(after)
         existing.insert(idx + 1, new_id)
     else:
@@ -148,27 +188,32 @@ def enqueue(
     return new_id
 
 
-def get_queue(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+def get_queue(conn: sqlite3.Connection, channel: int = DEFAULT_CHANNEL) -> list[dict[str, Any]]:
     rows = conn.execute(
-        "SELECT * FROM jobs WHERE status = 'queued' ORDER BY position ASC"
+        "SELECT * FROM jobs WHERE status = 'queued' AND channel = ? ORDER BY position ASC",
+        (channel,),
     ).fetchall()
     return [_row_to_dict(r) for r in rows]
 
 
-def get_running(conn: sqlite3.Connection) -> dict[str, Any] | None:
-    row = conn.execute("SELECT * FROM jobs WHERE status = 'running' LIMIT 1").fetchone()
+def get_running(conn: sqlite3.Connection, channel: int = DEFAULT_CHANNEL) -> dict[str, Any] | None:
+    row = conn.execute(
+        "SELECT * FROM jobs WHERE status = 'running' AND channel = ? LIMIT 1", (channel,)
+    ).fetchone()
     return _row_to_dict(row) if row else None
 
 
-def get_backlog(conn: sqlite3.Connection, limit: int = 10) -> list[dict[str, Any]]:
+def get_backlog(
+    conn: sqlite3.Connection, channel: int = DEFAULT_CHANNEL, limit: int = 10
+) -> list[dict[str, Any]]:
     rows = conn.execute(
         """
         SELECT * FROM jobs
-        WHERE status IN ('done', 'failed', 'cancelled')
+        WHERE status IN ('done', 'failed', 'cancelled') AND channel = ?
         ORDER BY finished_at DESC
         LIMIT ?
         """,
-        (limit,),
+        (channel, limit),
     ).fetchall()
     return [_row_to_dict(r) for r in rows]
 
@@ -190,7 +235,7 @@ def mark_running(conn: sqlite3.Connection, job_id: int, pid: int, pgid: int) -> 
         """,
         (pid, pgid, _now(), job_id),
     )
-    remaining = [i for i in _queued_ids_ordered(conn) if i != job_id]
+    remaining = [i for i in _queued_ids_ordered(conn, job["channel"]) if i != job_id]
     _reindex_queue(conn, remaining)
     conn.commit()
 
@@ -206,6 +251,9 @@ def mark_finished(
 ) -> None:
     if status not in ("done", "failed", "cancelled"):
         raise ValueError(f"invalid terminal status: {status}")
+    job = get_job(conn, job_id)
+    if job is None:
+        raise ValueError(f"job {job_id} does not exist")
     conn.execute(
         """
         UPDATE jobs
@@ -215,18 +263,20 @@ def mark_finished(
         (status, exit_code, note, _now(), job_id),
     )
     conn.commit()
-    _prune_backlog(conn, keep=keep_backlog)
+    _prune_backlog(conn, job["channel"], keep=keep_backlog)
 
 
-def _prune_backlog(conn: sqlite3.Connection, keep: int = 10) -> None:
-    """Delete finished-job DB rows beyond the most recent `keep`. Log files
-    on disk are left untouched — only the row is pruned."""
+def _prune_backlog(conn: sqlite3.Connection, channel: int, keep: int = 10) -> None:
+    """Delete finished-job DB rows beyond the most recent `keep`, scoped to
+    one channel. Log files on disk are left untouched -- only the row is
+    pruned."""
     rows = conn.execute(
         """
         SELECT id FROM jobs
-        WHERE status IN ('done', 'failed', 'cancelled')
+        WHERE status IN ('done', 'failed', 'cancelled') AND channel = ?
         ORDER BY finished_at DESC
-        """
+        """,
+        (channel,),
     ).fetchall()
     stale_ids = [r["id"] for r in rows[keep:]]
     if stale_ids:
@@ -244,7 +294,7 @@ def remove_from_queue(conn: sqlite3.Connection, job_id: int) -> None:
             "use cancel for a running job"
         )
     conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
-    remaining = [i for i in _queued_ids_ordered(conn) if i != job_id]
+    remaining = [i for i in _queued_ids_ordered(conn, job["channel"]) if i != job_id]
     _reindex_queue(conn, remaining)
     conn.commit()
 
@@ -262,7 +312,10 @@ def _reorder(
 ) -> None:
     if job_id == target_id:
         raise ValueError("cannot reorder a job relative to itself")
-    ids = _queued_ids_ordered(conn)
+    job = get_job(conn, job_id)
+    if job is None:
+        raise ValueError(f"job {job_id} does not exist")
+    ids = _queued_ids_ordered(conn, job["channel"])
     if job_id not in ids:
         raise ValueError(f"job {job_id} is not queued")
     if target_id not in ids:
@@ -276,7 +329,8 @@ def _reorder(
 
 def requeue(conn: sqlite3.Connection, job_id: int, *, log_path: str) -> int:
     """Re-enqueue a done/failed/cancelled job with its original argv/cwd/env/
-    timeout, appended to the end of the queue. Returns the new job's id."""
+    timeout/channel, appended to the end of its channel's queue. Returns
+    the new job's id."""
     job = get_job(conn, job_id)
     if job is None:
         raise ValueError(f"job {job_id} does not exist")
@@ -291,27 +345,30 @@ def requeue(conn: sqlite3.Connection, job_id: int, *, log_path: str) -> int:
         resolved_cmd=json.loads(job["resolved_cmd"]),
         cwd=job["cwd"],
         log_path=log_path,
+        channel=job["channel"],
         env_extra=json.loads(job["env_extra"]) if job["env_extra"] else None,
         timeout_secs=job["timeout_secs"],
     )
 
 
 # ---------------------------------------------------------------------------
-# Daemon pause state
+# Daemon pause state (per channel)
 # ---------------------------------------------------------------------------
 
 
-def get_paused(conn: sqlite3.Connection) -> bool:
-    row = conn.execute("SELECT value FROM daemon_state WHERE key = 'paused'").fetchone()
+def get_paused(conn: sqlite3.Connection, channel: int = DEFAULT_CHANNEL) -> bool:
+    row = conn.execute(
+        "SELECT value FROM daemon_state WHERE key = ?", (f"paused:{channel}",)
+    ).fetchone()
     return row is not None and row["value"] == "true"
 
 
-def set_paused(conn: sqlite3.Connection, paused: bool) -> None:
+def set_paused(conn: sqlite3.Connection, paused: bool, channel: int = DEFAULT_CHANNEL) -> None:
     conn.execute(
         """
-        INSERT INTO daemon_state (key, value) VALUES ('paused', ?)
+        INSERT INTO daemon_state (key, value) VALUES (?, ?)
         ON CONFLICT(key) DO UPDATE SET value = excluded.value
         """,
-        ("true" if paused else "false",),
+        (f"paused:{channel}", "true" if paused else "false"),
     )
     conn.commit()

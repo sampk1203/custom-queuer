@@ -15,8 +15,9 @@ from rich.table import Table
 
 from queuer import client
 from queuer.daemon import _default_log_dir
+from queuer.db import DEFAULT_CHANNEL
 
-app = typer.Typer(help="queuer: a serial background job queue")
+app = typer.Typer(help="queuer: a background job queue with parallel channels")
 console = Console()
 
 
@@ -68,8 +69,12 @@ def add(
         ..., help="Command to run. Use -- before it if it has its own flags, "
         "e.g. queuer add --timeout 60 -- python train.py --epochs 5"
     ),
-    before: Optional[int] = typer.Option(None, "--before", help="Insert before this job ID"),
-    after: Optional[int] = typer.Option(None, "--after", help="Insert after this job ID"),
+    channel: int = typer.Option(
+        DEFAULT_CHANNEL, "--channel", help="Channel to queue on. Each channel runs serially; "
+        "different channels run in parallel. Defaults to channel 1."
+    ),
+    before: Optional[int] = typer.Option(None, "--before", help="Insert before this job ID (same channel)"),
+    after: Optional[int] = typer.Option(None, "--after", help="Insert after this job ID (same channel)"),
     timeout: Optional[int] = typer.Option(
         None, "--timeout", help="Kill the job if it runs longer than this many seconds"
     ),
@@ -78,6 +83,7 @@ def add(
 
     Examples:
       queuer add -- python train.py --epochs 5
+      queuer add --channel 2 -- python train.py --epochs 5
       queuer add --timeout 60 -- ./run.sh
       queuer add --after 12 -- python eval.py
       queuer add --before 12 -- python setup.py
@@ -86,49 +92,33 @@ def add(
         "add",
         argv=cmd,
         cwd=os.getcwd(),
+        channel=channel,
         before=before,
         after=after,
         timeout_secs=timeout,
     )
-    console.print(f"Queued as job [bold]{data['id']}[/bold]")
+    console.print(f"Queued as job [bold]{data['id']}[/bold] on channel [bold]{data['channel']}[/bold]")
 
 
 # ---------------------------------------------------------------------------
 # list
 # ---------------------------------------------------------------------------
 
-@app.command(name="list")
-def list_jobs(
-    full: bool = typer.Option(False, "--full", help="Show resolved absolute paths instead of what you typed"),
-    as_json: bool = typer.Option(False, "--json", help="Print raw JSON instead of a table"),
-) -> None:
-    """Show the currently running job, the queue, and the last 10 finished jobs.
+def _render_queue_and_backlog(channel_data: dict[str, Any], full: bool) -> None:
+    if channel_data["paused"]:
+        console.print("[yellow]channel is paused -- new jobs will not start[/yellow]\n")
 
-    Examples:
-      queuer list
-      queuer list --full
-      queuer list --json
-    """
-    data = _call("list")
-
-    if as_json:
-        console.print_json(json.dumps(data))
-        return
-
-    if data["paused"]:
-        console.print("[yellow]daemon is paused -- new jobs will not start[/yellow]\n")
-
-    running = data["running"]
+    running = channel_data["running"]
 
     queue_table = Table(show_lines=False)
     queue_table.add_column("ID", justify="right")
     queue_table.add_column("Command")
     if running:
         queue_table.add_row(str(running["id"]), f"* {_cmd_str(running, full)}", style="bold green")
-    for job in data["queue"]:
+    for job in channel_data["queue"]:
         queue_table.add_row(str(job["id"]), _cmd_str(job, full))
 
-    if running or data["queue"]:
+    if running or channel_data["queue"]:
         console.print(queue_table)
     else:
         console.print("[dim](idle -- nothing running or queued)[/dim]")
@@ -139,7 +129,7 @@ def list_jobs(
     backlog_table.add_column("Command")
     backlog_table.add_column("Duration", justify="right")
     backlog_table.add_column("Exit", justify="right")
-    for job in data["backlog"]:
+    for job in channel_data["backlog"]:
         status_style = {"done": "green", "failed": "red", "cancelled": "yellow"}.get(job["status"], "")
         backlog_table.add_row(
             str(job["id"]),
@@ -151,30 +141,74 @@ def list_jobs(
     console.print(backlog_table)
 
 
+@app.command(name="list")
+def list_jobs(
+    full: bool = typer.Option(False, "--full", help="Show resolved absolute paths instead of what you typed"),
+    as_json: bool = typer.Option(False, "--json", help="Print raw JSON instead of a table"),
+) -> None:
+    """Show every channel's currently running job, queue, and last 10
+    finished jobs, each in its own section. Only channels that have had a
+    job land on them show up here.
+
+    Examples:
+      queuer list
+      queuer list --full
+      queuer list --json
+    """
+    data = _call("list")
+    channels = data["channels"]
+
+    if as_json:
+        console.print_json(json.dumps(data))
+        return
+
+    if not channels:
+        console.print("[dim](no channels -- nothing has ever been queued)[/dim]")
+        return
+
+    for i, channel_id in enumerate(sorted(channels, key=int)):
+        if i > 0:
+            console.print()
+        console.print(f"[bold]channel {channel_id}[/bold]")
+        _render_queue_and_backlog(channels[channel_id], full)
+
+
 # ---------------------------------------------------------------------------
 # status
 # ---------------------------------------------------------------------------
 
 @app.command()
 def status(as_json: bool = typer.Option(False, "--json")) -> None:
-    """Show only the currently running job.
+    """Show only the currently running job, for every channel.
 
     Examples:
       queuer status
       queuer status --json
     """
     data = _call("status")
+    channels = data["channels"]
+
     if as_json:
         console.print_json(json.dumps(data))
         return
-    if data["paused"]:
-        console.print("[yellow]daemon is paused[/yellow]")
-    running = data["running"]
-    if running:
-        console.print(f"[bold green]#{running['id']}[/bold green]  {_cmd_str(running, full=False)}")
-        console.print(f"started: {_fmt_time(running['started_at'])}  running for: {_fmt_duration(running)}")
-    else:
-        console.print("[dim]idle -- no job running[/dim]")
+
+    if not channels:
+        console.print("[dim](no channels -- nothing has ever been queued)[/dim]")
+        return
+
+    for i, channel_id in enumerate(sorted(channels, key=int)):
+        if i > 0:
+            console.print()
+        chan = channels[channel_id]
+        console.print(f"[bold]channel {channel_id}[/bold]")
+        if chan["paused"]:
+            console.print("[yellow]paused[/yellow]")
+        running = chan["running"]
+        if running:
+            console.print(f"[bold green]#{running['id']}[/bold green]  {_cmd_str(running, full=False)}")
+            console.print(f"started: {_fmt_time(running['started_at'])}  running for: {_fmt_duration(running)}")
+        else:
+            console.print("[dim]idle -- no job running[/dim]")
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +229,7 @@ def show(job_id: int, as_json: bool = typer.Option(False, "--json")) -> None:
         return
 
     table = Table(show_header=False, title=f"Job #{job['id']}")
+    table.add_row("channel", str(job["channel"]))
     table.add_row("status", job["status"])
     table.add_row("raw command", " ".join(json.loads(job["raw_cmd"])))
     table.add_row("resolved command", " ".join(json.loads(job["resolved_cmd"])))
@@ -217,14 +252,17 @@ def show(job_id: int, as_json: bool = typer.Option(False, "--json")) -> None:
 # ---------------------------------------------------------------------------
 
 @app.command()
-def cancel() -> None:
-    """Kill the currently running job.
+def cancel(
+    channel: int = typer.Option(DEFAULT_CHANNEL, "--channel", help="Channel whose running job to kill"),
+) -> None:
+    """Kill the currently running job on a channel (default: channel 1).
 
     Example:
       queuer cancel
+      queuer cancel --channel 2
     """
-    data = _call("cancel")
-    console.print(f"Cancelled job [bold]{data['cancelled']}[/bold]")
+    data = _call("cancel", channel=channel)
+    console.print(f"Cancelled job [bold]{data['cancelled']}[/bold] on channel [bold]{data['channel']}[/bold]")
 
 
 @app.command()
@@ -240,7 +278,7 @@ def rm(job_id: int) -> None:
 
 @app.command()
 def requeue(job_id: int) -> None:
-    """Re-enqueue a finished job with its original command, cwd, and timeout.
+    """Re-enqueue a finished job with its original command, cwd, timeout, and channel.
 
     Example:
       queuer requeue 12
@@ -250,25 +288,36 @@ def requeue(job_id: int) -> None:
 
 
 @app.command()
-def pause() -> None:
-    """Stop the daemon from starting new jobs. The current job (if any) keeps running.
+def pause(
+    channel: int = typer.Option(DEFAULT_CHANNEL, "--channel", help="Channel to pause"),
+) -> None:
+    """Stop a channel from starting new jobs (default: channel 1). The
+    channel's current job, if any, keeps running. Other channels are
+    unaffected.
 
     Example:
       queuer pause
+      queuer pause --channel 2
     """
-    _call("pause")
-    console.print("[yellow]Paused[/yellow] -- new jobs will not start until you run `queuer resume`")
+    _call("pause", channel=channel)
+    console.print(
+        f"[yellow]Paused[/yellow] channel {channel} -- new jobs will not start until you run "
+        f"`queuer resume --channel {channel}`"
+    )
 
 
 @app.command()
-def resume() -> None:
-    """Resume pulling new jobs from the queue.
+def resume(
+    channel: int = typer.Option(DEFAULT_CHANNEL, "--channel", help="Channel to resume"),
+) -> None:
+    """Resume pulling new jobs from a channel's queue (default: channel 1).
 
     Example:
       queuer resume
+      queuer resume --channel 2
     """
-    _call("resume")
-    console.print("[green]Resumed[/green]")
+    _call("resume", channel=channel)
+    console.print(f"[green]Resumed[/green] channel {channel}")
 
 
 # ---------------------------------------------------------------------------

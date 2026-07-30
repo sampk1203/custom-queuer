@@ -1,9 +1,15 @@
-"""queuerd: the background daemon that owns the job queue and runs jobs
-one at a time.
+"""queuerd: the background daemon that owns the job queue and runs jobs.
 
-Listens on a Unix domain socket for newline-delimited JSON requests (see
-the plan, section 5, for the protocol). All state mutation happens here --
-the CLI is a thin client that only ever talks to this process.
+Listens on a Unix domain socket for newline-delimited JSON requests. All
+state mutation happens here -- the CLI is a thin client that only ever
+talks to this process.
+
+Channels: each channel is an independent serial queue with its own worker
+loop (own current-job slot, own pause flag, own wake event) -- channels
+run in parallel with each other, jobs within one channel still run one
+at a time. A channel's worker loop is spawned lazily: on daemon startup
+for any channel that already has rows in the DB, and on first `add` to a
+brand-new channel.
 
 Run standalone for manual testing with: `python -m queuer.daemon`
 Normally launched by the systemd --user unit (Phase 4).
@@ -60,10 +66,13 @@ class Daemon:
         self.log_dir = log_dir or _default_log_dir()
         self.conn: sqlite3.Connection | None = None
 
-        self._wake = asyncio.Event()
-        self._current_proc: asyncio.subprocess.Process | None = None
-        self._current_job_id: int | None = None
-        self._cancel_requested = False
+        # all per-channel: each channel gets its own wake event, its own
+        # current-job slot, its own cancel flag, its own worker task.
+        self._wake: dict[int, asyncio.Event] = {}
+        self._current_proc: dict[int, asyncio.subprocess.Process] = {}
+        self._current_job_id: dict[int, int] = {}
+        self._cancel_requested: dict[int, bool] = {}
+        self._worker_tasks: dict[int, asyncio.Task] = {}
 
     # -- setup -----------------------------------------------------------
 
@@ -74,39 +83,51 @@ class Daemon:
     def _recover_on_startup(self) -> None:
         """A row still marked 'running' from a previous daemon instance
         cannot actually still be running -- we just started. Mark it
-        failed rather than silently losing it or re-running it."""
+        failed rather than silently losing it or re-running it. Checked
+        across every channel that has ever been used."""
         assert self.conn is not None
-        running = db.get_running(self.conn)
-        if running is not None:
-            db.mark_finished(
-                self.conn,
-                running["id"],
-                status="failed",
-                note="interrupted by daemon restart",
-            )
+        for channel in db.list_channels(self.conn):
+            running = db.get_running(self.conn, channel)
+            if running is not None:
+                db.mark_finished(
+                    self.conn,
+                    running["id"],
+                    status="failed",
+                    note="interrupted by daemon restart",
+                )
+
+    def _ensure_channel_worker(self, channel: int) -> None:
+        """Lazily spawn a channel's worker loop if it isn't running yet."""
+        if channel in self._worker_tasks:
+            return
+        self._wake[channel] = asyncio.Event()
+        self._cancel_requested[channel] = False
+        self._worker_tasks[channel] = asyncio.create_task(self.worker_loop(channel))
 
     # -- worker loop -------------------------------------------------------
 
-    async def worker_loop(self) -> None:
+    async def worker_loop(self, channel: int) -> None:
         assert self.conn is not None
+        wake = self._wake[channel]
         while True:
-            self._wake.clear()
-            if not db.get_paused(self.conn):
-                queue = db.get_queue(self.conn)
+            wake.clear()
+            if not db.get_paused(self.conn, channel):
+                queue = db.get_queue(self.conn, channel)
                 if queue:
-                    await self._run_job(queue[0])
+                    await self._run_job(channel, queue[0])
                     continue
             # idle: wait for something to wake us (new job, resume, etc.),
             # but also poll periodically as a safety net
             try:
-                await asyncio.wait_for(self._wake.wait(), timeout=1.0)
+                await asyncio.wait_for(wake.wait(), timeout=1.0)
             except asyncio.TimeoutError:
                 pass
 
-    def _wake_worker(self) -> None:
-        self._wake.set()
+    def _wake_worker(self, channel: int) -> None:
+        self._ensure_channel_worker(channel)
+        self._wake[channel].set()
 
-    async def _run_job(self, job: dict[str, Any]) -> None:
+    async def _run_job(self, channel: int, job: dict[str, Any]) -> None:
         assert self.conn is not None
         job_id = job["id"]
         argv = json.loads(job["resolved_cmd"])
@@ -131,9 +152,9 @@ class Daemon:
             return
 
         db.mark_running(self.conn, job_id, pid=proc.pid, pgid=proc.pid)
-        self._current_proc = proc
-        self._current_job_id = job_id
-        self._cancel_requested = False
+        self._current_proc[channel] = proc
+        self._current_job_id[channel] = job_id
+        self._cancel_requested[channel] = False
 
         log_task = asyncio.create_task(self._pump_log(proc, log_path))
         timeout = job["timeout_secs"]
@@ -148,19 +169,19 @@ class Daemon:
             exit_code = await proc.wait()
             await log_task
             db.mark_finished(self.conn, job_id, status="failed", exit_code=exit_code, note="timed out")
-            self._current_proc = None
-            self._current_job_id = None
+            self._current_proc.pop(channel, None)
+            self._current_job_id.pop(channel, None)
             return
 
         await log_task
 
-        if self._cancel_requested:
+        if self._cancel_requested[channel]:
             status = "cancelled"
         else:
             status = "done" if exit_code == 0 else "failed"
         db.mark_finished(self.conn, job_id, status=status, exit_code=exit_code)
-        self._current_proc = None
-        self._current_job_id = None
+        self._current_proc.pop(channel, None)
+        self._current_job_id.pop(channel, None)
 
     async def _pump_log(self, proc: asyncio.subprocess.Process, log_path: Path) -> None:
         """Stream the job's combined stdout/stderr to its log file, capped
@@ -223,6 +244,7 @@ class Daemon:
     async def _cmd_add(self, args: dict[str, Any]) -> dict[str, Any]:
         argv = args["argv"]
         cwd = args["cwd"]
+        channel = args.get("channel") or db.DEFAULT_CHANNEL
         if not argv:
             raise ValueError("empty command")
 
@@ -241,6 +263,7 @@ class Daemon:
             resolved_cmd=resolved,
             cwd=cwd,
             log_path="pending",
+            channel=channel,
             timeout_secs=args.get("timeout_secs"),
             before=args.get("before"),
             after=args.get("after"),
@@ -249,21 +272,30 @@ class Daemon:
         self.conn.execute("UPDATE jobs SET log_path = ? WHERE id = ?", (log_path, job_id))
         self.conn.commit()
 
-        self._wake_worker()
-        return {"id": job_id}
+        self._wake_worker(channel)
+        return {"id": job_id, "channel": channel}
 
     async def _cmd_list(self, args: dict[str, Any]) -> dict[str, Any]:
         assert self.conn is not None
-        return {
-            "running": db.get_running(self.conn),
-            "queue": db.get_queue(self.conn),
-            "backlog": db.get_backlog(self.conn),
-            "paused": db.get_paused(self.conn),
-        }
+        channels: dict[int, dict[str, Any]] = {}
+        for channel in db.list_channels(self.conn):
+            channels[channel] = {
+                "running": db.get_running(self.conn, channel),
+                "queue": db.get_queue(self.conn, channel),
+                "backlog": db.get_backlog(self.conn, channel),
+                "paused": db.get_paused(self.conn, channel),
+            }
+        return {"channels": channels}
 
     async def _cmd_status(self, args: dict[str, Any]) -> dict[str, Any]:
         assert self.conn is not None
-        return {"running": db.get_running(self.conn), "paused": db.get_paused(self.conn)}
+        channels: dict[int, dict[str, Any]] = {}
+        for channel in db.list_channels(self.conn):
+            channels[channel] = {
+                "running": db.get_running(self.conn, channel),
+                "paused": db.get_paused(self.conn, channel),
+            }
+        return {"channels": channels}
 
     async def _cmd_show(self, args: dict[str, Any]) -> dict[str, Any]:
         assert self.conn is not None
@@ -278,12 +310,14 @@ class Daemon:
         return {"removed": args["id"]}
 
     async def _cmd_cancel(self, args: dict[str, Any]) -> dict[str, Any]:
-        if self._current_proc is None or self._current_job_id is None:
-            raise ValueError("no job is currently running")
-        self._cancel_requested = True
-        job_id = self._current_job_id
-        await self._kill_process_group(self._current_proc)
-        return {"cancelled": job_id}
+        channel = args.get("channel") or db.DEFAULT_CHANNEL
+        proc = self._current_proc.get(channel)
+        job_id = self._current_job_id.get(channel)
+        if proc is None or job_id is None:
+            raise ValueError(f"no job is currently running on channel {channel}")
+        self._cancel_requested[channel] = True
+        await self._kill_process_group(proc)
+        return {"cancelled": job_id, "channel": channel}
 
     async def _cmd_requeue(self, args: dict[str, Any]) -> dict[str, Any]:
         assert self.conn is not None
@@ -291,19 +325,23 @@ class Daemon:
         log_path = str(self.log_dir / f"{new_id}.log")
         self.conn.execute("UPDATE jobs SET log_path = ? WHERE id = ?", (log_path, new_id))
         self.conn.commit()
-        self._wake_worker()
+        new_job = db.get_job(self.conn, new_id)
+        assert new_job is not None
+        self._wake_worker(new_job["channel"])
         return {"id": new_id}
 
     async def _cmd_pause(self, args: dict[str, Any]) -> dict[str, Any]:
         assert self.conn is not None
-        db.set_paused(self.conn, True)
-        return {"paused": True}
+        channel = args.get("channel") or db.DEFAULT_CHANNEL
+        db.set_paused(self.conn, True, channel)
+        return {"paused": True, "channel": channel}
 
     async def _cmd_resume(self, args: dict[str, Any]) -> dict[str, Any]:
         assert self.conn is not None
-        db.set_paused(self.conn, False)
-        self._wake_worker()
-        return {"paused": False}
+        channel = args.get("channel") or db.DEFAULT_CHANNEL
+        db.set_paused(self.conn, False, channel)
+        self._wake_worker(channel)
+        return {"paused": False, "channel": channel}
 
     # -- socket server ------------------------------------------------------
 
@@ -336,11 +374,17 @@ class Daemon:
         self.socket_path.parent.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)
 
+        # channel 1 always gets a worker, plus one for every other channel
+        # that already has rows from a previous run.
+        self._ensure_channel_worker(db.DEFAULT_CHANNEL)
+        assert self.conn is not None
+        for channel in db.list_channels(self.conn):
+            self._ensure_channel_worker(channel)
+
         server = await asyncio.start_unix_server(self._handle_client, path=str(self.socket_path))
-        worker_task = asyncio.create_task(self.worker_loop())
 
         async with server:
-            await asyncio.gather(server.serve_forever(), worker_task)
+            await asyncio.gather(server.serve_forever(), *self._worker_tasks.values())
 
 
 def main() -> None:

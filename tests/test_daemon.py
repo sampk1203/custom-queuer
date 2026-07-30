@@ -12,6 +12,7 @@ import asyncio
 import json
 import os
 import signal
+import time
 from pathlib import Path
 
 import pytest
@@ -48,6 +49,13 @@ async def wait_for_status(sock_path: Path, job_id: int, statuses: set[str], time
     raise AssertionError(f"job {job_id} did not reach {statuses} within {timeout}s")
 
 
+def _ch(resp_data: dict, channel: int) -> dict:
+    """`list`/`status` responses key channels by their JSON string form
+    (e.g. "1", "2") since the wire protocol is JSON -- this looks a
+    channel's section up by its int id."""
+    return resp_data["channels"][str(channel)]
+
+
 @pytest_asyncio.fixture
 async def daemon(tmp_path):
     d = Daemon(
@@ -66,9 +74,9 @@ async def daemon(tmp_path):
 
     yield d
 
-    if d._current_proc is not None:
+    for proc in list(d._current_proc.values()):
         try:
-            os.killpg(d._current_proc.pid, signal.SIGKILL)
+            os.killpg(proc.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
 
@@ -120,6 +128,80 @@ async def test_nonzero_exit_marks_failed(daemon):
 
 
 # ---------------------------------------------------------------------------
+# channels: default, explicit, isolation
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_add_defaults_to_channel_one(daemon):
+    resp = await send(daemon.socket_path, "add", argv=["echo", "hi"], cwd=CWD)
+    assert resp["data"]["channel"] == 1
+    job_id = resp["data"]["id"]
+    job = await wait_for_status(daemon.socket_path, job_id, {"done", "failed"})
+    assert job["channel"] == 1
+
+
+@pytest.mark.asyncio
+async def test_add_to_explicit_channel(daemon):
+    resp = await send(daemon.socket_path, "add", argv=["echo", "hi"], cwd=CWD, channel=3)
+    assert resp["data"]["channel"] == 3
+    job_id = resp["data"]["id"]
+    job = await wait_for_status(daemon.socket_path, job_id, {"done", "failed"})
+    assert job["channel"] == 3
+
+
+@pytest.mark.asyncio
+async def test_channel_absent_from_list_until_first_job(daemon):
+    listing = await send(daemon.socket_path, "list")
+    assert listing["data"]["channels"] == {}
+
+    await send(daemon.socket_path, "add", argv=["echo", "hi"], cwd=CWD, channel=2)
+    await asyncio.sleep(0.1)
+
+    listing = await send(daemon.socket_path, "list")
+    assert "2" in listing["data"]["channels"]
+    assert "3" not in listing["data"]["channels"]  # never touched, never appears
+
+
+@pytest.mark.asyncio
+async def test_job_ids_global_across_channels(daemon):
+    a = await send(daemon.socket_path, "add", argv=["echo", "a"], cwd=CWD, channel=1)
+    b = await send(daemon.socket_path, "add", argv=["echo", "b"], cwd=CWD, channel=2)
+    c = await send(daemon.socket_path, "add", argv=["echo", "c"], cwd=CWD, channel=1)
+    assert a["data"]["id"] < b["data"]["id"] < c["data"]["id"]
+
+
+@pytest.mark.asyncio
+async def test_channels_run_in_parallel_not_serially(daemon):
+    # two 1.5s jobs on separate channels, added back to back -- if channels
+    # were still one shared serial queue this would take ~3s; parallel
+    # channels should finish in ~1.5s.
+    start = time.monotonic()
+    r1 = await send(daemon.socket_path, "add", argv=["sleep", "1.5"], cwd=CWD, channel=1)
+    r2 = await send(daemon.socket_path, "add", argv=["sleep", "1.5"], cwd=CWD, channel=2)
+
+    job1 = await wait_for_status(daemon.socket_path, r1["data"]["id"], {"done", "failed"}, timeout=5.0)
+    job2 = await wait_for_status(daemon.socket_path, r2["data"]["id"], {"done", "failed"}, timeout=5.0)
+    elapsed = time.monotonic() - start
+
+    assert job1["status"] == "done"
+    assert job2["status"] == "done"
+    assert elapsed < 2.5  # well under the ~3s a serial run would take
+
+
+@pytest.mark.asyncio
+async def test_channel_is_serial_internally(daemon):
+    # two jobs on the *same* channel must still run one at a time
+    r1 = await send(daemon.socket_path, "add", argv=["sleep", "0.5"], cwd=CWD, channel=1)
+    r2 = await send(daemon.socket_path, "add", argv=["echo", "second"], cwd=CWD, channel=1)
+    await asyncio.sleep(0.1)
+
+    listing = await send(daemon.socket_path, "list")
+    chan = _ch(listing["data"], 1)
+    assert chan["running"]["id"] == r1["data"]["id"]
+    assert [j["id"] for j in chan["queue"]] == [r2["data"]["id"]]
+
+
+# ---------------------------------------------------------------------------
 # list / status / show
 # ---------------------------------------------------------------------------
 
@@ -131,22 +213,50 @@ async def test_list_shows_running_and_queued(daemon):
 
     listing = await send(daemon.socket_path, "list")
     assert listing["ok"]
-    assert listing["data"]["running"]["id"] == r1["data"]["id"]
-    queued_ids = [j["id"] for j in listing["data"]["queue"]]
+    chan = _ch(listing["data"], 1)
+    assert chan["running"]["id"] == r1["data"]["id"]
+    queued_ids = [j["id"] for j in chan["queue"]]
     assert r2["data"]["id"] in queued_ids
 
 
 @pytest.mark.asyncio
-async def test_status_idle_when_nothing_queued(daemon):
+async def test_list_separates_channels(daemon):
+    r1 = await send(daemon.socket_path, "add", argv=["sleep", "1"], cwd=CWD, channel=1)
+    r2 = await send(daemon.socket_path, "add", argv=["sleep", "1"], cwd=CWD, channel=2)
+    await asyncio.sleep(0.2)
+
+    listing = await send(daemon.socket_path, "list")
+    assert _ch(listing["data"], 1)["running"]["id"] == r1["data"]["id"]
+    assert _ch(listing["data"], 2)["running"]["id"] == r2["data"]["id"]
+
+
+@pytest.mark.asyncio
+async def test_status_idle_when_nothing_ever_queued(daemon):
     resp = await send(daemon.socket_path, "status")
     assert resp["ok"]
-    assert resp["data"]["running"] is None
+    assert resp["data"]["channels"] == {}
+
+
+@pytest.mark.asyncio
+async def test_status_shows_per_channel_running(daemon):
+    r1 = await send(daemon.socket_path, "add", argv=["sleep", "1"], cwd=CWD, channel=1)
+    await asyncio.sleep(0.2)
+    resp = await send(daemon.socket_path, "status")
+    assert _ch(resp["data"], 1)["running"]["id"] == r1["data"]["id"]
 
 
 @pytest.mark.asyncio
 async def test_show_unknown_job_errors(daemon):
     resp = await send(daemon.socket_path, "show", id=99999)
     assert resp["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_show_includes_channel(daemon):
+    resp = await send(daemon.socket_path, "add", argv=["echo", "hi"], cwd=CWD, channel=4)
+    job_id = resp["data"]["id"]
+    job = await wait_for_status(daemon.socket_path, job_id, {"done", "failed"})
+    assert job["channel"] == 4
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +283,48 @@ async def test_cancel_when_idle_errors(daemon):
     assert resp["ok"] is False
 
 
+@pytest.mark.asyncio
+async def test_cancel_defaults_to_channel_one(daemon):
+    resp = await send(daemon.socket_path, "add", argv=["sleep", "10"], cwd=CWD, channel=1)
+    job_id = resp["data"]["id"]
+    await asyncio.sleep(0.2)
+
+    cancel_resp = await send(daemon.socket_path, "cancel")  # no channel arg
+    assert cancel_resp["ok"]
+    assert cancel_resp["data"]["cancelled"] == job_id
+
+
+@pytest.mark.asyncio
+async def test_cancel_scoped_to_one_channel_leaves_others_running(daemon):
+    r1 = await send(daemon.socket_path, "add", argv=["sleep", "2"], cwd=CWD, channel=1)
+    r2 = await send(daemon.socket_path, "add", argv=["sleep", "2"], cwd=CWD, channel=2)
+    await asyncio.sleep(0.2)
+
+    cancel_resp = await send(daemon.socket_path, "cancel", channel=2)
+    assert cancel_resp["ok"]
+    assert cancel_resp["data"]["cancelled"] == r2["data"]["id"]
+
+    job2 = await wait_for_status(daemon.socket_path, r2["data"]["id"], {"cancelled", "failed", "done"})
+    assert job2["status"] == "cancelled"
+
+    # channel 1's job was never touched
+    status = await send(daemon.socket_path, "show", id=r1["data"]["id"])
+    assert status["data"]["status"] == "running"
+
+    await send(daemon.socket_path, "cancel", channel=1)  # cleanup
+
+
+@pytest.mark.asyncio
+async def test_cancel_on_channel_with_nothing_running_errors(daemon):
+    await send(daemon.socket_path, "add", argv=["sleep", "2"], cwd=CWD, channel=1)
+    await asyncio.sleep(0.2)
+
+    resp = await send(daemon.socket_path, "cancel", channel=2)  # channel 2 idle
+    assert resp["ok"] is False
+
+    await send(daemon.socket_path, "cancel", channel=1)  # cleanup
+
+
 # ---------------------------------------------------------------------------
 # rm
 # ---------------------------------------------------------------------------
@@ -187,7 +339,7 @@ async def test_rm_queued_job(daemon):
     assert rm_resp["ok"]
 
     listing = await send(daemon.socket_path, "list")
-    ids = [j["id"] for j in listing["data"]["queue"]]
+    ids = [j["id"] for j in _ch(listing["data"], 1)["queue"]]
     assert r2["data"]["id"] not in ids
 
 
@@ -246,6 +398,17 @@ async def test_requeue_nonexistent_job_errors(daemon):
     assert resp["ok"] is False
 
 
+@pytest.mark.asyncio
+async def test_requeue_preserves_channel(daemon):
+    r1 = await send(daemon.socket_path, "add", argv=["echo", "original"], cwd=CWD, channel=3)
+    job_id = r1["data"]["id"]
+    await wait_for_status(daemon.socket_path, job_id, {"done", "failed"})
+
+    rq = await send(daemon.socket_path, "requeue", id=job_id)
+    new_job = await wait_for_status(daemon.socket_path, rq["data"]["id"], {"done", "failed"})
+    assert new_job["channel"] == 3
+
+
 # ---------------------------------------------------------------------------
 # pause / resume
 # ---------------------------------------------------------------------------
@@ -279,13 +442,34 @@ async def test_resume_lets_paused_queue_continue(daemon):
 
 @pytest.mark.asyncio
 async def test_pause_state_survives_within_same_daemon_instance(daemon):
+    await send(daemon.socket_path, "add", argv=["echo", "seed"], cwd=CWD)  # registers channel 1
     await send(daemon.socket_path, "pause")
     status1 = await send(daemon.socket_path, "list")
-    assert status1["data"]["paused"] is True
+    assert _ch(status1["data"], 1)["paused"] is True
 
     await send(daemon.socket_path, "resume")
     status2 = await send(daemon.socket_path, "list")
-    assert status2["data"]["paused"] is False
+    assert _ch(status2["data"], 1)["paused"] is False
+
+
+@pytest.mark.asyncio
+async def test_pause_scoped_to_one_channel(daemon):
+    r1 = await send(daemon.socket_path, "add", argv=["sleep", "0.5"], cwd=CWD, channel=1)
+    await send(daemon.socket_path, "pause", channel=2)
+    r2 = await send(daemon.socket_path, "add", argv=["echo", "held"], cwd=CWD, channel=2)
+
+    # channel 1 unaffected -- runs to completion
+    job1 = await wait_for_status(daemon.socket_path, r1["data"]["id"], {"done", "failed"})
+    assert job1["status"] == "done"
+
+    # channel 2 stays queued -- it's paused
+    await asyncio.sleep(0.3)
+    show2 = await send(daemon.socket_path, "show", id=r2["data"]["id"])
+    assert show2["data"]["status"] == "queued"
+
+    await send(daemon.socket_path, "resume", channel=2)
+    job2 = await wait_for_status(daemon.socket_path, r2["data"]["id"], {"done", "failed"})
+    assert job2["status"] == "done"
 
 
 # ---------------------------------------------------------------------------
@@ -327,7 +511,7 @@ async def test_before_after_ordering(daemon):
     c = await send(daemon.socket_path, "add", argv=["echo", "c"], cwd=CWD, after=a["data"]["id"])
 
     listing = await send(daemon.socket_path, "list")
-    ids = [j["id"] for j in listing["data"]["queue"]]
+    ids = [j["id"] for j in _ch(listing["data"], 1)["queue"]]
     assert ids == [b["data"]["id"], a["data"]["id"], c["data"]["id"]]
 
     await send(daemon.socket_path, "cancel")  # cleanup the blocker
@@ -337,6 +521,17 @@ async def test_before_after_ordering(daemon):
 async def test_before_nonqueued_id_errors(daemon):
     resp = await send(daemon.socket_path, "add", argv=["echo", "x"], cwd=CWD, before=99999)
     assert resp["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_before_id_from_different_channel_errors(daemon):
+    a2 = await send(daemon.socket_path, "add", argv=["sleep", "1"], cwd=CWD, channel=2)
+    resp = await send(
+        daemon.socket_path, "add", argv=["echo", "x"], cwd=CWD, channel=1, before=a2["data"]["id"]
+    )
+    assert resp["ok"] is False
+
+    await send(daemon.socket_path, "cancel", channel=2)  # cleanup
 
 
 # ---------------------------------------------------------------------------
@@ -407,6 +602,76 @@ async def test_startup_recovery_leaves_queued_jobs_untouched(tmp_path):
         job = await wait_for_status(d.socket_path, queued_id, {"done", "failed"})
         assert job["status"] == "done"
         assert job["note"] is None
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_startup_recovery_covers_every_channel(tmp_path):
+    db_path = tmp_path / "queuer.db"
+
+    conn = db_module.connect(db_path)
+    db_module.init_db(conn)
+    job1 = db_module.enqueue(
+        conn, raw_cmd=["sleep", "999"], resolved_cmd=["/bin/sleep", "999"], cwd=CWD,
+        log_path=str(tmp_path / "logs" / "1.log"), channel=1,
+    )
+    db_module.mark_running(conn, job1, pid=999999, pgid=999999)
+    job2 = db_module.enqueue(
+        conn, raw_cmd=["sleep", "999"], resolved_cmd=["/bin/sleep", "999"], cwd=CWD,
+        log_path=str(tmp_path / "logs" / "2.log"), channel=2,
+    )
+    db_module.mark_running(conn, job2, pid=999998, pgid=999998)
+    conn.close()
+
+    d = Daemon(db_path=db_path, socket_path=tmp_path / "queuer.sock", log_dir=tmp_path / "logs")
+    task = asyncio.create_task(d.serve())
+    try:
+        for _ in range(100):
+            if d.socket_path.exists():
+                break
+            await asyncio.sleep(0.02)
+
+        resp1 = await send(d.socket_path, "show", id=job1)
+        resp2 = await send(d.socket_path, "show", id=job2)
+        assert resp1["data"]["status"] == "failed"
+        assert resp1["data"]["note"] == "interrupted by daemon restart"
+        assert resp2["data"]["status"] == "failed"
+        assert resp2["data"]["note"] == "interrupted by daemon restart"
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_startup_spawns_worker_for_preexisting_channel_and_runs_new_jobs(tmp_path):
+    # a channel that only ever appears in the DB (never touched this
+    # daemon instance) must still get a live worker on startup, not just
+    # remain a dead entry in the channels table.
+    db_path = tmp_path / "queuer.db"
+    conn = db_module.connect(db_path)
+    db_module.init_db(conn)
+    db_module.register_channel(conn, 2)  # channel 2 "exists" but is idle
+    conn.close()
+
+    d = Daemon(db_path=db_path, socket_path=tmp_path / "queuer.sock", log_dir=tmp_path / "logs")
+    task = asyncio.create_task(d.serve())
+    try:
+        for _ in range(100):
+            if d.socket_path.exists():
+                break
+            await asyncio.sleep(0.02)
+
+        resp = await send(d.socket_path, "add", argv=["echo", "hi"], cwd=CWD, channel=2)
+        job = await wait_for_status(d.socket_path, resp["data"]["id"], {"done", "failed"})
+        assert job["status"] == "done"
     finally:
         task.cancel()
         try:
