@@ -16,6 +16,8 @@ import json
 import os
 import signal
 import sqlite3
+import sys
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -315,6 +317,8 @@ class Daemon:
         except json.JSONDecodeError:
             resp = {"ok": False, "error": "invalid JSON request"}
         except Exception as e:  # last-resort guard: one bad request must not kill the daemon
+            print(f"[queuerd] unexpected error handling request {req!r}:", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
             resp = {"ok": False, "error": f"internal error: {e}"}
         writer.write((json.dumps(resp) + "\n").encode())
         await writer.drain()
