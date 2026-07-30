@@ -19,18 +19,25 @@ cd custom-queuer
 ```
 
 `install.sh` is safe to re-run any time (after a `git pull`, or if you move
-the project directory) — it syncs the venv, stops any existing `queuerd`
-process (systemd-managed or stray), rewrites the systemd unit with the
-correct path, enables + starts it, and enables linger so it survives
-logout.
+the project directory) — it syncs the venv, runs the test suite, installs
+`queuer` / `qur` / `queuerd` onto your `PATH` via `uv tool install
+--editable .` (edits to the code take effect without reinstalling), stops
+any existing `queuerd` process (systemd-managed or stray), rewrites the
+systemd unit with the correct path, enables + starts it, and enables
+linger so it survives logout.
+
+`qur` is a short alias for `queuer` — same command, less typing.
 
 To confirm it worked:
 ```bash
 systemctl --user status queuerd
-uv run queuer status
+qur status
 ```
 
 ## Command reference
+
+`qur` works everywhere `queuer` does below — it's the same command, just shorter.
+Every command also has worked examples under `qur <command> --help`.
 
 ```
 queuer add [--before ID | --after ID] [--timeout SECONDS] -- <cmd...>
@@ -51,9 +58,9 @@ Enqueues a job. Always put `--` before the command itself if it has its
 own flags, or `queuer` will try to parse them as its own options:
 
 ```bash
-uv run queuer add -- echo hello
-uv run queuer add --timeout 300 -- python train.py --epochs 50
-uv run queuer add --after 12 -- ./run_simulation.sh input.yaml
+qur add -- echo hello
+qur add --timeout 300 -- python train.py --epochs 50
+qur add --after 12 -- ./run_simulation.sh input.yaml
 ```
 
 The command is captured two ways:
@@ -75,8 +82,9 @@ and marks it `failed` with `note: timed out`.
 
 ### `list`
 
-Shows the currently running job, the full queue, and the last 10
-finished jobs (done/failed/cancelled — oldest evicted once you pass 10).
+Shows one table: the currently running job first (marked with `*`),
+followed by the queue, then the last 10 finished jobs (done/failed/
+cancelled — oldest evicted once you pass 10) in a separate section.
 
 - `--full` shows resolved absolute paths instead of what you typed
 - `--json` prints the raw response instead of a table, for scripting
