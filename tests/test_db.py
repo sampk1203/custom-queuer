@@ -467,3 +467,122 @@ def test_pause_toggle_independent_per_channel(conn):
     db.set_paused(conn, False, channel=1)
     assert db.get_paused(conn, channel=1) is False
     assert db.get_paused(conn, channel=2) is True
+
+
+# ---------------------------------------------------------------------------
+# priority lane (`--now`): is_priority queue partition, stopped/running toggle
+# ---------------------------------------------------------------------------
+
+def test_priority_job_does_not_appear_in_normal_queue(conn):
+    a = _mk(conn, "a")
+    p = _mk(conn, "p", is_priority=True)
+    assert [j["id"] for j in db.get_queue(conn)] == [a]
+    assert [j["id"] for j in db.get_queue(conn, is_priority=True)] == [p]
+
+
+def test_priority_lane_has_its_own_position_sequence(conn):
+    p1 = _mk(conn, "p1", is_priority=True)
+    p2 = _mk(conn, "p2", is_priority=True)
+    queue = db.get_queue(conn, is_priority=True)
+    assert [j["id"] for j in queue] == [p1, p2]
+    assert [j["position"] for j in queue] == [0, 1]
+
+
+def test_priority_lane_scoped_per_channel(conn):
+    p1 = _mk(conn, "p1", channel=1, is_priority=True)
+    p2 = _mk(conn, "p2", channel=2, is_priority=True)
+    assert [j["id"] for j in db.get_queue(conn, channel=1, is_priority=True)] == [p1]
+    assert [j["id"] for j in db.get_queue(conn, channel=2, is_priority=True)] == [p2]
+
+
+def test_mark_stopped_then_resumed_round_trip(conn):
+    a = _mk(conn, "a")
+    db.mark_running(conn, a, pid=1, pgid=1)
+    db.mark_stopped(conn, a)
+    assert db.get_job(conn, a)["status"] == "stopped"
+    assert db.get_running(conn) is None
+    assert db.get_stopped(conn)["id"] == a
+
+    db.mark_resumed(conn, a)
+    assert db.get_job(conn, a)["status"] == "running"
+    assert db.get_running(conn)["id"] == a
+    assert db.get_stopped(conn) is None
+
+
+def test_mark_stopped_requires_running(conn):
+    a = _mk(conn, "a")  # still queued
+    with pytest.raises(ValueError):
+        db.mark_stopped(conn, a)
+
+
+def test_mark_resumed_requires_stopped(conn):
+    a = _mk(conn, "a")
+    db.mark_running(conn, a, pid=1, pgid=1)
+    with pytest.raises(ValueError):
+        db.mark_resumed(conn, a)  # still running, not stopped
+
+
+def test_mark_running_reindexes_only_its_own_priority_partition(conn):
+    a1 = _mk(conn, "a1")
+    a2 = _mk(conn, "a2")
+    p1 = _mk(conn, "p1", is_priority=True)
+    db.mark_running(conn, a1, pid=1, pgid=1)
+    # normal queue reindexed (a1 gone), priority lane untouched
+    assert [j["id"] for j in db.get_queue(conn)] == [a2]
+    assert [j["position"] for j in db.get_queue(conn)] == [0]
+    assert [j["id"] for j in db.get_queue(conn, is_priority=True)] == [p1]
+    assert [j["position"] for j in db.get_queue(conn, is_priority=True)] == [0]
+
+
+def test_stopped_status_survives_schema_migration(tmp_path):
+    """A DB written by the pre-priority-lane schema (no is_priority
+    column, no 'stopped' in the CHECK) upgrades cleanly and existing
+    rows are preserved with is_priority=0."""
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    old_conn = sqlite3.connect(path)
+    old_conn.executescript(
+        """
+        CREATE TABLE jobs (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel       INTEGER NOT NULL DEFAULT 1,
+            status        TEXT NOT NULL CHECK (status IN
+                            ('queued','running','done','failed','cancelled')),
+            position      INTEGER,
+            raw_cmd       TEXT NOT NULL,
+            resolved_cmd  TEXT NOT NULL,
+            cwd           TEXT NOT NULL,
+            env_extra     TEXT,
+            pid           INTEGER,
+            pgid          INTEGER,
+            enqueued_at   TEXT NOT NULL,
+            started_at    TEXT,
+            finished_at   TEXT,
+            exit_code     INTEGER,
+            log_path      TEXT NOT NULL,
+            note          TEXT,
+            timeout_secs  INTEGER
+        );
+        """
+    )
+    old_conn.execute(
+        """
+        INSERT INTO jobs (channel, status, position, raw_cmd, resolved_cmd, cwd,
+                           enqueued_at, log_path)
+        VALUES (1, 'queued', 0, '["a"]', '["/usr/bin/a"]', '/tmp', '2026-01-01', '/tmp/a.log')
+        """
+    )
+    old_conn.commit()
+    old_conn.close()
+
+    conn = db.connect(path)
+    db.init_db(conn)
+    job = db.get_job(conn, 1)
+    assert job["status"] == "queued"
+    assert job["is_priority"] == 0
+    # new status value now accepted by the CHECK constraint
+    db.mark_running(conn, 1, pid=1, pgid=1)
+    db.mark_stopped(conn, 1)
+    assert db.get_job(conn, 1)["status"] == "stopped"
+    conn.close()

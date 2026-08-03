@@ -750,3 +750,126 @@ async def test_empty_request_does_not_crash_daemon(daemon):
     # daemon should still respond to a fresh connection afterward
     followup = await send(daemon.socket_path, "status")
     assert followup["ok"]
+
+
+# ---------------------------------------------------------------------------
+# `--now` priority lane: SIGSTOP the running job, run priority in FIFO,
+# SIGCONT once the priority lane drains
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_now_freezes_running_job_and_runs_priority_job_first(daemon):
+    r1 = await send(daemon.socket_path, "add", argv=["sleep", "2"], cwd=CWD)
+    job1 = r1["data"]["id"]
+    await wait_for_status(daemon.socket_path, job1, {"running"})
+
+    r2 = await send(daemon.socket_path, "add", argv=["sleep", "0.5"], cwd=CWD, now=True)
+    assert r2["ok"]
+    job2 = r2["data"]["id"]
+
+    # frozen job shows up as 'stopped', not 'running' -- and stays that
+    # way while the priority job runs to completion
+    stopped = await wait_for_status(daemon.socket_path, job1, {"stopped"})
+    assert stopped["status"] == "stopped"
+
+    finished2 = await wait_for_status(daemon.socket_path, job2, {"done", "failed"})
+    assert finished2["status"] == "done"
+    assert finished2["is_priority"] == 1
+
+    # frozen job resumes on its own once the priority lane drains, and
+    # completes normally (SIGCONT, not a fresh run)
+    finished1 = await wait_for_status(daemon.socket_path, job1, {"done", "failed"}, timeout=8.0)
+    assert finished1["status"] == "done"
+    assert finished1["exit_code"] == 0
+
+
+@pytest.mark.asyncio
+async def test_now_on_idle_channel_just_runs_no_freeze(daemon):
+    resp = await send(daemon.socket_path, "add", argv=["echo", "hi"], cwd=CWD, now=True)
+    job_id = resp["data"]["id"]
+    job = await wait_for_status(daemon.socket_path, job_id, {"done", "failed"})
+    assert job["status"] == "done"
+    assert job["is_priority"] == 1
+
+    listing = await send(daemon.socket_path, "list")
+    assert _ch(listing["data"], 1)["frozen"] is None
+
+
+@pytest.mark.asyncio
+async def test_multiple_now_jobs_stack_fifo_behind_each_other(daemon):
+    r1 = await send(daemon.socket_path, "add", argv=["sleep", "2"], cwd=CWD)
+    job1 = r1["data"]["id"]
+    await wait_for_status(daemon.socket_path, job1, {"running"})
+
+    r2 = await send(daemon.socket_path, "add", argv=["sleep", "0.3"], cwd=CWD, now=True)
+    job2 = r2["data"]["id"]
+    await wait_for_status(daemon.socket_path, job2, {"running"})
+
+    # a second --now while one priority job is already running should NOT
+    # trigger a second freeze -- it just queues FIFO in the priority lane
+    r3 = await send(daemon.socket_path, "add", argv=["echo", "third"], cwd=CWD, now=True)
+    job3 = r3["data"]["id"]
+
+    listing = await send(daemon.socket_path, "list")
+    chan = _ch(listing["data"], 1)
+    assert chan["frozen"]["id"] == job1  # still exactly one frozen job
+    assert [j["id"] for j in chan["priority_queue"]] == [job3]
+
+    finished2 = await wait_for_status(daemon.socket_path, job2, {"done", "failed"})
+    assert finished2["status"] == "done"
+    finished3 = await wait_for_status(daemon.socket_path, job3, {"done", "failed"})
+    assert finished3["status"] == "done"
+
+    finished1 = await wait_for_status(daemon.socket_path, job1, {"done", "failed"}, timeout=8.0)
+    assert finished1["status"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_now_scoped_to_its_own_channel(daemon):
+    r1 = await send(daemon.socket_path, "add", argv=["sleep", "1.5"], cwd=CWD, channel=1)
+    job1 = r1["data"]["id"]
+    await wait_for_status(daemon.socket_path, job1, {"running"})
+
+    # a --now on a different, idle channel must not touch channel 1 at all
+    r2 = await send(daemon.socket_path, "add", argv=["echo", "hi"], cwd=CWD, channel=2, now=True)
+    job2 = r2["data"]["id"]
+    finished2 = await wait_for_status(daemon.socket_path, job2, {"done", "failed"})
+    assert finished2["status"] == "done"
+
+    listing = await send(daemon.socket_path, "list")
+    assert _ch(listing["data"], 1)["frozen"] is None
+    assert _ch(listing["data"], 1)["running"]["id"] == job1
+
+    finished1 = await wait_for_status(daemon.socket_path, job1, {"done", "failed"})
+    assert finished1["status"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_now_rejects_before_and_after(daemon):
+    resp = await send(daemon.socket_path, "add", argv=["echo", "hi"], cwd=CWD, now=True, before=1)
+    assert resp["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_cancel_targets_priority_job_while_frozen_job_untouched(daemon):
+    r1 = await send(daemon.socket_path, "add", argv=["sleep", "3"], cwd=CWD)
+    job1 = r1["data"]["id"]
+    await wait_for_status(daemon.socket_path, job1, {"running"})
+
+    r2 = await send(daemon.socket_path, "add", argv=["sleep", "3"], cwd=CWD, now=True)
+    job2 = r2["data"]["id"]
+    await wait_for_status(daemon.socket_path, job2, {"running"})
+
+    # cancel while a priority job is in the foreground must kill the
+    # priority job, not disturb the frozen one
+    cancel_resp = await send(daemon.socket_path, "cancel", channel=1)
+    assert cancel_resp["ok"]
+    assert cancel_resp["data"]["cancelled"] == job2
+
+    finished2 = await wait_for_status(daemon.socket_path, job2, {"cancelled", "failed", "done"})
+    assert finished2["status"] == "cancelled"
+
+    # frozen job resumes once the (now-empty) priority lane drains, and
+    # is still alive/untouched by the cancel
+    finished1 = await wait_for_status(daemon.socket_path, job1, {"done", "failed"}, timeout=8.0)
+    assert finished1["status"] == "done"

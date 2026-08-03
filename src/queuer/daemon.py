@@ -74,6 +74,15 @@ class Daemon:
         self._cancel_requested: dict[int, bool] = {}
         self._worker_tasks: dict[int, asyncio.Task] = {}
 
+        # `--now` priority lane: at most one job can be frozen per channel
+        # at a time (a frozen normal job, held here with its own proc
+        # reference since self._current_proc gets reassigned to whatever
+        # priority job is running in the foreground while it's frozen).
+        # The priority worker task runs the priority queue FIFO, then
+        # SIGCONTs the frozen job once that queue drains.
+        self._frozen: dict[int, tuple[int, asyncio.subprocess.Process]] = {}
+        self._priority_worker_tasks: dict[int, asyncio.Task] = {}
+
     # -- setup -----------------------------------------------------------
 
     def _connect(self) -> None:
@@ -127,6 +136,67 @@ class Daemon:
         self._ensure_channel_worker(channel)
         self._wake[channel].set()
 
+    # -- priority lane (`--now`) ------------------------------------------
+
+    def _ensure_priority_worker(self, channel: int) -> None:
+        """Spawn the priority-lane runner for a channel if it isn't
+        already draining one. Idempotent -- additional `--now` jobs while
+        one is already running just land in the DB queue and get picked
+        up by the existing task's next loop iteration."""
+        task = self._priority_worker_tasks.get(channel)
+        if task is not None and not task.done():
+            return
+        self._priority_worker_tasks[channel] = asyncio.create_task(self._priority_worker_loop(channel))
+
+    async def _priority_worker_loop(self, channel: int) -> None:
+        assert self.conn is not None
+        while True:
+            queue = db.get_queue(self.conn, channel, is_priority=True)
+            if not queue:
+                break
+            await self._run_job(channel, queue[0])
+        if channel in self._frozen:
+            await self._resume_frozen(channel)
+
+    def _freeze_current_if_normal(self, channel: int) -> None:
+        """Called synchronously from `add --now`: if a normal (non-
+        priority) job is currently running on this channel and nothing is
+        already frozen there, SIGSTOP it and hand the channel over to the
+        priority lane. No-op if the channel is idle (nothing to freeze --
+        the priority job just runs like any other) or if a priority job
+        is already in the foreground (the new one queues in FIFO behind
+        it, no additional freeze needed)."""
+        assert self.conn is not None
+        if channel in self._frozen:
+            return
+        job_id = self._current_job_id.get(channel)
+        proc = self._current_proc.get(channel)
+        if job_id is None or proc is None:
+            return
+        job = db.get_job(self.conn, job_id)
+        if job is None or bool(job["is_priority"]):
+            return
+        try:
+            os.killpg(proc.pid, signal.SIGSTOP)
+        except ProcessLookupError:
+            return
+        db.mark_stopped(self.conn, job_id)
+        self._frozen[channel] = (job_id, proc)
+
+    async def _resume_frozen(self, channel: int) -> None:
+        assert self.conn is not None
+        job_id, proc = self._frozen.pop(channel)
+        try:
+            os.killpg(proc.pid, signal.SIGCONT)
+        except ProcessLookupError:
+            # process died while frozen (shouldn't normally happen) -- its
+            # own worker task's proc.wait() will still return and finalize
+            # it; nothing more to do here.
+            return
+        db.mark_resumed(self.conn, job_id)
+        self._current_proc[channel] = proc
+        self._current_job_id[channel] = job_id
+
     async def _run_job(self, channel: int, job: dict[str, Any]) -> None:
         assert self.conn is not None
         job_id = job["id"]
@@ -177,6 +247,7 @@ class Daemon:
 
         if self._cancel_requested[channel]:
             status = "cancelled"
+            self._cancel_requested[channel] = False
         else:
             status = "done" if exit_code == 0 else "failed"
         db.mark_finished(self.conn, job_id, status=status, exit_code=exit_code)
@@ -245,8 +316,11 @@ class Daemon:
         argv = args["argv"]
         cwd = args["cwd"]
         channel = args.get("channel") or db.DEFAULT_CHANNEL
+        now = bool(args.get("now"))
         if not argv:
             raise ValueError("empty command")
+        if now and (args.get("before") is not None or args.get("after") is not None):
+            raise ValueError("--now cannot be combined with --before/--after")
 
         resolved = resolve_command(argv, cwd)
         exe = resolved[0]
@@ -267,12 +341,17 @@ class Daemon:
             timeout_secs=args.get("timeout_secs"),
             before=args.get("before"),
             after=args.get("after"),
+            is_priority=now,
         )
         log_path = str(self.log_dir / f"{job_id}.log")
         self.conn.execute("UPDATE jobs SET log_path = ? WHERE id = ?", (log_path, job_id))
         self.conn.commit()
 
-        self._wake_worker(channel)
+        if now:
+            self._freeze_current_if_normal(channel)
+            self._ensure_priority_worker(channel)
+        else:
+            self._wake_worker(channel)
         return {"id": job_id, "channel": channel}
 
     async def _cmd_list(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -282,6 +361,8 @@ class Daemon:
             channels[channel] = {
                 "running": db.get_running(self.conn, channel),
                 "queue": db.get_queue(self.conn, channel),
+                "priority_queue": db.get_queue(self.conn, channel, is_priority=True),
+                "frozen": db.get_stopped(self.conn, channel),
                 "backlog": db.get_backlog(self.conn, channel),
                 "paused": db.get_paused(self.conn, channel),
             }
@@ -293,6 +374,7 @@ class Daemon:
         for channel in db.list_channels(self.conn):
             channels[channel] = {
                 "running": db.get_running(self.conn, channel),
+                "frozen": db.get_stopped(self.conn, channel),
                 "paused": db.get_paused(self.conn, channel),
             }
         return {"channels": channels}

@@ -78,6 +78,13 @@ def add(
     timeout: Optional[int] = typer.Option(
         None, "--timeout", help="Kill the job if it runs longer than this many seconds"
     ),
+    now: bool = typer.Option(
+        False, "--now",
+        help="Jump the channel's queue: freezes (SIGSTOP) whatever is currently running "
+        "on that channel and runs this immediately. Further --now jobs queue FIFO behind "
+        "it; once the priority lane empties, the frozen job resumes (SIGCONT) untouched. "
+        "Cannot be combined with --before/--after.",
+    ),
 ) -> None:
     """Enqueue a job.
 
@@ -87,6 +94,7 @@ def add(
       queuer add --timeout 60 -- ./run.sh
       queuer add --after 12 -- python eval.py
       queuer add --before 12 -- python setup.py
+      queuer add --now -- python urgent_eval.py
     """
     data = _call(
         "add",
@@ -96,8 +104,11 @@ def add(
         before=before,
         after=after,
         timeout_secs=timeout,
+        now=now,
     )
     console.print(f"Queued as job [bold]{data['id']}[/bold] on channel [bold]{data['channel']}[/bold]")
+    if now:
+        console.print("[yellow]--now[/yellow]: current job on this channel frozen (if any); this runs first")
 
 
 # ---------------------------------------------------------------------------
@@ -109,16 +120,26 @@ def _render_queue_and_backlog(channel_data: dict[str, Any], full: bool) -> None:
         console.print("[yellow]channel is paused -- new jobs will not start[/yellow]\n")
 
     running = channel_data["running"]
+    frozen = channel_data.get("frozen")
+    priority_queue = channel_data.get("priority_queue") or []
+
+    if frozen:
+        console.print(
+            f"[yellow]#{frozen['id']} frozen (--now preempted it)[/yellow]  {_cmd_str(frozen, full)}"
+        )
 
     queue_table = Table(show_lines=False)
     queue_table.add_column("ID", justify="right")
     queue_table.add_column("Command")
     if running:
-        queue_table.add_row(str(running["id"]), f"* {_cmd_str(running, full)}", style="bold green")
+        marker = "* (priority)" if running.get("is_priority") else "*"
+        queue_table.add_row(str(running["id"]), f"{marker} {_cmd_str(running, full)}", style="bold green")
+    for job in priority_queue:
+        queue_table.add_row(str(job["id"]), f"(priority) {_cmd_str(job, full)}")
     for job in channel_data["queue"]:
         queue_table.add_row(str(job["id"]), _cmd_str(job, full))
 
-    if running or channel_data["queue"]:
+    if running or priority_queue or channel_data["queue"]:
         console.print(queue_table)
     else:
         console.print("[dim](idle -- nothing running or queued)[/dim]")
@@ -203,11 +224,15 @@ def status(as_json: bool = typer.Option(False, "--json")) -> None:
         console.print(f"[bold]channel {channel_id}[/bold]")
         if chan["paused"]:
             console.print("[yellow]paused[/yellow]")
+        frozen = chan.get("frozen")
+        if frozen:
+            console.print(f"[yellow]#{frozen['id']} frozen (--now preempted it)[/yellow]  {_cmd_str(frozen, full=False)}")
         running = chan["running"]
         if running:
-            console.print(f"[bold green]#{running['id']}[/bold green]  {_cmd_str(running, full=False)}")
+            label = "(priority)" if running.get("is_priority") else ""
+            console.print(f"[bold green]#{running['id']}[/bold green] {label}  {_cmd_str(running, full=False)}")
             console.print(f"started: {_fmt_time(running['started_at'])}  running for: {_fmt_duration(running)}")
-        else:
+        elif not frozen:
             console.print("[dim]idle -- no job running[/dim]")
 
 

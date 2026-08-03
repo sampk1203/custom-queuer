@@ -22,12 +22,12 @@ from typing import Any
 DEFAULT_DB_PATH = Path.home() / ".local" / "state" / "queuer" / "queuer.db"
 DEFAULT_CHANNEL = 1
 
-_SCHEMA = """
+_JOBS_TABLE = """
 CREATE TABLE IF NOT EXISTS jobs (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     channel       INTEGER NOT NULL DEFAULT 1,
     status        TEXT NOT NULL CHECK (status IN
-                    ('queued','running','done','failed','cancelled')),
+                    ('queued','running','stopped','done','failed','cancelled')),
     position      INTEGER,
     raw_cmd       TEXT NOT NULL,
     resolved_cmd  TEXT NOT NULL,
@@ -41,9 +41,12 @@ CREATE TABLE IF NOT EXISTS jobs (
     exit_code     INTEGER,
     log_path      TEXT NOT NULL,
     note          TEXT,
-    timeout_secs  INTEGER
+    timeout_secs  INTEGER,
+    is_priority   INTEGER NOT NULL DEFAULT 0
 );
+"""
 
+_SCHEMA = _JOBS_TABLE + """
 CREATE TABLE IF NOT EXISTS channels (
     id            INTEGER PRIMARY KEY,
     first_seen_at TEXT NOT NULL
@@ -64,9 +67,35 @@ def connect(db_path: Path | str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     return conn
 
 
+def _migrate_add_priority_lane(conn: sqlite3.Connection) -> None:
+    """DBs created before the `--now` priority lane lack `is_priority`
+    and the `stopped` status. CHECK constraints can't be altered in
+    place, so rebuild the table. No-op once migrated (or on a fresh DB,
+    which is already created with the new schema)."""
+    cols = [r["name"] for r in conn.execute("PRAGMA table_info(jobs)").fetchall()]
+    if "is_priority" in cols:
+        return
+    conn.executescript("ALTER TABLE jobs RENAME TO jobs_old;")
+    conn.executescript(_JOBS_TABLE)
+    conn.execute(
+        """
+        INSERT INTO jobs (id, channel, status, position, raw_cmd, resolved_cmd, cwd,
+                           env_extra, pid, pgid, enqueued_at, started_at, finished_at,
+                           exit_code, log_path, note, timeout_secs, is_priority)
+        SELECT id, channel, status, position, raw_cmd, resolved_cmd, cwd,
+               env_extra, pid, pgid, enqueued_at, started_at, finished_at,
+               exit_code, log_path, note, timeout_secs, 0
+        FROM jobs_old
+        """
+    )
+    conn.execute("DROP TABLE jobs_old")
+    conn.commit()
+
+
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA)
     conn.commit()
+    _migrate_add_priority_lane(conn)
 
 
 def _now() -> str:
@@ -102,10 +131,10 @@ def list_channels(conn: sqlite3.Connection) -> list[int]:
 # ---------------------------------------------------------------------------
 
 
-def _queued_ids_ordered(conn: sqlite3.Connection, channel: int) -> list[int]:
+def _queued_ids_ordered(conn: sqlite3.Connection, channel: int, is_priority: bool = False) -> list[int]:
     rows = conn.execute(
-        "SELECT id FROM jobs WHERE status = 'queued' AND channel = ? ORDER BY position ASC",
-        (channel,),
+        "SELECT id FROM jobs WHERE status = 'queued' AND channel = ? AND is_priority = ? ORDER BY position ASC",
+        (channel, int(is_priority)),
     ).fetchall()
     return [r["id"] for r in rows]
 
@@ -134,6 +163,7 @@ def enqueue(
     timeout_secs: int | None = None,
     before: int | None = None,
     after: int | None = None,
+    is_priority: bool = False,
 ) -> int:
     """Insert a new queued job on `channel`. Returns the new job's id.
 
@@ -142,6 +172,11 @@ def enqueue(
     reference an id currently queued on the *same* channel -- a stale id
     or one from a different channel is rejected the same way (ValueError:
     not currently queued).
+
+    `is_priority` puts the job on that channel's priority lane instead of
+    its normal queue -- a separate FIFO with its own position sequence,
+    used by `--now`. `before`/`after` are always resolved against the same
+    lane the new job is joining.
     """
     if before is not None and after is not None:
         raise ValueError("before and after are mutually exclusive")
@@ -152,8 +187,8 @@ def enqueue(
         """
         INSERT INTO jobs
             (channel, status, position, raw_cmd, resolved_cmd, cwd, env_extra,
-             enqueued_at, log_path, timeout_secs)
-        VALUES (?, 'queued', NULL, ?, ?, ?, ?, ?, ?, ?)
+             enqueued_at, log_path, timeout_secs, is_priority)
+        VALUES (?, 'queued', NULL, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             channel,
@@ -164,11 +199,12 @@ def enqueue(
             _now(),
             log_path,
             timeout_secs,
+            int(is_priority),
         ),
     )
     new_id = cur.lastrowid
 
-    existing = [i for i in _queued_ids_ordered(conn, channel) if i != new_id]
+    existing = [i for i in _queued_ids_ordered(conn, channel, is_priority) if i != new_id]
 
     if before is not None:
         if before not in existing:
@@ -188,10 +224,12 @@ def enqueue(
     return new_id
 
 
-def get_queue(conn: sqlite3.Connection, channel: int = DEFAULT_CHANNEL) -> list[dict[str, Any]]:
+def get_queue(
+    conn: sqlite3.Connection, channel: int = DEFAULT_CHANNEL, is_priority: bool = False
+) -> list[dict[str, Any]]:
     rows = conn.execute(
-        "SELECT * FROM jobs WHERE status = 'queued' AND channel = ? ORDER BY position ASC",
-        (channel,),
+        "SELECT * FROM jobs WHERE status = 'queued' AND channel = ? AND is_priority = ? ORDER BY position ASC",
+        (channel, int(is_priority)),
     ).fetchall()
     return [_row_to_dict(r) for r in rows]
 
@@ -199,6 +237,16 @@ def get_queue(conn: sqlite3.Connection, channel: int = DEFAULT_CHANNEL) -> list[
 def get_running(conn: sqlite3.Connection, channel: int = DEFAULT_CHANNEL) -> dict[str, Any] | None:
     row = conn.execute(
         "SELECT * FROM jobs WHERE status = 'running' AND channel = ? LIMIT 1", (channel,)
+    ).fetchone()
+    return _row_to_dict(row) if row else None
+
+
+def get_stopped(conn: sqlite3.Connection, channel: int = DEFAULT_CHANNEL) -> dict[str, Any] | None:
+    """The job frozen (SIGSTOP'd) on this channel by a `--now` preemption,
+    if any -- at most one per channel, since only a non-priority job can
+    be frozen and a priority lane freezes it at most once."""
+    row = conn.execute(
+        "SELECT * FROM jobs WHERE status = 'stopped' AND channel = ? LIMIT 1", (channel,)
     ).fetchone()
     return _row_to_dict(row) if row else None
 
@@ -235,8 +283,29 @@ def mark_running(conn: sqlite3.Connection, job_id: int, pid: int, pgid: int) -> 
         """,
         (pid, pgid, _now(), job_id),
     )
-    remaining = [i for i in _queued_ids_ordered(conn, job["channel"]) if i != job_id]
+    remaining = [i for i in _queued_ids_ordered(conn, job["channel"], bool(job["is_priority"])) if i != job_id]
     _reindex_queue(conn, remaining)
+    conn.commit()
+
+
+def mark_stopped(conn: sqlite3.Connection, job_id: int) -> None:
+    """Freeze a running job in place (paired with an external SIGSTOP) --
+    used to preempt it for a `--now` priority job. Status only; pid/pgid/
+    started_at are left untouched so resuming looks like nothing happened."""
+    job = get_job(conn, job_id)
+    if job is None or job["status"] != "running":
+        raise ValueError(f"job {job_id} is not running")
+    conn.execute("UPDATE jobs SET status = 'stopped' WHERE id = ?", (job_id,))
+    conn.commit()
+
+
+def mark_resumed(conn: sqlite3.Connection, job_id: int) -> None:
+    """Reverse of mark_stopped (paired with an external SIGCONT), once the
+    priority lane that preempted it has drained."""
+    job = get_job(conn, job_id)
+    if job is None or job["status"] != "stopped":
+        raise ValueError(f"job {job_id} is not stopped")
+    conn.execute("UPDATE jobs SET status = 'running' WHERE id = ?", (job_id,))
     conn.commit()
 
 
@@ -294,7 +363,7 @@ def remove_from_queue(conn: sqlite3.Connection, job_id: int) -> None:
             "use cancel for a running job"
         )
     conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
-    remaining = [i for i in _queued_ids_ordered(conn, job["channel"]) if i != job_id]
+    remaining = [i for i in _queued_ids_ordered(conn, job["channel"], bool(job["is_priority"])) if i != job_id]
     _reindex_queue(conn, remaining)
     conn.commit()
 
@@ -315,7 +384,7 @@ def _reorder(
     job = get_job(conn, job_id)
     if job is None:
         raise ValueError(f"job {job_id} does not exist")
-    ids = _queued_ids_ordered(conn, job["channel"])
+    ids = _queued_ids_ordered(conn, job["channel"], bool(job["is_priority"]))
     if job_id not in ids:
         raise ValueError(f"job {job_id} is not queued")
     if target_id not in ids:
