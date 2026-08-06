@@ -27,18 +27,24 @@ import shutil
 from pathlib import Path
 
 
-def resolve_command(argv: list[str], cwd: str) -> list[str]:
+def resolve_command(argv: list[str], cwd: str, path_env: str | None = None) -> list[str]:
     """Return a new argv list with path-like tokens canonicalized.
 
     `cwd` is the directory the command was enqueued from (captured by the
     CLI at `add` time), used as the base for resolving relative paths.
+
+    `path_env` is the PATH to use for argv[0] lookup (e.g. `python3` ->
+    absolute path). Must be the *client's* PATH, not the resolving
+    process's own -- the daemon is long-lived and its PATH predates any
+    venv the client had active at enqueue time, so it can't be trusted to
+    resolve bare commands like `python`.
     """
     if not argv:
         return []
-    return [_resolve_token(token, cwd, is_argv0=(i == 0)) for i, token in enumerate(argv)]
+    return [_resolve_token(token, cwd, is_argv0=(i == 0), path_env=path_env) for i, token in enumerate(argv)]
 
 
-def _resolve_token(token: str, cwd: str, *, is_argv0: bool) -> str:
+def _resolve_token(token: str, cwd: str, *, is_argv0: bool, path_env: str | None = None) -> str:
     if token == "":
         # Path(cwd) / "" == Path(cwd), which always exists -- without this
         # guard an empty argument would get silently rewritten to the cwd's
@@ -62,7 +68,7 @@ def _resolve_token(token: str, cwd: str, *, is_argv0: bool) -> str:
 
     # argv[0] as a bare command name -> resolve via PATH (e.g. "python3").
     if is_argv0:
-        which = shutil.which(token)
+        which = shutil.which(token, path=path_env)
         if which:
             return os.path.abspath(which)
 

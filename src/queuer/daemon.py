@@ -322,10 +322,12 @@ class Daemon:
         if now and (args.get("before") is not None or args.get("after") is not None):
             raise ValueError("--now cannot be combined with --before/--after")
 
-        resolved = resolve_command(argv, cwd)
+        client_path = args.get("path") or None
+        resolved = resolve_command(argv, cwd, path_env=client_path)
         exe = resolved[0]
         if not (os.path.isfile(exe) and os.access(exe, os.X_OK)):
             raise ValueError(f"executable not found or not executable: {exe}")
+        env_extra = {"PATH": client_path} if client_path else None
 
         # log_path needs the row's own id, which we don't have until after
         # insert -- write a placeholder, then patch it in immediately
@@ -342,6 +344,7 @@ class Daemon:
             before=args.get("before"),
             after=args.get("after"),
             is_priority=now,
+            env_extra=env_extra,
         )
         log_path = str(self.log_dir / f"{job_id}.log")
         self.conn.execute("UPDATE jobs SET log_path = ? WHERE id = ?", (log_path, job_id))

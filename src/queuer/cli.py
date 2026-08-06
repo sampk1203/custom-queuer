@@ -13,8 +13,8 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from queuer import client
-from queuer.daemon import _default_log_dir
+from queuer import client, db
+from queuer.daemon import _default_db_path, _default_log_dir
 from queuer.db import DEFAULT_CHANNEL
 
 app = typer.Typer(help="queuer: a background job queue with parallel channels")
@@ -100,6 +100,7 @@ def add(
         "add",
         argv=cmd,
         cwd=os.getcwd(),
+        path=os.environ.get("PATH", ""),
         channel=channel,
         before=before,
         after=after,
@@ -380,6 +381,65 @@ def logs(
                     time.sleep(0.5)
         except KeyboardInterrupt:
             pass
+
+
+@app.command(name="clean-logs")
+def clean_logs(
+    days: int = typer.Option(30, "--days", help="Delete logs for jobs finished more than this many days ago"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be deleted without deleting"),
+) -> None:
+    """Delete old log files from disk to free space.
+
+    Only touches finished jobs (done/failed/cancelled) whose finished_at
+    is older than --days. Also removes orphaned logs (files whose job row
+    no longer exists in the DB, e.g. pruned backlog). Never touches logs
+    for queued/running/stopped jobs. Reads the DB directly -- works even
+    if the daemon isn't running.
+
+    Examples:
+      queuer clean-logs --dry-run
+      queuer clean-logs --days 7
+    """
+    log_dir = _default_log_dir()
+    if not log_dir.exists():
+        console.print("[dim](no log directory)[/dim]")
+        return
+
+    conn = db.connect(_default_db_path())
+    cutoff = time.time() - days * 86400
+    to_delete: list[Path] = []
+
+    for log_file in log_dir.glob("*.log"):
+        try:
+            job_id = int(log_file.stem)
+        except ValueError:
+            continue  # not a job log, leave it alone
+
+        job = db.get_job(conn, job_id)
+        if job is None:
+            to_delete.append(log_file)  # orphaned -- no matching row
+            continue
+        if job["status"] not in ("done", "failed", "cancelled"):
+            continue  # queued/running/stopped -- never touch
+        if not job["finished_at"]:
+            continue
+        finished_ts = datetime.fromisoformat(job["finished_at"]).timestamp()
+        if finished_ts < cutoff:
+            to_delete.append(log_file)
+
+    conn.close()
+
+    if not to_delete:
+        console.print("[dim](nothing to clean)[/dim]")
+        return
+
+    total_bytes = sum(f.stat().st_size for f in to_delete)
+    verb = "Would delete" if dry_run else "Deleting"
+    console.print(f"{verb} {len(to_delete)} log(s), {total_bytes / 1024:.0f} KB")
+    for f in to_delete:
+        console.print(f"  {f}")
+        if not dry_run:
+            f.unlink()
 
 
 if __name__ == "__main__":
