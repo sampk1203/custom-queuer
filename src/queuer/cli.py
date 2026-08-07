@@ -101,6 +101,7 @@ def add(
         argv=cmd,
         cwd=os.getcwd(),
         path=os.environ.get("PATH", ""),
+        virtual_env=os.environ.get("VIRTUAL_ENV"),
         channel=channel,
         before=before,
         after=after,

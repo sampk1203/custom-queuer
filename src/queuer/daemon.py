@@ -259,7 +259,7 @@ class Daemon:
         at MAX_LOG_BYTES with a single truncation marker line."""
         written = 0
         truncated = False
-        with open(log_path, "ab") as f:
+        with open(log_path, "wb") as f:
             assert proc.stdout is not None
             while True:
                 chunk = await proc.stdout.read(65536)
@@ -327,7 +327,13 @@ class Daemon:
         exe = resolved[0]
         if not (os.path.isfile(exe) and os.access(exe, os.X_OK)):
             raise ValueError(f"executable not found or not executable: {exe}")
-        env_extra = {"PATH": client_path} if client_path else None
+        env_extra: dict[str, str] = {}
+        if client_path:
+            env_extra["PATH"] = client_path
+        virtual_env = args.get("virtual_env")
+        if virtual_env:
+            env_extra["VIRTUAL_ENV"] = virtual_env
+        env_extra = env_extra or None
 
         # log_path needs the row's own id, which we don't have until after
         # insert -- write a placeholder, then patch it in immediately
