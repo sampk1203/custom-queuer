@@ -20,6 +20,17 @@ from queuer.db import DEFAULT_CHANNEL
 app = typer.Typer(help="queuer: a background job queue with parallel channels")
 console = Console()
 
+# argv is exec'd directly (no shell) -- these tokens only do what they look
+# like they do under a shell. Typed as one -- job, they're silently passed
+# as literal argv words instead, e.g. `queuer add -- a && b` runs the literal
+# executable "a && b" (which fails) or, if wrapped by hand as "a", "&&", "b",
+# runs `a` with args "&&" "b" -- neither does what a shell user expects.
+_SHELL_OPERATORS = {"&&", "||", "|", ";", ">", ">>", "<", "<<", "`"}
+
+
+def _find_shell_operators(argv: list[str]) -> list[str]:
+    return [tok for tok in argv if tok in _SHELL_OPERATORS or "$(" in tok]
+
 
 def _call(cmd: str, **kwargs: Any) -> Any:
     """Call the daemon, printing a clean one-line error and exiting
@@ -85,6 +96,10 @@ def add(
         "it; once the priority lane empties, the frozen job resumes (SIGCONT) untouched. "
         "Cannot be combined with --before/--after.",
     ),
+    force: bool = typer.Option(
+        False, "--force",
+        help="Skip the shell-operator check (&&, |, ;, >, ...) and queue as literal argv anyway.",
+    ),
 ) -> None:
     """Enqueue a job.
 
@@ -96,6 +111,17 @@ def add(
       queuer add --before 12 -- python setup.py
       queuer add --now -- python urgent_eval.py
     """
+    bad = _find_shell_operators(cmd)
+    if bad and not force:
+        typer.echo(
+            f"Error: {bad} look like shell operators, but queuer execs argv directly "
+            "(no shell) -- they won't do what you expect. Wrap in a shell yourself:\n"
+            f'  queuer add -- bash -c "{" ".join(cmd)}"\n'
+            "or pass --force to queue exactly as typed.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
     data = _call(
         "add",
         argv=cmd,
