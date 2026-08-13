@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
+import stat
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -32,6 +35,16 @@ def _find_shell_operators(argv: list[str]) -> list[str]:
     return [tok for tok in argv if tok in _SHELL_OPERATORS or "$(" in tok]
 
 
+def _stdin_was_redirected_from_file() -> bool:
+    """True if fd 0 is a regular file, i.e. the invoking shell did `< somefile`
+    on *this* process. A pipe (`cmd | queuer ...`) shows up as a FIFO, not a
+    regular file, so that case is deliberately not flagged here."""
+    try:
+        return stat.S_ISREG(os.fstat(0).st_mode)
+    except OSError:
+        return False
+
+
 def _call(cmd: str, **kwargs: Any) -> Any:
     """Call the daemon, printing a clean one-line error and exiting
     nonzero on any failure rather than letting a traceback surface."""
@@ -43,9 +56,13 @@ def _call(cmd: str, **kwargs: Any) -> Any:
 
 
 def _cmd_str(job: dict[str, Any], full: bool) -> str:
+    # shlex.join (not " ".join) so that an argv element containing spaces
+    # or shell metacharacters -- e.g. the "g16 < test.gjf" in
+    # ["bash", "-c", "g16 < test.gjf"] -- round-trips as one quoted word
+    # instead of printing as if it were several separate, unquoted tokens.
     key = "resolved_cmd" if full else "raw_cmd"
     argv = json.loads(job[key])
-    return " ".join(argv)
+    return shlex.join(argv)
 
 
 def _fmt_time(ts: str | None) -> str:
@@ -111,12 +128,29 @@ def add(
       queuer add --before 12 -- python setup.py
       queuer add --now -- python urgent_eval.py
     """
+    if _stdin_was_redirected_from_file():
+        # queuer execs the job directly with its own fresh stdin -- it does
+        # NOT hand the daemon's copy of *this* fd to the job. So a redirect
+        # like `queuer add -- g16 < test.gjf` was consumed by your shell to
+        # feed *queuer's* stdin, not the job's, and "test.gjf" never made it
+        # into argv at all. Warn rather than silently queuing a job that's
+        # missing the input file it was supposed to have.
+        typer.echo(
+            "Warning: it looks like stdin was redirected from a file on this "
+            "queuer invocation itself (e.g. `queuer add -- cmd < file`). That "
+            "redirect applies to queuer, not to the job -- the job will run "
+            "with no input file. If you meant the redirect for the job, wrap "
+            "it in a shell instead:\n"
+            f"  queuer add -- bash -c {shlex.quote(shlex.join(cmd) + ' < file')}\n",
+            err=True,
+        )
+
     bad = _find_shell_operators(cmd)
     if bad and not force:
         typer.echo(
             f"Error: {bad} look like shell operators, but queuer execs argv directly "
             "(no shell) -- they won't do what you expect. Wrap in a shell yourself:\n"
-            f'  queuer add -- bash -c "{" ".join(cmd)}"\n'
+            f"  queuer add -- bash -c {shlex.quote(shlex.join(cmd))}\n"
             "or pass --force to queue exactly as typed.",
             err=True,
         )
@@ -284,8 +318,8 @@ def show(job_id: int, as_json: bool = typer.Option(False, "--json")) -> None:
     table = Table(show_header=False, title=f"Job #{job['id']}")
     table.add_row("channel", str(job["channel"]))
     table.add_row("status", job["status"])
-    table.add_row("raw command", " ".join(json.loads(job["raw_cmd"])))
-    table.add_row("resolved command", " ".join(json.loads(job["resolved_cmd"])))
+    table.add_row("raw command", shlex.join(json.loads(job["raw_cmd"])))
+    table.add_row("resolved command", shlex.join(json.loads(job["resolved_cmd"])))
     table.add_row("cwd", job["cwd"])
     table.add_row("enqueued at", _fmt_time(job["enqueued_at"]))
     table.add_row("started at", _fmt_time(job["started_at"]))
