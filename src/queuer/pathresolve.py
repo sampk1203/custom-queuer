@@ -18,6 +18,25 @@ Rule (per the project plan, section 2):
 
   Anything else -- flags (`-x`, `--verbose`), and bare words that aren't
   existing files -- is left exactly as typed.
+
+  EXCEPTION -- shell -c scripts: every job queuer runs is now shaped
+  ["bash", "-c", "<script text>"] (see cli.py's _build_job_argv). argv[2]
+  in that shape is not a filesystem path or a single word at all -- it's
+  an entire embedded shell command, and it very often *contains* '/'
+  characters that have nothing to do with paths relative to cwd (a URL
+  like "https://example.com", a second script's own internal "a/b/c",
+  etc). Blindly running that whole string through os.path.join+abspath
+  would corrupt it -- e.g. abspath's normpath collapses the "//" in
+  "https://" down to a single '/', turning "https://example.com" into
+  "https:/example.com". So argv[2] is deliberately left byte-for-byte
+  untouched whenever argv[0]/argv[1] identify it as a shell -c script;
+  the shell itself resolves any relative paths inside the script against
+  the job's cwd at run time (the daemon execs with cwd= set correctly),
+  so no python-side resolution is needed or wanted there. Only argv[2]
+  is exempted this way -- extra positional args after the script (i.e.
+  a hand-written `bash -c '...' name arg1 arg2`, which become $0/$1/...
+  inside the script) are still resolved normally like any other argv
+  word, same as before this exception existed.
 """
 
 from __future__ import annotations
@@ -25,6 +44,19 @@ from __future__ import annotations
 import os
 import shutil
 from pathlib import Path
+
+# Recognized shell interpreters for the "-c script" exception above. Kept
+# in sync with cli.py, which imports this constant so both modules agree
+# on what counts as "this argv is a shell -c invocation".
+SHELL_INTERPRETERS = {"bash", "sh", "zsh", "dash", "ksh", "ash"}
+
+
+def _is_shell_dash_c(argv: list[str]) -> bool:
+    """True if argv looks like ["<shell>", "-c", "<script>", ...] -- i.e.
+    argv[2], if present, is shell source text rather than a path/word."""
+    if len(argv) < 3:
+        return False
+    return os.path.basename(argv[0]) in SHELL_INTERPRETERS and argv[1] == "-c"
 
 
 def resolve_command(argv: list[str], cwd: str, path_env: str | None = None) -> list[str]:
@@ -41,7 +73,15 @@ def resolve_command(argv: list[str], cwd: str, path_env: str | None = None) -> l
     """
     if not argv:
         return []
-    return [_resolve_token(token, cwd, is_argv0=(i == 0), path_env=path_env) for i, token in enumerate(argv)]
+    shell_script = _is_shell_dash_c(argv)
+    resolved: list[str] = []
+    for i, token in enumerate(argv):
+        if i == 2 and shell_script:
+            # The -c script itself -- opaque shell source, never a path.
+            resolved.append(token)
+            continue
+        resolved.append(_resolve_token(token, cwd, is_argv0=(i == 0), path_env=path_env))
+    return resolved
 
 
 def _resolve_token(token: str, cwd: str, *, is_argv0: bool, path_env: str | None = None) -> str:

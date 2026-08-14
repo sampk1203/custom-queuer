@@ -19,20 +19,48 @@ from rich.table import Table
 from queuer import client, db
 from queuer.daemon import _default_db_path, _default_log_dir
 from queuer.db import DEFAULT_CHANNEL
+from queuer.pathresolve import SHELL_INTERPRETERS
 
 app = typer.Typer(help="queuer: a background job queue with parallel channels")
 console = Console()
 
-# argv is exec'd directly (no shell) -- these tokens only do what they look
-# like they do under a shell. Typed as one -- job, they're silently passed
-# as literal argv words instead, e.g. `queuer add -- a && b` runs the literal
-# executable "a && b" (which fails) or, if wrapped by hand as "a", "&&", "b",
-# runs `a` with args "&&" "b" -- neither does what a shell user expects.
-_SHELL_OPERATORS = {"&&", "||", "|", ";", ">", ">>", "<", "<<", "`"}
 
+def _build_job_argv(cmd: list[str]) -> list[str]:
+    """Turn the words typed after `--` into the argv queuer actually execs:
+    always ["bash", "-c", "<script>"], so every job runs through a real
+    shell instead of being execve'd directly. This is what lets shell
+    syntax -- &&, |, ;, <, >, quoting, $VARS, globs -- work the way people
+    expect, without anyone having to type `bash -c "..."` themselves.
 
-def _find_shell_operators(argv: list[str]) -> list[str]:
-    return [tok for tok in argv if tok in _SHELL_OPERATORS or "$(" in tok]
+    Why this needs no "detect shell operators" step: argv after `--` has
+    already been through the *invoking* shell's own tokenizing once.
+    Anything typed unquoted (a bare `<` or `&&`) was already consumed by
+    that outer shell before queuer's process even started -- no code here
+    can retroactively recover it, wrapping or not. The only way such
+    syntax reaches us intact is if the whole command was quoted as ONE
+    shell word, e.g.:
+        queuer add -- 'g16 < input.gjf'
+        queuer add -- 'az login && ./deploy.sh'
+    in which case `cmd` is a single element and IS already valid shell
+    source -- passed to `bash -c` completely untouched.
+
+    Otherwise (2+ words -- the common case: a program plus its own flags/
+    args, possibly including one quoted multi-word argument like a JSON
+    payload, e.g. `curl -d '{"key": "value"}' url`) shlex.join re-quotes
+    each word exactly enough that `bash -c` parses it back into the
+    identical argv -- equivalent to a plain direct exec, just routed
+    through a shell so it composes with `--now`/timeouts/etc the same way
+    everything else does.
+
+    Special case: if the user already hand-wrote `bash -c '...'` (the old
+    workaround), use it as-is instead of wrapping it a second time.
+    """
+    if not cmd:
+        raise ValueError("empty command")
+    if len(cmd) == 3 and os.path.basename(cmd[0]) in SHELL_INTERPRETERS and cmd[1] == "-c":
+        return list(cmd)
+    script = cmd[0] if len(cmd) == 1 else shlex.join(cmd)
+    return ["bash", "-c", script]
 
 
 def _stdin_was_redirected_from_file() -> bool:
@@ -94,8 +122,12 @@ def _fmt_duration(job: dict[str, Any]) -> str:
 @app.command()
 def add(
     cmd: list[str] = typer.Argument(
-        ..., help="Command to run. Use -- before it if it has its own flags, "
-        "e.g. queuer add --timeout 60 -- python train.py --epochs 5"
+        ..., help="Command to run, exactly as you'd type it in a shell. Always run via "
+        "`bash -c`, so &&, |, ;, <, >, quoting, $VARS, and globs all work. Plain commands "
+        "need no special handling: queuer add -- python train.py --epochs 5. If your "
+        "command uses shell syntax, quote the WHOLE thing as one argument so your own "
+        "shell hands it to queuer intact instead of acting on it itself: "
+        "queuer add -- 'az login && ./deploy.sh'  or  queuer add -- 'g16 < input.gjf'"
     ),
     channel: int = typer.Option(
         DEFAULT_CHANNEL, "--channel", help="Channel to queue on. Each channel runs serially; "
@@ -113,12 +145,9 @@ def add(
         "it; once the priority lane empties, the frozen job resumes (SIGCONT) untouched. "
         "Cannot be combined with --before/--after.",
     ),
-    force: bool = typer.Option(
-        False, "--force",
-        help="Skip the shell-operator check (&&, |, ;, >, ...) and queue as literal argv anyway.",
-    ),
 ) -> None:
-    """Enqueue a job.
+    """Enqueue a job. Runs via `bash -c`, so shell syntax works -- quote the whole
+    command as one argument if it uses any (see the argument help above).
 
     Examples:
       queuer add -- python train.py --epochs 5
@@ -127,38 +156,38 @@ def add(
       queuer add --after 12 -- python eval.py
       queuer add --before 12 -- python setup.py
       queuer add --now -- python urgent_eval.py
+      queuer add -- curl -d '{"key": "value"}' https://example.com/api
+      queuer add -- 'g16 < input.gjf > output.log'
+      queuer add -- 'az login && ./deploy.sh'
     """
+    if not cmd:
+        typer.echo("Error: no command given after --", err=True)
+        raise typer.Exit(code=1)
+
     if _stdin_was_redirected_from_file():
-        # queuer execs the job directly with its own fresh stdin -- it does
-        # NOT hand the daemon's copy of *this* fd to the job. So a redirect
-        # like `queuer add -- g16 < test.gjf` was consumed by your shell to
-        # feed *queuer's* stdin, not the job's, and "test.gjf" never made it
-        # into argv at all. Warn rather than silently queuing a job that's
-        # missing the input file it was supposed to have.
+        # queuer execs the job with its own fresh stdin -- it does NOT hand
+        # the daemon's copy of *this* fd to the job. So a bare redirect
+        # like `queuer add -- g16 < test.gjf` (unquoted) was consumed by
+        # your shell to feed *queuer's* stdin before queuer even started,
+        # and "test.gjf" never made it into argv at all. Warn rather than
+        # silently queuing a job that's missing the input file it was
+        # supposed to have.
         typer.echo(
             "Warning: it looks like stdin was redirected from a file on this "
-            "queuer invocation itself (e.g. `queuer add -- cmd < file`). That "
-            "redirect applies to queuer, not to the job -- the job will run "
-            "with no input file. If you meant the redirect for the job, wrap "
-            "it in a shell instead:\n"
-            f"  queuer add -- bash -c {shlex.quote(shlex.join(cmd) + ' < file')}\n",
+            "queuer invocation itself (e.g. `queuer add -- g16 < test.gjf`). "
+            "Your shell consumed that redirect for queuer, not for the job -- "
+            "the job will run with no input file. If the redirect was meant "
+            "for the job, quote the whole command (including the redirect) "
+            "as one argument so your shell passes it through untouched:\n"
+            "  queuer add -- 'g16 < test.gjf'\n",
             err=True,
         )
 
-    bad = _find_shell_operators(cmd)
-    if bad and not force:
-        typer.echo(
-            f"Error: {bad} look like shell operators, but queuer execs argv directly "
-            "(no shell) -- they won't do what you expect. Wrap in a shell yourself:\n"
-            f"  queuer add -- bash -c {shlex.quote(shlex.join(cmd))}\n"
-            "or pass --force to queue exactly as typed.",
-            err=True,
-        )
-        raise typer.Exit(code=1)
+    job_argv = _build_job_argv(cmd)
 
     data = _call(
         "add",
-        argv=cmd,
+        argv=job_argv,
         cwd=os.getcwd(),
         path=os.environ.get("PATH", ""),
         virtual_env=os.environ.get("VIRTUAL_ENV"),
