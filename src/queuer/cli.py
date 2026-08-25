@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import shutil
 import stat
 import sys
 import time
@@ -23,6 +24,50 @@ from queuer.pathresolve import SHELL_INTERPRETERS
 
 app = typer.Typer(help="queuer: a background job queue with parallel channels")
 console = Console()
+
+
+def _resolve_interpreter(cmd: list[str]) -> list[str]:
+    """Resolve cmd[0] (the program name) to an absolute path via PATH lookup,
+    if it's a bare command name. Leaves every other token completely
+    untouched.
+
+    This runs BEFORE `_build_job_argv` wraps the command into `bash -c
+    '<script>'`. Once wrapped, `pathresolve.resolve_command` (called
+    daemon-side) deliberately treats the whole script as opaque text -- see
+    the shell -c exception in pathresolve.py -- so it never resolves the
+    program name buried inside it. Baking the absolute path in here instead
+    means the job pins the exact interpreter (e.g. a venv's python) at
+    enqueue time, instead of depending on the daemon reproducing the right
+    PATH at run time.
+
+    Deliberately narrower than pathresolve's own per-token resolution: it
+    only ever touches cmd[0]. Running the same logic over every token would
+    also walk into any inline source text that follows a `-c`/`-e` flag
+    (`python -c "..."`, `perl -e "..."`, `node -e "..."`, etc.) -- those are
+    opaque code, not paths, and rewriting a literal '/' inside them would
+    silently corrupt the script. pathresolve.py's own shell -c exception
+    exists for exactly this hazard, but only recognizes shell interpreters
+    (SHELL_INTERPRETERS), not other languages' inline-eval flags, so this
+    stays safe by never resolving past argv[0].
+    """
+    if not cmd:
+        return cmd
+    if len(cmd) == 3 and os.path.basename(cmd[0]) in SHELL_INTERPRETERS and cmd[1] == "-c":
+        # user hand-wrote `bash -c '...'` themselves -- this shape was
+        # already handled correctly (pathresolve resolves the interpreter
+        # itself daemon-side, the script text was already exempt either
+        # way). Leave it untouched so `raw_cmd` still reflects exactly
+        # what was typed, same as before this fix.
+        return cmd
+    prog = cmd[0]
+    if "/" in prog or Path(prog).exists():
+        # already a path, or a bare name that happens to exist relative to
+        # cwd -- leave it for pathresolve's own (later, cwd-aware) handling
+        return cmd
+    which = shutil.which(prog)
+    if which:
+        return [os.path.abspath(which), *cmd[1:]]
+    return cmd
 
 
 def _build_job_argv(cmd: list[str]) -> list[str]:
@@ -183,7 +228,7 @@ def add(
             err=True,
         )
 
-    job_argv = _build_job_argv(cmd)
+    job_argv = _build_job_argv(_resolve_interpreter(cmd))
 
     data = _call(
         "add",
