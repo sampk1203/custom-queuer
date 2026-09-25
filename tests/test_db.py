@@ -586,3 +586,44 @@ def test_stopped_status_survives_schema_migration(tmp_path):
     db.mark_stopped(conn, 1)
     assert db.get_job(conn, 1)["status"] == "stopped"
     conn.close()
+
+
+# ---------------------------------------------------------------------------
+# clear_backlog
+# ---------------------------------------------------------------------------
+
+
+def _finish(conn, job_id, status="done"):
+    db.mark_running(conn, job_id, pid=1, pgid=1)
+    db.mark_finished(conn, job_id, status=status)
+
+
+def test_clear_backlog_removes_finished_jobs_only(conn):
+    a = _mk(conn, "a")
+    b = _mk(conn, "b")
+    queued = _mk(conn, "c")  # left queued -- must survive
+    _finish(conn, a, status="done")
+    _finish(conn, b, status="failed")
+
+    deleted = db.clear_backlog(conn)
+
+    assert deleted == 2
+    assert db.get_backlog(conn) == []
+    assert [j["id"] for j in db.get_queue(conn)] == [queued]
+
+
+def test_clear_backlog_scoped_to_one_channel(conn):
+    a = _mk(conn, "a", channel=1)
+    b = _mk(conn, "b", channel=2)
+    _finish(conn, a, status="done")
+    _finish(conn, b, status="done")
+
+    deleted = db.clear_backlog(conn, channel=1)
+
+    assert deleted == 1
+    assert db.get_backlog(conn, channel=1) == []
+    assert len(db.get_backlog(conn, channel=2)) == 1
+
+
+def test_clear_backlog_empty_is_a_noop(conn):
+    assert db.clear_backlog(conn) == 0

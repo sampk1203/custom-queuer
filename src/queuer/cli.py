@@ -26,19 +26,95 @@ app = typer.Typer(help="queuer: a background job queue with parallel channels")
 console = Console()
 
 
+SHELL_METACHARS = frozenset("|&;<>`$*?~\n")
+
+
+def _is_explicit_shell_c(cmd: list[str]) -> bool:
+    """True if the user hand-wrote `bash -c '...'` (or sh/zsh/etc) themselves."""
+    return len(cmd) == 3 and os.path.basename(cmd[0]) in SHELL_INTERPRETERS and cmd[1] == "-c"
+
+
+def _needs_shell(script: str) -> bool:
+    """True if `script` contains syntax only a real shell can interpret --
+    pipes, redirects, chaining, substitution, globbing, expansion. Anything
+    without these is just a program name plus plain arguments and can be
+    exec'd directly.
+
+    Deliberately does NOT include `(`, `)`, `{`, `}`, `[`, `]` -- those show
+    up constantly in ordinary inline code (`python -c "print(1)"`, a JSON
+    payload, a regex) and would force bash for things that are not shell
+    syntax at all. The chars kept here are ones with essentially no other
+    reading in a single quoted-as-one-word command.
+    """
+    return any(c in SHELL_METACHARS for c in script)
+
+
+def _build_job_argv(cmd: list[str]) -> list[str]:
+    """Turn the words typed after `--` into the argv queuer actually execs.
+
+    Bash is only used when the command genuinely needs shell syntax --
+    &&, |, ;, <, >, $VARS, backticks, globs, subshells. Everything else is
+    exec'd directly (no `bash -c` enclosure), so PATH/path resolution runs
+    on the real argv instead of being buried inside an opaque script string,
+    and there's no double round of shell-quoting to go messy on display.
+
+    Why detecting shell syntax is only possible/needed in the single-word
+    case: argv after `--` has already been through the *invoking* shell's
+    own tokenizing once. Anything typed unquoted (a bare `<` or `&&`) was
+    already consumed by that outer shell before queuer's process even
+    started -- no code here can recover it. The only way such syntax
+    reaches us intact is if the whole command was quoted as ONE shell word,
+    e.g.:
+        queuer add -- 'g16 < input.gjf'
+        queuer add -- 'az login && ./deploy.sh'
+    So a single-element `cmd` is checked for shell metacharacters and only
+    wrapped in `bash -c` if it actually has any; otherwise it's split with
+    shlex (POSIX quoting rules, same as a shell would) into a plain argv.
+
+    2+ words (the common case: a program plus its own flags/args, possibly
+    including one quoted multi-word argument like a JSON payload, e.g.
+    `curl -d '{"key": "value"}' url`) can never carry surviving shell syntax
+    -- the outer shell already tokenized them -- so they're used as-is,
+    untouched, no bash, no re-quoting.
+
+    Special case: if the user already hand-wrote `bash -c '...'` (the old
+    workaround), use it as-is instead of wrapping it a second time.
+    """
+    if not cmd:
+        raise ValueError("empty command")
+    if _is_explicit_shell_c(cmd):
+        return list(cmd)
+    if len(cmd) == 1:
+        script = cmd[0]
+        if not script:
+            raise ValueError("empty command")
+        if _needs_shell(script):
+            return ["bash", "-c", script]
+        try:
+            words = shlex.split(script)
+        except ValueError:
+            # unbalanced quotes etc -- can't safely split this ourselves,
+            # so hand it to a real shell exactly as typed.
+            return ["bash", "-c", script]
+        if not words:
+            raise ValueError("empty command")
+        return words
+    return list(cmd)
+
+
 def _resolve_interpreter(cmd: list[str]) -> list[str]:
     """Resolve cmd[0] (the program name) to an absolute path via PATH lookup,
     if it's a bare command name. Leaves every other token completely
     untouched.
 
-    This runs BEFORE `_build_job_argv` wraps the command into `bash -c
-    '<script>'`. Once wrapped, `pathresolve.resolve_command` (called
-    daemon-side) deliberately treats the whole script as opaque text -- see
-    the shell -c exception in pathresolve.py -- so it never resolves the
-    program name buried inside it. Baking the absolute path in here instead
-    means the job pins the exact interpreter (e.g. a venv's python) at
-    enqueue time, instead of depending on the daemon reproducing the right
-    PATH at run time.
+    Runs AFTER `_build_job_argv`, on the final argv queuer will exec. For a
+    direct-exec argv (the common case now), this pins the exact interpreter
+    (e.g. a venv's python) at enqueue time using the client's own PATH,
+    instead of depending on the daemon reproducing it at run time. For a
+    `bash -c '<script>'` shape (only produced when the command genuinely
+    needs shell syntax), cmd[0] is "bash" itself and this is a no-op --
+    resolving into the opaque script text is `pathresolve.py`'s job to
+    deliberately avoid, not this function's.
 
     Deliberately narrower than pathresolve's own per-token resolution: it
     only ever touches cmd[0]. Running the same logic over every token would
@@ -52,12 +128,11 @@ def _resolve_interpreter(cmd: list[str]) -> list[str]:
     """
     if not cmd:
         return cmd
-    if len(cmd) == 3 and os.path.basename(cmd[0]) in SHELL_INTERPRETERS and cmd[1] == "-c":
-        # user hand-wrote `bash -c '...'` themselves -- this shape was
-        # already handled correctly (pathresolve resolves the interpreter
-        # itself daemon-side, the script text was already exempt either
-        # way). Leave it untouched so `raw_cmd` still reflects exactly
-        # what was typed, same as before this fix.
+    if _is_explicit_shell_c(cmd):
+        # user hand-wrote `bash -c '...'` themselves, or `_build_job_argv`
+        # produced this shape because the command needed real shell syntax
+        # -- either way pathresolve resolves the interpreter itself
+        # daemon-side, and the script text is deliberately left alone.
         return cmd
     prog = cmd[0]
     if "/" in prog or Path(prog).exists():
@@ -68,44 +143,6 @@ def _resolve_interpreter(cmd: list[str]) -> list[str]:
     if which:
         return [os.path.abspath(which), *cmd[1:]]
     return cmd
-
-
-def _build_job_argv(cmd: list[str]) -> list[str]:
-    """Turn the words typed after `--` into the argv queuer actually execs:
-    always ["bash", "-c", "<script>"], so every job runs through a real
-    shell instead of being execve'd directly. This is what lets shell
-    syntax -- &&, |, ;, <, >, quoting, $VARS, globs -- work the way people
-    expect, without anyone having to type `bash -c "..."` themselves.
-
-    Why this needs no "detect shell operators" step: argv after `--` has
-    already been through the *invoking* shell's own tokenizing once.
-    Anything typed unquoted (a bare `<` or `&&`) was already consumed by
-    that outer shell before queuer's process even started -- no code here
-    can retroactively recover it, wrapping or not. The only way such
-    syntax reaches us intact is if the whole command was quoted as ONE
-    shell word, e.g.:
-        queuer add -- 'g16 < input.gjf'
-        queuer add -- 'az login && ./deploy.sh'
-    in which case `cmd` is a single element and IS already valid shell
-    source -- passed to `bash -c` completely untouched.
-
-    Otherwise (2+ words -- the common case: a program plus its own flags/
-    args, possibly including one quoted multi-word argument like a JSON
-    payload, e.g. `curl -d '{"key": "value"}' url`) shlex.join re-quotes
-    each word exactly enough that `bash -c` parses it back into the
-    identical argv -- equivalent to a plain direct exec, just routed
-    through a shell so it composes with `--now`/timeouts/etc the same way
-    everything else does.
-
-    Special case: if the user already hand-wrote `bash -c '...'` (the old
-    workaround), use it as-is instead of wrapping it a second time.
-    """
-    if not cmd:
-        raise ValueError("empty command")
-    if len(cmd) == 3 and os.path.basename(cmd[0]) in SHELL_INTERPRETERS and cmd[1] == "-c":
-        return list(cmd)
-    script = cmd[0] if len(cmd) == 1 else shlex.join(cmd)
-    return ["bash", "-c", script]
 
 
 def _stdin_was_redirected_from_file() -> bool:
@@ -128,14 +165,43 @@ def _call(cmd: str, **kwargs: Any) -> Any:
         raise typer.Exit(code=1)
 
 
+def _display_quote(word: str) -> str:
+    """Quote one argv word for human display -- round-trips exactly via
+    shlex.split (safe to copy-paste back into a real shell), but picks
+    whichever quoting style is actually clean for this word instead of
+    always defaulting to POSIX single-quote escaping.
+
+    shlex.quote's escaping for a single quote *inside* a single-quoted
+    string is the standard `'"'"'` dance -- correct, but it's real quote
+    soup the moment a word contains more than one embedded `'` (e.g. a
+    Python one-liner with two string literals). If the word has no
+    characters that are special inside double quotes (", $, `, \\,
+    newline), double-quoting it is just as valid and round-trips the same
+    -- and it's the one case (an embedded single quote, nothing else
+    exotic) that's extremely common in `-c` one-liners.
+    """
+    if not word:
+        return "''"
+    if shlex.quote(word) == word:
+        # no quoting needed at all
+        return word
+    if not any(c in word for c in '"$`\\\n'):
+        return f'"{word}"'
+    return shlex.quote(word)
+
+
+def _display_join(argv: list[str]) -> str:
+    return " ".join(_display_quote(w) for w in argv)
+
+
 def _cmd_str(job: dict[str, Any], full: bool) -> str:
-    # shlex.join (not " ".join) so that an argv element containing spaces
-    # or shell metacharacters -- e.g. the "g16 < test.gjf" in
+    # _display_join (not " ".join) so that an argv element containing
+    # spaces or shell metacharacters -- e.g. the "g16 < test.gjf" in
     # ["bash", "-c", "g16 < test.gjf"] -- round-trips as one quoted word
     # instead of printing as if it were several separate, unquoted tokens.
     key = "resolved_cmd" if full else "raw_cmd"
     argv = json.loads(job[key])
-    return shlex.join(argv)
+    return _display_join(argv)
 
 
 def _fmt_time(ts: str | None) -> str:
@@ -167,11 +233,11 @@ def _fmt_duration(job: dict[str, Any]) -> str:
 @app.command()
 def add(
     cmd: list[str] = typer.Argument(
-        ..., help="Command to run, exactly as you'd type it in a shell. Always run via "
-        "`bash -c`, so &&, |, ;, <, >, quoting, $VARS, and globs all work. Plain commands "
-        "need no special handling: queuer add -- python train.py --epochs 5. If your "
-        "command uses shell syntax, quote the WHOLE thing as one argument so your own "
-        "shell hands it to queuer intact instead of acting on it itself: "
+        ..., help="Command to run, exactly as you'd type it in a shell. Plain commands are "
+        "exec'd directly, no shell involved: queuer add -- python train.py --epochs 5. "
+        "If your command uses shell syntax (&&, |, ;, <, >, $VARS, globs), quote the WHOLE "
+        "thing as one argument so your own shell hands it to queuer intact instead of "
+        "acting on it itself -- queuer then runs it via `bash -c`: "
         "queuer add -- 'az login && ./deploy.sh'  or  queuer add -- 'g16 < input.gjf'"
     ),
     channel: int = typer.Option(
@@ -228,11 +294,20 @@ def add(
             err=True,
         )
 
-    job_argv = _build_job_argv(_resolve_interpreter(cmd))
+    # `argv` is what actually gets exec'd -- bash-wrapped if the command
+    # needed shell syntax, with the interpreter pre-pinned to an absolute
+    # path so the job doesn't depend on the daemon reproducing a venv's
+    # PATH. `raw_argv` is `cmd` completely untouched -- exactly the words
+    # typed after `--` -- kept separate purely for `raw command` in
+    # `show`/`list` so that view reflects what the user wrote, not queuer's
+    # own interpreter-pinning. `resolved command` (see pathresolve.py,
+    # daemon-side) is where absolute executable/file paths belong.
+    job_argv = _resolve_interpreter(_build_job_argv(cmd))
 
     data = _call(
         "add",
         argv=job_argv,
+        raw_argv=cmd,
         cwd=os.getcwd(),
         path=os.environ.get("PATH", ""),
         virtual_env=os.environ.get("VIRTUAL_ENV"),
@@ -392,8 +467,8 @@ def show(job_id: int, as_json: bool = typer.Option(False, "--json")) -> None:
     table = Table(show_header=False, title=f"Job #{job['id']}")
     table.add_row("channel", str(job["channel"]))
     table.add_row("status", job["status"])
-    table.add_row("raw command", shlex.join(json.loads(job["raw_cmd"])))
-    table.add_row("resolved command", shlex.join(json.loads(job["resolved_cmd"])))
+    table.add_row("raw command", _display_join(json.loads(job["raw_cmd"])))
+    table.add_row("resolved command", _display_join(json.loads(job["resolved_cmd"])))
     table.add_row("cwd", job["cwd"])
     table.add_row("enqueued at", _fmt_time(job["enqueued_at"]))
     table.add_row("started at", _fmt_time(job["started_at"]))
@@ -424,6 +499,26 @@ def cancel(
     """
     data = _call("cancel", channel=channel)
     console.print(f"Cancelled job [bold]{data['cancelled']}[/bold] on channel [bold]{data['channel']}[/bold]")
+
+
+@app.command()
+def clear(
+    channel: Optional[int] = typer.Option(
+        None, "--channel", help="Only clear this channel's history (default: every channel)"
+    ),
+) -> None:
+    """Delete finished job records (done/failed/cancelled) -- the backlog
+    section shown by `list`/`status`. Queued and running jobs are never
+    touched. Log files on disk are untouched too -- use `clean-logs` for
+    those.
+
+    Examples:
+      queuer clear
+      queuer clear --channel 2
+    """
+    data = _call("clear", channel=channel)
+    scope = f"channel {channel}" if channel is not None else "all channels"
+    console.print(f"Cleared [bold]{data['cleared']}[/bold] finished job record(s) ({scope})")
 
 
 @app.command()

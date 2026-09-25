@@ -107,6 +107,32 @@ async def test_job_runs_to_completion(daemon):
 
 
 @pytest.mark.asyncio
+async def test_raw_argv_stored_separately_from_resolved_argv(daemon):
+    # `argv` (what actually runs) gets the interpreter pinned to an
+    # absolute path; `raw_argv` (what the user typed) must be stored
+    # untouched and shown as-is in `raw_cmd`, not clobbered by the pin.
+    resp = await send(
+        daemon.socket_path, "add",
+        argv=["/bin/echo", "hello"],
+        raw_argv=["echo", "hello"],
+        cwd=CWD,
+    )
+    assert resp["ok"]
+    job = await wait_for_status(daemon.socket_path, resp["data"]["id"], {"done", "failed"})
+    assert json.loads(job["raw_cmd"]) == ["echo", "hello"]
+    assert json.loads(job["resolved_cmd"])[0] == "/bin/echo"
+
+
+@pytest.mark.asyncio
+async def test_raw_argv_falls_back_to_argv_when_absent(daemon):
+    # older clients that don't send raw_argv -- unchanged behavior.
+    resp = await send(daemon.socket_path, "add", argv=["/bin/echo", "hi"], cwd=CWD)
+    assert resp["ok"]
+    job = await wait_for_status(daemon.socket_path, resp["data"]["id"], {"done", "failed"})
+    assert json.loads(job["raw_cmd"]) == ["/bin/echo", "hi"]
+
+
+@pytest.mark.asyncio
 async def test_add_rejects_missing_executable(daemon):
     resp = await send(daemon.socket_path, "add", argv=["/bin/this-does-not-exist-xyz"], cwd=CWD)
     assert resp["ok"] is False
@@ -359,6 +385,61 @@ async def test_rm_running_job_errors(daemon):
 async def test_rm_nonexistent_job_errors(daemon):
     resp = await send(daemon.socket_path, "rm", id=99999)
     assert resp["ok"] is False
+
+
+# ---------------------------------------------------------------------------
+# clear
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_clear_removes_finished_backlog(daemon):
+    resp = await send(daemon.socket_path, "add", argv=["/bin/echo", "hi"], cwd=CWD)
+    job_id = resp["data"]["id"]
+    await wait_for_status(daemon.socket_path, job_id, {"done", "failed"})
+
+    listing = await send(daemon.socket_path, "list")
+    assert any(j["id"] == job_id for j in _ch(listing["data"], 1)["backlog"])
+
+    clear_resp = await send(daemon.socket_path, "clear")
+    assert clear_resp["ok"]
+    assert clear_resp["data"]["cleared"] == 1
+
+    listing = await send(daemon.socket_path, "list")
+    assert _ch(listing["data"], 1)["backlog"] == []
+
+
+@pytest.mark.asyncio
+async def test_clear_leaves_queued_and_running_jobs_alone(daemon):
+    running = await send(daemon.socket_path, "add", argv=["sleep", "2"], cwd=CWD)
+    await asyncio.sleep(0.2)
+    queued = await send(daemon.socket_path, "add", argv=["sleep", "1"], cwd=CWD)
+
+    clear_resp = await send(daemon.socket_path, "clear")
+    assert clear_resp["ok"]
+    assert clear_resp["data"]["cleared"] == 0
+
+    listing = await send(daemon.socket_path, "list")
+    ch = _ch(listing["data"], 1)
+    assert ch["running"]["id"] == running["data"]["id"]
+    assert [j["id"] for j in ch["queue"]] == [queued["data"]["id"]]
+
+    await send(daemon.socket_path, "rm", id=queued["data"]["id"])
+    await send(daemon.socket_path, "cancel")  # cleanup
+
+
+@pytest.mark.asyncio
+async def test_clear_scoped_to_one_channel(daemon):
+    a = await send(daemon.socket_path, "add", argv=["/bin/echo", "a"], cwd=CWD, channel=1)
+    b = await send(daemon.socket_path, "add", argv=["/bin/echo", "b"], cwd=CWD, channel=2)
+    await wait_for_status(daemon.socket_path, a["data"]["id"], {"done", "failed"})
+    await wait_for_status(daemon.socket_path, b["data"]["id"], {"done", "failed"})
+
+    clear_resp = await send(daemon.socket_path, "clear", channel=1)
+    assert clear_resp["data"]["cleared"] == 1
+
+    listing = await send(daemon.socket_path, "list")
+    assert _ch(listing["data"], 1)["backlog"] == []
+    assert len(_ch(listing["data"], 2)["backlog"]) == 1
 
 
 # ---------------------------------------------------------------------------

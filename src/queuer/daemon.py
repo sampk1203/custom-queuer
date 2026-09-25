@@ -314,6 +314,12 @@ class Daemon:
 
     async def _cmd_add(self, args: dict[str, Any]) -> dict[str, Any]:
         argv = args["argv"]
+        # `raw_argv` is exactly what the user typed after `--`, with no
+        # interpreter-pinning or bash-wrapping applied -- kept separate from
+        # `argv` (which is what's actually resolved/exec'd) so `raw command`
+        # in show/list reflects what was typed. Older clients that don't
+        # send it fall back to `argv`, same as before this field existed.
+        raw_argv = args.get("raw_argv") or argv
         cwd = args["cwd"]
         channel = args.get("channel") or db.DEFAULT_CHANNEL
         now = bool(args.get("now"))
@@ -341,7 +347,7 @@ class Daemon:
         assert self.conn is not None
         job_id = db.enqueue(
             self.conn,
-            raw_cmd=argv,
+            raw_cmd=raw_argv,
             resolved_cmd=resolved,
             cwd=cwd,
             log_path="pending",
@@ -394,6 +400,12 @@ class Daemon:
         if job is None:
             raise ValueError(f"job {args['id']} does not exist")
         return job
+
+    async def _cmd_clear(self, args: dict[str, Any]) -> dict[str, Any]:
+        assert self.conn is not None
+        channel = args.get("channel")
+        cleared = db.clear_backlog(self.conn, channel=channel)
+        return {"cleared": cleared, "channel": channel}
 
     async def _cmd_rm(self, args: dict[str, Any]) -> dict[str, Any]:
         assert self.conn is not None

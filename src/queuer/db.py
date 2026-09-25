@@ -353,6 +353,27 @@ def _prune_backlog(conn: sqlite3.Connection, channel: int, keep: int = 10) -> No
         conn.commit()
 
 
+def clear_backlog(conn: sqlite3.Connection, channel: int | None = None) -> int:
+    """Delete all finished (done/failed/cancelled) job rows -- the history
+    shown by `list`/`status`, and nothing else. Queued, running, and
+    stopped (frozen by `--now`) jobs are never touched by this. Log files
+    on disk are left alone (see `clean-logs` for those). Returns the
+    number of rows deleted.
+
+    `channel=None` clears every channel's backlog; passing a channel
+    number scopes it to just that one.
+    """
+    if channel is None:
+        cur = conn.execute("DELETE FROM jobs WHERE status IN ('done', 'failed', 'cancelled')")
+    else:
+        cur = conn.execute(
+            "DELETE FROM jobs WHERE status IN ('done', 'failed', 'cancelled') AND channel = ?",
+            (channel,),
+        )
+    conn.commit()
+    return cur.rowcount
+
+
 def remove_from_queue(conn: sqlite3.Connection, job_id: int) -> None:
     job = get_job(conn, job_id)
     if job is None:
