@@ -339,6 +339,9 @@ class Daemon:
         virtual_env = args.get("virtual_env")
         if virtual_env:
             env_extra["VIRTUAL_ENV"] = virtual_env
+        python_path = args.get("python_path")
+        if python_path:
+            env_extra["PYTHONPATH"] = python_path
         env_extra = env_extra or None
 
         # log_path needs the row's own id, which we don't have until after

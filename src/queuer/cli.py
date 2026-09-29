@@ -311,6 +311,7 @@ def add(
         cwd=os.getcwd(),
         path=os.environ.get("PATH", ""),
         virtual_env=os.environ.get("VIRTUAL_ENV"),
+        python_path=os.environ.get("PYTHONPATH"),
         channel=channel,
         before=before,
         after=after,
