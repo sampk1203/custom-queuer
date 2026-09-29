@@ -370,6 +370,12 @@ def clear_backlog(conn: sqlite3.Connection, channel: int | None = None) -> int:
             "DELETE FROM jobs WHERE status IN ('done', 'failed', 'cancelled') AND channel = ?",
             (channel,),
         )
+    # Drop registry rows for channels (other than the default) that now have
+    # no jobs at all, so `list`/`status` stop showing empty channels.
+    conn.execute(
+        "DELETE FROM channels WHERE id != ? AND id NOT IN (SELECT DISTINCT channel FROM jobs)",
+        (DEFAULT_CHANNEL,),
+    )
     conn.commit()
     return cur.rowcount
 

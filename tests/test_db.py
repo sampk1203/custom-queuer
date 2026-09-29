@@ -627,3 +627,38 @@ def test_clear_backlog_scoped_to_one_channel(conn):
 
 def test_clear_backlog_empty_is_a_noop(conn):
     assert db.clear_backlog(conn) == 0
+
+
+def test_clear_backlog_prunes_empty_channels_except_default(conn):
+    a = _mk(conn, "a", channel=1)
+    b = _mk(conn, "b", channel=2)
+    c = _mk(conn, "c", channel=3)
+    keep = _mk(conn, "d", channel=4)  # stays queued -- channel 4 must survive
+    _finish(conn, a)
+    _finish(conn, b)
+    _finish(conn, c)
+
+    db.clear_backlog(conn)
+
+    assert db.list_channels(conn) == [1, 4]
+    assert [j["id"] for j in db.get_queue(conn, channel=4)] == [keep]
+
+
+def test_clear_backlog_keeps_default_channel_when_empty(conn):
+    a = _mk(conn, "a", channel=1)
+    _finish(conn, a)
+
+    db.clear_backlog(conn)
+
+    assert db.list_channels(conn) == [1]
+
+
+def test_channel_reappears_after_prune_when_reused(conn):
+    a = _mk(conn, "a", channel=2)
+    _finish(conn, a)
+    db.clear_backlog(conn)
+    assert db.list_channels(conn) == []
+
+    _mk(conn, "b", channel=2)
+
+    assert db.list_channels(conn) == [2]
