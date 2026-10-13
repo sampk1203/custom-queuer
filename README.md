@@ -22,6 +22,7 @@ cd custom-queuer
 the project directory) — it syncs the venv, runs the test suite, installs
 `queuer` / `qur` / `queuerd` onto your `PATH` via `uv tool install
 --editable .` (edits to the code take effect without reinstalling), stops
+shell tab-completion for `qur`/`queuer` (for your login shell), stops
 any existing `queuerd` process (systemd-managed or stray), rewrites the
 systemd unit with the correct path, enables + starts it, and enables
 linger so it survives logout.
@@ -37,19 +38,22 @@ qur status
 ## Command reference
 
 `qur` works everywhere `queuer` does below — it's the same command, just shorter.
-Every command also has worked examples under `qur <command> --help`.
+Every command also has worked examples under `qur <command> --help`, and `qur --help-all`
+prints the help for every command at once.
 
 ```
-queuer add [--before ID | --after ID] [--timeout SECONDS] -- <cmd...>
-queuer list [--full] [--json]
+queuer add [--channel N] [--before ID | --after ID | --now] [--timeout SECONDS] [--retries N] -- <cmd...>
+queuer list [--channel N] [--full] [--json]
 queuer status [--json]
-queuer show ID [--json]
-queuer cancel
+queuer show ID [ID...] [--json]
+queuer cancel [--channel N]
+queuer clear [--channel N]
 queuer rm ID
 queuer requeue ID
-queuer pause
-queuer resume
+queuer pause [--channel N]
+queuer resume [--channel N]
 queuer logs ID [--tail]
+queuer clean-logs [--days N] [--dry-run]
 ```
 
 ### `add`
@@ -72,6 +76,12 @@ The command is captured two ways:
   `.venv/bin/python3` to its symlink target would silently break venv
   activation for the job).
 
+`--retries N` requeues the job automatically (at the end of its channel's
+queue) if it fails — non-zero exit, timeout, or failed start — up to N
+times. Each retry is a new job with its own ID and log; the failed job's
+note says which job replaced it. Cancelled jobs are never retried, and
+jobs interrupted by a daemon restart are not retried either.
+
 `add` validates the executable exists and is executable *before*
 accepting the job — a bad command is rejected immediately, not an hour
 later when it reaches the front of the queue.
@@ -82,17 +92,22 @@ and marks it `failed` with `note: timed out`.
 
 ### `list`
 
-Shows one table: the currently running job first (marked with `*`),
-followed by the queue, then the last 10 finished jobs (done/failed/
-cancelled — oldest evicted once you pass 10) in a separate section.
+Shows each channel in its own section: the running job first (marked
+with `*`), then the queue, with the time each job was queued and how long
+ago that was, then the last 10 finished jobs (done/failed/cancelled).
 
+- `--channel N` lists only that channel (default: all channels)
+- The `Origin` column says where a job came from: `new` (you queued it),
+  `retry of #N (k/max)` (automatic, after job N failed), or `requeue of #N`
+  (manual, via `qur requeue N`)
 - `--full` shows resolved absolute paths instead of what you typed
 - `--json` prints the raw response instead of a table, for scripting
 
-### `show ID`
+### `show ID [ID...]`
 
-Full detail on one job — both command forms, cwd, every timestamp,
-duration, exit code, timeout setting, pid, and log path.
+Full detail on one or more jobs — both command forms, cwd, every timestamp,
+duration, exit code, timeout, auto-retry count, pid, and log path. With
+`--json`, one ID prints an object; several print a list.
 
 ### `cancel`
 
@@ -109,7 +124,7 @@ doesn't exist.
 ### `requeue ID`
 
 Re-enqueues a finished job (done/failed/cancelled) with its exact
-original command, working directory, and timeout, appended to the end
+original command, working directory, timeout, and retry setting, appended to the end
 of the queue. Handy for rerunning a job that failed without retyping it.
 
 ### `pause` / `resume`
@@ -179,8 +194,8 @@ For a design/architecture writeup and the phase-by-phase build plan, see
 
 ## Known limitations (by design, not oversights)
 
-- Strictly serial — one job at a time, no concurrency.
-- No automatic retries on failure — use `requeue` manually.
+- Serial within a channel — one job at a time per channel (channels run in parallel).
+- Retries are opt-in per job (`--retries`), immediate, and go to the end of the queue.
 - No sandboxing — jobs run with your own user permissions, same as
   running them directly in a shell.
 - Nothing currently prevents two `queuerd` processes from running

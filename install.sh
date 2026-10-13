@@ -3,7 +3,7 @@
 # Safe to re-run any time (e.g. after moving the project or pulling updates).
 #
 # Order of operations, and why: bootstrap uv -> sync venv -> run full test
-# suite -> only then touch the running service. If the tests fail, the
+# suite -> install CLI + shell completion -> only then touch the running service. If the tests fail, the
 # script stops there and the previously-installed (working) daemon, if
 # any, is left running untouched.
 set -euo pipefail
@@ -65,6 +65,24 @@ echo "==> All tests passed"
 echo "==> Installing CLI onto PATH (queuer, qur, queuerd)"
 uv tool install --editable . --force
 uv tool update-shell
+
+# ---------------------------------------------------------------------------
+# 3c. Install shell tab-completion for `qur` and `queuer`
+#     Typer detects the shell from the parent process, so run it inside the
+#     user's login shell ($SHELL) -- otherwise it would see this script's own
+#     bash and install bash completion for a zsh/fish user. A failure here is
+#     only a warning: completion is a convenience, not worth aborting for.
+# ---------------------------------------------------------------------------
+
+echo "==> Installing shell completion for ${SHELL:-bash}"
+UV_TOOL_BIN="$(uv tool dir --bin)"
+for prog in qur queuer; do
+    # "; exit \$?" stops the shell from exec-ing the command directly, which
+    # would remove the shell from the process tree and break detection
+    if ! "${SHELL:-bash}" -c "'$UV_TOOL_BIN/$prog' --install-completion; exit \$?"; then
+        echo "WARNING: could not install completion for '$prog' (run '$prog --install-completion' manually)." >&2
+    fi
+done
 
 # ---------------------------------------------------------------------------
 # 4. Stop any existing queuerd (systemd-managed or a stray manual process)

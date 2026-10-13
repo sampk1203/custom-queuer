@@ -491,6 +491,117 @@ async def test_requeue_preserves_channel(daemon):
 
 
 # ---------------------------------------------------------------------------
+# auto-retry (--retries)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_failed_job_is_retried_up_to_max_retries(daemon):
+    r = await send(daemon.socket_path, "add", argv=["false"], cwd=CWD, max_retries=2)
+    first = r["data"]["id"]
+
+    last = await wait_for_status(daemon.socket_path, first + 2, {"failed"})
+    assert last["attempt"] == 2
+    assert last["max_retries"] == 2
+
+    # retry budget exhausted -- no 4th job
+    await asyncio.sleep(0.5)
+    assert (await send(daemon.socket_path, "show", id=first + 3))["ok"] is False
+
+    # the first failure's note says where its retry went
+    j1 = (await send(daemon.socket_path, "show", id=first))["data"]
+    assert j1["attempt"] == 0
+    assert j1["origin"] is None
+    j2 = (await send(daemon.socket_path, "show", id=first + 1))["data"]
+    assert (j2["origin"], j2["parent_id"]) == ("retry", first)
+    assert (last["origin"], last["parent_id"]) == ("retry", first + 1)
+    assert f"queued as job {first + 1}" in j1["note"]
+
+
+@pytest.mark.asyncio
+async def test_retry_stops_once_job_succeeds(daemon, tmp_path):
+    marker = tmp_path / "ran-once"
+    script = f"test -f {marker} || {{ touch {marker}; exit 1; }}"
+    r = await send(daemon.socket_path, "add", argv=["sh", "-c", script], cwd=CWD, max_retries=5)
+    first = r["data"]["id"]
+
+    j1 = await wait_for_status(daemon.socket_path, first, {"failed"})
+    j2 = await wait_for_status(daemon.socket_path, first + 1, {"done"})
+    assert j2["attempt"] == 1
+
+    await asyncio.sleep(0.5)
+    assert (await send(daemon.socket_path, "show", id=first + 2))["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_no_retry_by_default(daemon):
+    r = await send(daemon.socket_path, "add", argv=["false"], cwd=CWD)
+    first = r["data"]["id"]
+    await wait_for_status(daemon.socket_path, first, {"failed"})
+    await asyncio.sleep(0.5)
+    assert (await send(daemon.socket_path, "show", id=first + 1))["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_successful_job_is_not_retried(daemon):
+    r = await send(daemon.socket_path, "add", argv=["true"], cwd=CWD, max_retries=3)
+    first = r["data"]["id"]
+    await wait_for_status(daemon.socket_path, first, {"done"})
+    await asyncio.sleep(0.5)
+    assert (await send(daemon.socket_path, "show", id=first + 1))["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_cancelled_job_is_not_retried(daemon):
+    r = await send(daemon.socket_path, "add", argv=["sleep", "5"], cwd=CWD, max_retries=3)
+    first = r["data"]["id"]
+    await wait_for_status(daemon.socket_path, first, {"running"})
+    await send(daemon.socket_path, "cancel")
+    await wait_for_status(daemon.socket_path, first, {"cancelled"})
+    await asyncio.sleep(0.5)
+    assert (await send(daemon.socket_path, "show", id=first + 1))["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_timed_out_job_is_retried(daemon):
+    r = await send(
+        daemon.socket_path, "add", argv=["sleep", "30"], cwd=CWD, timeout_secs=1, max_retries=1
+    )
+    first = r["data"]["id"]
+    j1 = await wait_for_status(daemon.socket_path, first, {"failed"}, timeout=10)
+    assert "timed out" in j1["note"]
+    j2 = await wait_for_status(daemon.socket_path, first + 1, {"failed"}, timeout=10)
+    assert j2["attempt"] == 1
+
+
+@pytest.mark.asyncio
+async def test_retry_stays_on_same_channel(daemon):
+    r = await send(daemon.socket_path, "add", argv=["false"], cwd=CWD, channel=3, max_retries=1)
+    first = r["data"]["id"]
+    j2 = await wait_for_status(daemon.socket_path, first + 1, {"failed"})
+    assert j2["channel"] == 3
+
+
+@pytest.mark.asyncio
+async def test_negative_retries_rejected(daemon):
+    r = await send(daemon.socket_path, "add", argv=["true"], cwd=CWD, max_retries=-1)
+    assert r["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_manual_requeue_resets_attempt(daemon):
+    r = await send(daemon.socket_path, "add", argv=["false"], cwd=CWD, max_retries=1)
+    first = r["data"]["id"]
+    last = await wait_for_status(daemon.socket_path, first + 1, {"failed"})
+    assert last["attempt"] == 1
+
+    rq = await send(daemon.socket_path, "requeue", id=last["id"])
+    new_job = (await send(daemon.socket_path, "show", id=rq["data"]["id"]))["data"]
+    assert new_job["attempt"] == 0
+    assert (new_job["origin"], new_job["parent_id"]) == ("requeue", last["id"])
+    assert new_job["max_retries"] == 1
+
+
+# ---------------------------------------------------------------------------
 # pause / resume
 # ---------------------------------------------------------------------------
 

@@ -22,7 +22,21 @@ from queuer.daemon import _default_db_path, _default_log_dir
 from queuer.db import DEFAULT_CHANNEL
 from queuer.pathresolve import SHELL_INTERPRETERS
 
-app = typer.Typer(help="queuer: a background job queue with parallel channels")
+app = typer.Typer(
+    help="""Background job queue. Jobs on one channel run one at a time, in order; \
+different channels run in parallel (default channel: 1). `qur` is a short alias for `queuer`.
+
+\b
+Quick start:
+  qur add -- python train.py           queue a job
+  qur add --retries 2 -- ./flaky.sh    auto-requeue up to 2 times if it fails
+  qur list                             running / queued / recent jobs, all channels
+  qur show 12 14                       full detail for jobs 12 and 14
+  qur logs 12 --tail                   follow job 12's output
+  qur cancel                           kill the running job
+
+Run `qur <command> --help` for one command, or `qur --help-all` for every command's help.""",
+)
 console = Console()
 
 
@@ -207,16 +221,11 @@ def _cmd_str(job: dict[str, Any], full: bool) -> str:
 def _fmt_time(ts: str | None) -> str:
     if not ts:
         return "-"
-    return datetime.fromisoformat(ts).strftime("%Y-%m-%d %H:%M:%S")
+    # stored timestamps are UTC; show them in the machine's local time
+    return datetime.fromisoformat(ts).astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _fmt_duration(job: dict[str, Any]) -> str:
-    started = job.get("started_at")
-    if not started:
-        return "-"
-    start = datetime.fromisoformat(started)
-    end = datetime.fromisoformat(job["finished_at"]) if job.get("finished_at") else datetime.now(start.tzinfo)
-    secs = (end - start).total_seconds()
+def _fmt_secs(secs: float) -> str:
     if secs < 60:
         return f"{secs:.0f}s"
     minutes, secs = divmod(int(secs), 60)
@@ -226,50 +235,111 @@ def _fmt_duration(job: dict[str, Any]) -> str:
     return f"{hours}h{minutes}m"
 
 
+def _fmt_duration(job: dict[str, Any]) -> str:
+    started = job.get("started_at")
+    if not started:
+        return "-"
+    start = datetime.fromisoformat(started)
+    end = datetime.fromisoformat(job["finished_at"]) if job.get("finished_at") else datetime.now(start.tzinfo)
+    return _fmt_secs((end - start).total_seconds())
+
+
+def _fmt_origin(job: dict[str, Any]) -> str:
+    """Where a job came from: queued fresh, auto-retried by the daemon after a
+    failure, or requeued by hand."""
+    origin, parent = job.get("origin"), job.get("parent_id")
+    if origin == "retry":
+        return f"retry of #{parent} ({job['attempt']}/{job['max_retries']})"
+    if origin == "requeue":
+        return f"requeue of #{parent}"
+    return "new"
+
+
+def _fmt_elapsed(ts: str | None) -> str:
+    """Time since `ts` (an ISO timestamp), e.g. how long a job has been queued."""
+    if not ts:
+        return "-"
+    then = datetime.fromisoformat(ts)
+    return _fmt_secs(max(0.0, (datetime.now(then.tzinfo) - then).total_seconds()))
+
+
 # ---------------------------------------------------------------------------
 # add
 # ---------------------------------------------------------------------------
 
+def _help_all(ctx: typer.Context, value: bool) -> None:
+    if not value or ctx.resilient_parsing:
+        return
+    group = typer.main.get_command(app)
+    prog = ctx.find_root().info_name or "qur"
+    for name in group.commands:
+        console.rule(f"[bold]{prog} {name}[/bold]")
+        try:
+            group.main(args=[name, "--help"], prog_name=prog, standalone_mode=False)
+        except SystemExit:
+            pass
+    raise typer.Exit()
+
+
+@app.callback()
+def main(
+    help_all: bool = typer.Option(
+        False, "--help-all", callback=_help_all, is_eager=True,
+        help="Show the help for every command, one after another, and exit.",
+    ),
+) -> None:
+    pass
+
+
 @app.command()
 def add(
     cmd: list[str] = typer.Argument(
-        ..., help="Command to run, exactly as you'd type it in a shell. Plain commands are "
-        "exec'd directly, no shell involved: queuer add -- python train.py --epochs 5. "
-        "If your command uses shell syntax (&&, |, ;, <, >, $VARS, globs), quote the WHOLE "
-        "thing as one argument so your own shell hands it to queuer intact instead of "
-        "acting on it itself -- queuer then runs it via `bash -c`: "
-        "queuer add -- 'az login && ./deploy.sh'  or  queuer add -- 'g16 < input.gjf'"
+        ..., metavar="CMD...",
+        help="Command to run, written after `--`. Quote the WHOLE command as one "
+        "argument if it needs shell syntax (&&, |, ;, <, >, $VARS, globs)."
     ),
     channel: int = typer.Option(
-        DEFAULT_CHANNEL, "--channel", help="Channel to queue on. Each channel runs serially; "
-        "different channels run in parallel. Defaults to channel 1."
+        DEFAULT_CHANNEL, "--channel", help="Channel to queue on. Jobs on one channel run one at a "
+        "time; different channels run in parallel."
     ),
-    before: Optional[int] = typer.Option(None, "--before", help="Insert before this job ID (same channel)"),
-    after: Optional[int] = typer.Option(None, "--after", help="Insert after this job ID (same channel)"),
+    before: Optional[int] = typer.Option(None, "--before", help="Insert before this queued job ID (same channel)"),
+    after: Optional[int] = typer.Option(None, "--after", help="Insert after this queued job ID (same channel)"),
     timeout: Optional[int] = typer.Option(
-        None, "--timeout", help="Kill the job if it runs longer than this many seconds"
+        None, "--timeout", help="Kill the job if it runs longer than this many seconds (counts as a failure)"
+    ),
+    retries: int = typer.Option(
+        0, "--retries", min=0,
+        help="If the job fails (non-zero exit, timeout, or failed start), requeue it automatically at the "
+        "end of its channel's queue, up to this many times. Cancelled jobs are never retried.",
     ),
     now: bool = typer.Option(
         False, "--now",
-        help="Jump the channel's queue: freezes (SIGSTOP) whatever is currently running "
-        "on that channel and runs this immediately. Further --now jobs queue FIFO behind "
-        "it; once the priority lane empties, the frozen job resumes (SIGCONT) untouched. "
+        help="Jump the channel's queue: freeze (SIGSTOP) the running job and run this first. "
+        "More --now jobs run FIFO behind it, then the frozen job resumes (SIGCONT). "
         "Cannot be combined with --before/--after.",
     ),
 ) -> None:
-    """Enqueue a job. Runs via `bash -c`, so shell syntax works -- quote the whole
-    command as one argument if it uses any (see the argument help above).
+    """Queue a job.
 
+    Plain commands run directly, with no shell. If the command needs shell syntax,
+    quote the whole thing as one argument and it runs via `bash -c`. Put `--` before
+    the command so its own flags aren't parsed as queuer options.
+
+    The executable is checked when you add the job, so a bad command is rejected
+    immediately instead of when it reaches the front of the queue.
+
+    \b
     Examples:
-      queuer add -- python train.py --epochs 5
-      queuer add --channel 2 -- python train.py --epochs 5
-      queuer add --timeout 60 -- ./run.sh
-      queuer add --after 12 -- python eval.py
-      queuer add --before 12 -- python setup.py
-      queuer add --now -- python urgent_eval.py
-      queuer add -- curl -d '{"key": "value"}' https://example.com/api
-      queuer add -- 'g16 < input.gjf > output.log'
-      queuer add -- 'az login && ./deploy.sh'
+      qur add -- python train.py --epochs 5
+      qur add --channel 2 -- python train.py --epochs 5
+      qur add --timeout 60 -- ./run.sh
+      qur add --retries 3 -- python flaky_download.py
+      qur add --after 12 -- python eval.py
+      qur add --before 12 -- python setup.py
+      qur add --now -- python urgent_eval.py
+      qur add -- curl -d '{"key": "value"}' https://example.com/api
+      qur add -- 'g16 < input.gjf > output.log'
+      qur add -- 'az login && ./deploy.sh'
     """
     if not cmd:
         typer.echo("Error: no command given after --", err=True)
@@ -317,8 +387,11 @@ def add(
         after=after,
         timeout_secs=timeout,
         now=now,
+        max_retries=retries,
     )
     console.print(f"Queued as job [bold]{data['id']}[/bold] on channel [bold]{data['channel']}[/bold]")
+    if retries:
+        console.print(f"auto-retry on failure: up to {retries} time(s)")
     if now:
         console.print("[yellow]--now[/yellow]: current job on this channel frozen (if any); this runs first")
 
@@ -343,13 +416,26 @@ def _render_queue_and_backlog(channel_data: dict[str, Any], full: bool) -> None:
     queue_table = Table(show_lines=False)
     queue_table.add_column("ID", justify="right")
     queue_table.add_column("Command")
+    queue_table.add_column("Origin")
+    queue_table.add_column("Queued")
+    queue_table.add_column("Elapsed", justify="right")
     if running:
         marker = "* (priority)" if running.get("is_priority") else "*"
-        queue_table.add_row(str(running["id"]), f"{marker} {_cmd_str(running, full)}", style="bold green")
+        queue_table.add_row(
+            str(running["id"]), f"{marker} {_cmd_str(running, full)}", _fmt_origin(running),
+            _fmt_time(running["enqueued_at"]), _fmt_elapsed(running["enqueued_at"]),
+            style="bold green",
+        )
     for job in priority_queue:
-        queue_table.add_row(str(job["id"]), f"(priority) {_cmd_str(job, full)}")
+        queue_table.add_row(
+            str(job["id"]), f"(priority) {_cmd_str(job, full)}", _fmt_origin(job),
+            _fmt_time(job["enqueued_at"]), _fmt_elapsed(job["enqueued_at"]),
+        )
     for job in channel_data["queue"]:
-        queue_table.add_row(str(job["id"]), _cmd_str(job, full))
+        queue_table.add_row(
+            str(job["id"]), _cmd_str(job, full), _fmt_origin(job),
+            _fmt_time(job["enqueued_at"]), _fmt_elapsed(job["enqueued_at"]),
+        )
 
     if running or priority_queue or channel_data["queue"]:
         console.print(queue_table)
@@ -360,6 +446,7 @@ def _render_queue_and_backlog(channel_data: dict[str, Any], full: bool) -> None:
     backlog_table.add_column("ID", justify="right")
     backlog_table.add_column("Status")
     backlog_table.add_column("Command")
+    backlog_table.add_column("Origin")
     backlog_table.add_column("Duration", justify="right")
     backlog_table.add_column("Exit", justify="right")
     for job in channel_data["backlog"]:
@@ -368,6 +455,7 @@ def _render_queue_and_backlog(channel_data: dict[str, Any], full: bool) -> None:
             str(job["id"]),
             f"[{status_style}]{job['status']}[/{status_style}]" if status_style else job["status"],
             _cmd_str(job, full),
+            _fmt_origin(job),
             _fmt_duration(job),
             str(job["exit_code"]) if job["exit_code"] is not None else "-",
         )
@@ -376,20 +464,40 @@ def _render_queue_and_backlog(channel_data: dict[str, Any], full: bool) -> None:
 
 @app.command(name="list")
 def list_jobs(
+    channel: Optional[int] = typer.Option(
+        None, "--channel", help="Only list this channel (default: every channel)"
+    ),
     full: bool = typer.Option(False, "--full", help="Show resolved absolute paths instead of what you typed"),
     as_json: bool = typer.Option(False, "--json", help="Print raw JSON instead of a table"),
 ) -> None:
-    """Show every channel's currently running job, queue, and last 10
-    finished jobs, each in its own section. Only channels that have had a
-    job land on them show up here.
+    """List running, queued, and recent jobs, one section per channel.
 
+    Each channel shows its running job (marked *), then its queue, with when each
+    job was queued and how long ago that was ("Elapsed" counts from queue time,
+    so it includes any wait). Below that: the last 10 finished jobs.
+
+    The Origin column says where a job came from: "new" (queued by you),
+    "retry of #N" (queued automatically by --retries after job N failed; shows
+    the retry count), or "requeue of #N" (you ran `qur requeue N`). Only channels
+    that have had a job show up. For one job's full detail, use `qur show`.
+
+    \b
     Examples:
-      queuer list
-      queuer list --full
-      queuer list --json
+      qur list
+      qur list --channel 2
+      qur list --full
+      qur list --json
     """
     data = _call("list")
     channels = data["channels"]
+
+    if channel is not None:
+        # daemon returns every channel; keys are strings after the JSON round-trip
+        channels = {k: v for k, v in channels.items() if int(k) == channel}
+        if not channels:
+            typer.echo(f"Error: channel {channel} has no jobs (nothing has been queued on it)", err=True)
+            raise typer.Exit(code=1)
+        data = {"channels": channels}
 
     if as_json:
         console.print_json(json.dumps(data))
@@ -411,12 +519,16 @@ def list_jobs(
 # ---------------------------------------------------------------------------
 
 @app.command()
-def status(as_json: bool = typer.Option(False, "--json")) -> None:
-    """Show only the currently running job, for every channel.
+def status(as_json: bool = typer.Option(False, "--json", help="Print raw JSON instead of text")) -> None:
+    """Show the running job on every channel.
 
+    Also shows whether a channel is paused, and any job frozen by a `--now`
+    preemption. Does not list queued jobs -- use `qur list` for those.
+
+    \b
     Examples:
-      queuer status
-      queuer status --json
+      qur status
+      qur status --json
     """
     data = _call("status")
     channels = data["channels"]
@@ -452,19 +564,7 @@ def status(as_json: bool = typer.Option(False, "--json")) -> None:
 # show
 # ---------------------------------------------------------------------------
 
-@app.command()
-def show(job_id: int, as_json: bool = typer.Option(False, "--json")) -> None:
-    """Show full detail for one job: raw+resolved command, cwd, timestamps, exit code.
-
-    Examples:
-      queuer show 12
-      queuer show 12 --json
-    """
-    job = _call("show", id=job_id)
-    if as_json:
-        console.print_json(json.dumps(job))
-        return
-
+def _render_job(job: dict[str, Any]) -> None:
     table = Table(show_header=False, title=f"Job #{job['id']}")
     table.add_row("channel", str(job["channel"]))
     table.add_row("status", job["status"])
@@ -477,11 +577,56 @@ def show(job_id: int, as_json: bool = typer.Option(False, "--json")) -> None:
     table.add_row("duration", _fmt_duration(job))
     table.add_row("exit code", str(job["exit_code"]) if job["exit_code"] is not None else "-")
     table.add_row("timeout", f"{job['timeout_secs']}s" if job["timeout_secs"] else "none")
+    table.add_row("origin", _fmt_origin(job))
+    if job.get("max_retries"):
+        table.add_row("auto-retries", f"{job['attempt']} of {job['max_retries']} used")
     table.add_row("pid", str(job["pid"]) if job["pid"] else "-")
     table.add_row("log", job["log_path"])
     if job["note"]:
         table.add_row("note", job["note"])
     console.print(table)
+
+
+@app.command()
+def show(
+    job_ids: list[int] = typer.Argument(..., help="One or more job IDs", metavar="JOB_ID..."),
+    as_json: bool = typer.Option(False, "--json", help="Print raw JSON (one object, or a list for several IDs)"),
+) -> None:
+    """Show full detail for one or more jobs.
+
+    Shows raw and resolved command, cwd, timestamps, duration, exit code, timeout,
+    auto-retry count, pid, log path, and any note. With several IDs, an unknown ID
+    prints an error but the others are still shown (exit code 1 at the end).
+
+    \b
+    Examples:
+      qur show 12
+      qur show 12 14 15
+      qur show 12 --json
+    """
+    jobs: list[dict[str, Any]] = []
+    failed = False
+    for job_id in job_ids:
+        try:
+            jobs.append(client.send("show", id=job_id))
+        except client.DaemonError as e:
+            typer.echo(f"Error: {e}", err=True)
+            failed = True
+        except client.DaemonNotRunning as e:
+            typer.echo(f"Error: {e}", err=True)
+            raise typer.Exit(code=1)
+
+    if as_json:
+        if jobs:
+            console.print_json(json.dumps(jobs[0] if len(job_ids) == 1 else jobs))
+    else:
+        for i, job in enumerate(jobs):
+            if i > 0:
+                console.print()
+            _render_job(job)
+
+    if failed:
+        raise typer.Exit(code=1)
 
 
 # ---------------------------------------------------------------------------
@@ -492,11 +637,17 @@ def show(job_id: int, as_json: bool = typer.Option(False, "--json")) -> None:
 def cancel(
     channel: int = typer.Option(DEFAULT_CHANNEL, "--channel", help="Channel whose running job to kill"),
 ) -> None:
-    """Kill the currently running job on a channel (default: channel 1).
+    """Kill a channel's running job.
 
-    Example:
-      queuer cancel
-      queuer cancel --channel 2
+    Sends SIGTERM to the job's whole process group, then SIGKILL if it is still
+    alive after a short grace period. The job is recorded as `cancelled` and is
+    never auto-retried. Errors if nothing is running on the channel. To drop a job
+    that hasn't started yet, use `qur rm`.
+
+    \b
+    Examples:
+      qur cancel
+      qur cancel --channel 2
     """
     data = _call("cancel", channel=channel)
     console.print(f"Cancelled job [bold]{data['cancelled']}[/bold] on channel [bold]{data['channel']}[/bold]")
@@ -508,14 +659,16 @@ def clear(
         None, "--channel", help="Only clear this channel's history (default: every channel)"
     ),
 ) -> None:
-    """Delete finished job records (done/failed/cancelled) -- the backlog
-    section shown by `list`/`status`. Queued and running jobs are never
-    touched. Log files on disk are untouched too -- use `clean-logs` for
-    those.
+    """Delete finished-job records (done/failed/cancelled).
 
+    Clears the "Recent" section of `qur list`. Queued, running, and frozen jobs are
+    never touched. Channels left with no jobs at all drop off the list (channel 1
+    always stays). Log files stay on disk -- use `qur clean-logs` for those.
+
+    \b
     Examples:
-      queuer clear
-      queuer clear --channel 2
+      qur clear
+      qur clear --channel 2
     """
     data = _call("clear", channel=channel)
     scope = f"channel {channel}" if channel is not None else "all channels"
@@ -523,22 +676,31 @@ def clear(
 
 
 @app.command()
-def rm(job_id: int) -> None:
-    """Remove a job from the queue. Fails if it's currently running -- use cancel for that.
+def rm(job_id: int = typer.Argument(..., help="ID of a queued job")) -> None:
+    """Remove a queued job.
 
+    The job is deleted outright, not kept as history. Only works on jobs that are
+    still waiting; for a running job use `qur cancel`.
+
+    \b
     Example:
-      queuer rm 12
+      qur rm 12
     """
     _call("rm", id=job_id)
     console.print(f"Removed job [bold]{job_id}[/bold]")
 
 
 @app.command()
-def requeue(job_id: int) -> None:
-    """Re-enqueue a finished job with its original command, cwd, timeout, and channel.
+def requeue(job_id: int = typer.Argument(..., help="ID of a finished job (done/failed/cancelled)")) -> None:
+    """Queue a finished job again.
 
+    Makes a new job with the original command, cwd, environment, timeout, channel,
+    and --retries setting (with a fresh retry count), added to the end of that
+    channel's queue. Only works on done/failed/cancelled jobs.
+
+    \b
     Example:
-      queuer requeue 12
+      qur requeue 12
     """
     data = _call("requeue", id=job_id)
     console.print(f"Requeued job {job_id} as new job [bold]{data['id']}[/bold]")
@@ -548,18 +710,20 @@ def requeue(job_id: int) -> None:
 def pause(
     channel: int = typer.Option(DEFAULT_CHANNEL, "--channel", help="Channel to pause"),
 ) -> None:
-    """Stop a channel from starting new jobs (default: channel 1). The
-    channel's current job, if any, keeps running. Other channels are
-    unaffected.
+    """Stop a channel from starting new queued jobs.
 
-    Example:
-      queuer pause
-      queuer pause --channel 2
+    The channel's running job, if any, finishes normally. Other channels are
+    unaffected. The paused state survives daemon restarts. Undo with `qur resume`.
+
+    \b
+    Examples:
+      qur pause
+      qur pause --channel 2
     """
     _call("pause", channel=channel)
     console.print(
         f"[yellow]Paused[/yellow] channel {channel} -- new jobs will not start until you run "
-        f"`queuer resume --channel {channel}`"
+        f"`qur resume --channel {channel}`"
     )
 
 
@@ -567,11 +731,12 @@ def pause(
 def resume(
     channel: int = typer.Option(DEFAULT_CHANNEL, "--channel", help="Channel to resume"),
 ) -> None:
-    """Resume pulling new jobs from a channel's queue (default: channel 1).
+    """Let a paused channel start queued jobs again.
 
-    Example:
-      queuer resume
-      queuer resume --channel 2
+    \b
+    Examples:
+      qur resume
+      qur resume --channel 2
     """
     _call("resume", channel=channel)
     console.print(f"[green]Resumed[/green] channel {channel}")
@@ -583,14 +748,18 @@ def resume(
 
 @app.command()
 def logs(
-    job_id: int,
+    job_id: int = typer.Argument(..., help="Job ID"),
     tail: bool = typer.Option(False, "--tail", help="Follow the log as it grows (Ctrl-C to stop)"),
 ) -> None:
-    """Read a job's log file directly from disk (works even if the daemon isn't running).
+    """Print a job's log (stdout and stderr combined).
 
+    Reads the log file straight from disk, so it works even if the daemon isn't
+    running. Each retry of a job is a separate job with its own log.
+
+    \b
     Examples:
-      queuer logs 12
-      queuer logs 12 --tail
+      qur logs 12
+      qur logs 12 --tail
     """
     log_path = _default_log_dir() / f"{job_id}.log"
     if not log_path.exists():
@@ -619,17 +788,17 @@ def clean_logs(
     days: int = typer.Option(30, "--days", help="Delete logs for jobs finished more than this many days ago"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be deleted without deleting"),
 ) -> None:
-    """Delete old log files from disk to free space.
+    """Delete old log files from disk.
 
-    Only touches finished jobs (done/failed/cancelled) whose finished_at
-    is older than --days. Also removes orphaned logs (files whose job row
-    no longer exists in the DB, e.g. pruned backlog). Never touches logs
-    for queued/running/stopped jobs. Reads the DB directly -- works even
-    if the daemon isn't running.
+    Removes logs of finished jobs (done/failed/cancelled) finished more than --days
+    ago, plus orphaned logs whose job record no longer exists (e.g. pruned from
+    Recent). Never touches logs of queued, running, or frozen jobs. Reads the DB
+    directly, so it works even if the daemon isn't running.
 
+    \b
     Examples:
-      queuer clean-logs --dry-run
-      queuer clean-logs --days 7
+      qur clean-logs --dry-run
+      qur clean-logs --days 7
     """
     log_dir = _default_log_dir()
     if not log_dir.exists():

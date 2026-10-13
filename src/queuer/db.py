@@ -42,7 +42,11 @@ CREATE TABLE IF NOT EXISTS jobs (
     log_path      TEXT NOT NULL,
     note          TEXT,
     timeout_secs  INTEGER,
-    is_priority   INTEGER NOT NULL DEFAULT 0
+    is_priority   INTEGER NOT NULL DEFAULT 0,
+    max_retries   INTEGER NOT NULL DEFAULT 0,
+    attempt       INTEGER NOT NULL DEFAULT 0,
+    parent_id     INTEGER,
+    origin        TEXT
 );
 """
 
@@ -92,10 +96,28 @@ def _migrate_add_priority_lane(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _migrate_add_retries(conn: sqlite3.Connection) -> None:
+    """DBs created before auto-retry lack `max_retries` / `attempt` /
+    `parent_id` / `origin`. Plain
+    ADD COLUMN works here (no CHECK change needed). No-op once migrated."""
+    cols = [r["name"] for r in conn.execute("PRAGMA table_info(jobs)").fetchall()]
+    if "max_retries" not in cols:
+        conn.execute("ALTER TABLE jobs ADD COLUMN max_retries INTEGER NOT NULL DEFAULT 0")
+    if "attempt" not in cols:
+        conn.execute("ALTER TABLE jobs ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0")
+    # where a job came from: NULL origin = queued fresh by a human
+    if "parent_id" not in cols:
+        conn.execute("ALTER TABLE jobs ADD COLUMN parent_id INTEGER")
+    if "origin" not in cols:
+        conn.execute("ALTER TABLE jobs ADD COLUMN origin TEXT")
+    conn.commit()
+
+
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA)
     conn.commit()
     _migrate_add_priority_lane(conn)
+    _migrate_add_retries(conn)
 
 
 def _now() -> str:
@@ -164,6 +186,10 @@ def enqueue(
     before: int | None = None,
     after: int | None = None,
     is_priority: bool = False,
+    max_retries: int = 0,
+    attempt: int = 0,
+    parent_id: int | None = None,
+    origin: str | None = None,
 ) -> int:
     """Insert a new queued job on `channel`. Returns the new job's id.
 
@@ -177,6 +203,13 @@ def enqueue(
     its normal queue -- a separate FIFO with its own position sequence,
     used by `--now`. `before`/`after` are always resolved against the same
     lane the new job is joining.
+
+    `max_retries` is how many times the daemon may automatically requeue
+    this job if it fails; `attempt` is how many automatic retries have
+    already happened (0 for a job a human queued). `parent_id`/`origin`
+    record where the job came from: origin is None for a fresh job,
+    'retry' (daemon auto-retry) or 'requeue' (manual), with parent_id the
+    job it was copied from.
     """
     if before is not None and after is not None:
         raise ValueError("before and after are mutually exclusive")
@@ -187,8 +220,9 @@ def enqueue(
         """
         INSERT INTO jobs
             (channel, status, position, raw_cmd, resolved_cmd, cwd, env_extra,
-             enqueued_at, log_path, timeout_secs, is_priority)
-        VALUES (?, 'queued', NULL, ?, ?, ?, ?, ?, ?, ?, ?)
+             enqueued_at, log_path, timeout_secs, is_priority, max_retries, attempt,
+             parent_id, origin)
+        VALUES (?, 'queued', NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             channel,
@@ -200,6 +234,10 @@ def enqueue(
             log_path,
             timeout_secs,
             int(is_priority),
+            max_retries,
+            attempt,
+            parent_id,
+            origin,
         ),
     )
     new_id = cur.lastrowid
@@ -423,10 +461,14 @@ def _reorder(
     conn.commit()
 
 
-def requeue(conn: sqlite3.Connection, job_id: int, *, log_path: str) -> int:
+def requeue(conn: sqlite3.Connection, job_id: int, *, log_path: str, auto: bool = False) -> int:
     """Re-enqueue a done/failed/cancelled job with its original argv/cwd/env/
-    timeout/channel, appended to the end of its channel's queue. Returns
-    the new job's id."""
+    timeout/channel/max_retries, appended to the end of its channel's
+    queue. Returns the new job's id.
+
+    `auto=False` is a manual requeue: origin 'requeue', fresh retry count
+    (attempt 0). `auto=True` is the daemon retrying a failure: origin
+    'retry', attempt = old attempt + 1. Either way parent_id is `job_id`."""
     job = get_job(conn, job_id)
     if job is None:
         raise ValueError(f"job {job_id} does not exist")
@@ -444,6 +486,10 @@ def requeue(conn: sqlite3.Connection, job_id: int, *, log_path: str) -> int:
         channel=job["channel"],
         env_extra=json.loads(job["env_extra"]) if job["env_extra"] else None,
         timeout_secs=job["timeout_secs"],
+        max_retries=job["max_retries"],
+        attempt=job["attempt"] + 1 if auto else 0,
+        parent_id=job_id,
+        origin="retry" if auto else "requeue",
     )
 
 

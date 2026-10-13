@@ -219,6 +219,7 @@ class Daemon:
             )
         except (OSError, FileNotFoundError) as e:
             db.mark_finished(self.conn, job_id, status="failed", note=f"failed to start: {e}")
+            self._maybe_auto_retry(job_id)
             return
 
         db.mark_running(self.conn, job_id, pid=proc.pid, pgid=proc.pid)
@@ -241,6 +242,7 @@ class Daemon:
             db.mark_finished(self.conn, job_id, status="failed", exit_code=exit_code, note="timed out")
             self._current_proc.pop(channel, None)
             self._current_job_id.pop(channel, None)
+            self._maybe_auto_retry(job_id)
             return
 
         await log_task
@@ -253,6 +255,27 @@ class Daemon:
         db.mark_finished(self.conn, job_id, status=status, exit_code=exit_code)
         self._current_proc.pop(channel, None)
         self._current_job_id.pop(channel, None)
+        self._maybe_auto_retry(job_id)
+
+    def _maybe_auto_retry(self, job_id: int) -> None:
+        """If a just-finished job failed and still has retries left,
+        requeue it at the end of its channel's normal queue as a new job
+        (same command/cwd/env/timeout/max_retries, attempt + 1). Cancelled
+        and done jobs are never retried. The failed job's note records the
+        retry so `show` explains where it went."""
+        assert self.conn is not None
+        job = db.get_job(self.conn, job_id)
+        if job is None or job["status"] != "failed" or job["attempt"] >= job["max_retries"]:
+            return
+        attempt = job["attempt"] + 1
+        new_id = db.requeue(self.conn, job_id, log_path="pending", auto=True)
+        log_path = str(self.log_dir / f"{new_id}.log")
+        retry_note = f"auto-retry {attempt}/{job['max_retries']} queued as job {new_id}"
+        note = f"{job['note']}; {retry_note}" if job["note"] else retry_note
+        self.conn.execute("UPDATE jobs SET log_path = ? WHERE id = ?", (log_path, new_id))
+        self.conn.execute("UPDATE jobs SET note = ? WHERE id = ?", (note, job_id))
+        self.conn.commit()
+        self._wake_worker(job["channel"])
 
     async def _pump_log(self, proc: asyncio.subprocess.Process, log_path: Path) -> None:
         """Stream the job's combined stdout/stderr to its log file, capped
@@ -323,8 +346,11 @@ class Daemon:
         cwd = args["cwd"]
         channel = args.get("channel") or db.DEFAULT_CHANNEL
         now = bool(args.get("now"))
+        max_retries = args.get("max_retries") or 0
         if not argv:
             raise ValueError("empty command")
+        if not isinstance(max_retries, int) or max_retries < 0:
+            raise ValueError("retries must be a non-negative integer")
         if now and (args.get("before") is not None or args.get("after") is not None):
             raise ValueError("--now cannot be combined with --before/--after")
 
@@ -360,6 +386,7 @@ class Daemon:
             after=args.get("after"),
             is_priority=now,
             env_extra=env_extra,
+            max_retries=max_retries,
         )
         log_path = str(self.log_dir / f"{job_id}.log")
         self.conn.execute("UPDATE jobs SET log_path = ? WHERE id = ?", (log_path, job_id))

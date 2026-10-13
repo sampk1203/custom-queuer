@@ -662,3 +662,102 @@ def test_channel_reappears_after_prune_when_reused(conn):
     _mk(conn, "b", channel=2)
 
     assert db.list_channels(conn) == [2]
+
+
+# ---------------------------------------------------------------------------
+# auto-retry columns: max_retries / attempt
+# ---------------------------------------------------------------------------
+
+def test_enqueue_retry_fields_default_to_zero(conn):
+    a = _mk(conn, "a")
+    job = db.get_job(conn, a)
+    assert job["max_retries"] == 0
+    assert job["attempt"] == 0
+
+
+def test_enqueue_stores_max_retries(conn):
+    a = _mk(conn, "a", max_retries=3)
+    job = db.get_job(conn, a)
+    assert job["max_retries"] == 3
+    assert job["attempt"] == 0
+
+
+def test_manual_requeue_keeps_max_retries_and_resets_attempt(conn):
+    a = _mk(conn, "a", max_retries=3, attempt=2)
+    db.mark_running(conn, a, pid=1, pgid=1)
+    db.mark_finished(conn, a, status="failed", exit_code=1)
+    new_id = db.requeue(conn, a, log_path="/tmp/x.log")
+    new_job = db.get_job(conn, new_id)
+    assert new_job["max_retries"] == 3
+    assert new_job["attempt"] == 0
+
+
+def test_auto_requeue_increments_attempt(conn):
+    a = _mk(conn, "a", max_retries=3)
+    db.mark_running(conn, a, pid=1, pgid=1)
+    db.mark_finished(conn, a, status="failed", exit_code=1)
+    new_id = db.requeue(conn, a, log_path="/tmp/x.log", auto=True)
+    new_job = db.get_job(conn, new_id)
+    assert new_job["attempt"] == 1
+    assert new_job["max_retries"] == 3
+
+
+def test_fresh_job_has_no_origin(conn):
+    job = db.get_job(conn, _mk(conn, "a"))
+    assert job["origin"] is None
+    assert job["parent_id"] is None
+
+
+def test_manual_requeue_records_origin(conn):
+    a = _mk(conn, "a")
+    db.mark_running(conn, a, pid=1, pgid=1)
+    db.mark_finished(conn, a, status="failed", exit_code=1)
+    job = db.get_job(conn, db.requeue(conn, a, log_path="/tmp/x.log"))
+    assert (job["origin"], job["parent_id"]) == ("requeue", a)
+
+
+def test_auto_requeue_records_origin(conn):
+    a = _mk(conn, "a", max_retries=1)
+    db.mark_running(conn, a, pid=1, pgid=1)
+    db.mark_finished(conn, a, status="failed", exit_code=1)
+    job = db.get_job(conn, db.requeue(conn, a, log_path="/tmp/x.log", auto=True))
+    assert (job["origin"], job["parent_id"]) == ("retry", a)
+
+
+def test_init_db_migrates_pre_retry_database(tmp_path):
+    """A DB created before auto-retry existed gains the new columns, keeps
+    its rows, and the new columns default to 0."""
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    raw = sqlite3.connect(path)
+    raw.executescript(
+        """
+        CREATE TABLE jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel INTEGER NOT NULL DEFAULT 1,
+            status TEXT NOT NULL CHECK (status IN
+                ('queued','running','stopped','done','failed','cancelled')),
+            position INTEGER, raw_cmd TEXT NOT NULL, resolved_cmd TEXT NOT NULL,
+            cwd TEXT NOT NULL, env_extra TEXT, pid INTEGER, pgid INTEGER,
+            enqueued_at TEXT NOT NULL, started_at TEXT, finished_at TEXT,
+            exit_code INTEGER, log_path TEXT NOT NULL, note TEXT,
+            timeout_secs INTEGER, is_priority INTEGER NOT NULL DEFAULT 0
+        );
+        INSERT INTO jobs (status, position, raw_cmd, resolved_cmd, cwd, enqueued_at, log_path)
+        VALUES ('queued', 0, '["a"]', '["/usr/bin/a"]', '/tmp', '2026-01-01T00:00:00+00:00', '/tmp/1.log');
+        """
+    )
+    raw.commit()
+    raw.close()
+
+    c = db.connect(path)
+    db.init_db(c)
+    db.init_db(c)  # second run is a no-op
+    job = db.get_job(c, 1)
+    assert job["raw_cmd"] == '["a"]'
+    assert job["max_retries"] == 0
+    assert job["attempt"] == 0
+    assert job["origin"] is None
+    assert job["parent_id"] is None
+    c.close()
