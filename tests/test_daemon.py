@@ -19,6 +19,7 @@ import pytest
 import pytest_asyncio
 
 from queuer import db as db_module
+from queuer import notify
 from queuer.daemon import Daemon
 
 CWD = "/tmp"
@@ -54,6 +55,13 @@ def _ch(resp_data: dict, channel: int) -> dict:
     (e.g. "1", "2") since the wire protocol is JSON -- this looks a
     channel's section up by its int id."""
     return resp_data["channels"][str(channel)]
+
+
+@pytest.fixture(autouse=True)
+def _fast_listener_idle(monkeypatch):
+    # autouse fixtures run before `daemon`, so its Telegram listener (idle
+    # unless a test configures one) re-checks the config quickly
+    monkeypatch.setattr("queuer.daemon.LISTEN_IDLE_SECS", 0.05)
 
 
 @pytest_asyncio.fixture
@@ -1065,3 +1073,686 @@ async def test_cancel_targets_priority_job_while_frozen_job_untouched(daemon):
     # is still alive/untouched by the cancel
     finished1 = await wait_for_status(daemon.socket_path, job1, {"done", "failed"}, timeout=8.0)
     assert finished1["status"] == "done"
+
+
+# ---------------------------------------------------------------------------
+# cancel by job id
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_cancel_by_id_kills_running_job(daemon):
+    job_id = (await send(daemon.socket_path, "add", argv=["sleep", "10"], cwd=CWD))["data"]["id"]
+    await wait_for_status(daemon.socket_path, job_id, {"running"})
+
+    resp = await send(daemon.socket_path, "cancel", id=job_id)
+    assert resp["ok"]
+    assert resp["data"] == {"cancelled": job_id, "channel": 1}
+    job = await wait_for_status(daemon.socket_path, job_id, {"cancelled", "failed", "done"})
+    assert job["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_cancel_by_id_finds_job_on_other_channel_without_channel_arg(daemon):
+    r1 = await send(daemon.socket_path, "add", argv=["sleep", "10"], cwd=CWD, channel=1)
+    r2 = await send(daemon.socket_path, "add", argv=["sleep", "10"], cwd=CWD, channel=2)
+    await wait_for_status(daemon.socket_path, r1["data"]["id"], {"running"})
+    await wait_for_status(daemon.socket_path, r2["data"]["id"], {"running"})
+
+    resp = await send(daemon.socket_path, "cancel", id=r2["data"]["id"])  # no channel
+    assert resp["ok"] and resp["data"]["channel"] == 2
+    job2 = await wait_for_status(daemon.socket_path, r2["data"]["id"], {"cancelled", "failed", "done"})
+    assert job2["status"] == "cancelled"
+    assert (await send(daemon.socket_path, "show", id=r1["data"]["id"]))["data"]["status"] == "running"
+
+    await send(daemon.socket_path, "cancel", id=r1["data"]["id"])  # cleanup
+
+
+@pytest.mark.asyncio
+async def test_cancel_by_id_one_of_several_queued_jobs(daemon):
+    blocker = (await send(daemon.socket_path, "add", argv=["sleep", "10"], cwd=CWD))["data"]["id"]
+    await wait_for_status(daemon.socket_path, blocker, {"running"})
+    q1 = (await send(daemon.socket_path, "add", argv=["echo", "1"], cwd=CWD))["data"]["id"]
+    q2 = (await send(daemon.socket_path, "add", argv=["echo", "2"], cwd=CWD))["data"]["id"]
+
+    resp = await send(daemon.socket_path, "cancel", id=q1)
+    assert resp["ok"] and resp["data"]["cancelled"] == q1
+
+    job = (await send(daemon.socket_path, "show", id=q1))["data"]
+    assert job["status"] == "cancelled" and job["note"] == "cancelled while queued"
+    listing = (await send(daemon.socket_path, "list"))["data"]
+    assert [j["id"] for j in _ch(listing, 1)["queue"]] == [q2]
+    assert q1 in [j["id"] for j in _ch(listing, 1)["backlog"]]
+    assert _ch(listing, 1)["running"]["id"] == blocker  # untouched
+
+    await send(daemon.socket_path, "cancel", id=blocker)  # cleanup
+    done = await wait_for_status(daemon.socket_path, q2, {"done", "failed"})
+    assert done["status"] == "done"  # the other queued job still ran
+
+
+@pytest.mark.asyncio
+async def test_cancel_by_id_queued_priority_job(daemon):
+    r1 = await send(daemon.socket_path, "add", argv=["sleep", "10"], cwd=CWD)
+    await wait_for_status(daemon.socket_path, r1["data"]["id"], {"running"})
+    r2 = await send(daemon.socket_path, "add", argv=["sleep", "10"], cwd=CWD, now=True)
+    await wait_for_status(daemon.socket_path, r2["data"]["id"], {"running"})
+    r3 = await send(daemon.socket_path, "add", argv=["echo", "p"], cwd=CWD, now=True)  # queued behind r2
+
+    resp = await send(daemon.socket_path, "cancel", id=r3["data"]["id"])
+    assert resp["ok"]
+    assert (await send(daemon.socket_path, "show", id=r3["data"]["id"]))["data"]["status"] == "cancelled"
+    listing = (await send(daemon.socket_path, "list"))["data"]
+    assert _ch(listing, 1)["priority_queue"] == []
+
+    await send(daemon.socket_path, "cancel", id=r2["data"]["id"])
+    await send(daemon.socket_path, "cancel", id=r1["data"]["id"])
+
+
+@pytest.mark.asyncio
+async def test_cancel_by_id_frozen_job_leaves_priority_job_cancellable(daemon):
+    r1 = await send(daemon.socket_path, "add", argv=["sleep", "30"], cwd=CWD)
+    job1 = r1["data"]["id"]
+    await wait_for_status(daemon.socket_path, job1, {"running"})
+    r2 = await send(daemon.socket_path, "add", argv=["sleep", "30"], cwd=CWD, now=True)
+    job2 = r2["data"]["id"]
+    await wait_for_status(daemon.socket_path, job2, {"running"})
+    assert (await send(daemon.socket_path, "show", id=job1))["data"]["status"] == "stopped"
+
+    resp = await send(daemon.socket_path, "cancel", id=job1)
+    assert resp["ok"] and resp["data"]["cancelled"] == job1
+    j1 = await wait_for_status(daemon.socket_path, job1, {"cancelled", "failed", "done"}, timeout=8.0)
+    assert j1["status"] == "cancelled"
+
+    # the priority job is still running and still owns the channel's slot
+    listing = (await send(daemon.socket_path, "list"))["data"]
+    assert _ch(listing, 1)["frozen"] is None
+    assert _ch(listing, 1)["running"]["id"] == job2
+
+    # plain `cancel` must still find and kill it
+    plain = await send(daemon.socket_path, "cancel")
+    assert plain["ok"] and plain["data"]["cancelled"] == job2
+    j2 = await wait_for_status(daemon.socket_path, job2, {"cancelled", "failed", "done"})
+    assert j2["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_cancel_by_id_errors(daemon):
+    done = (await send(daemon.socket_path, "add", argv=["true"], cwd=CWD))["data"]["id"]
+    await wait_for_status(daemon.socket_path, done, {"done"})
+
+    missing = await send(daemon.socket_path, "cancel", id=999)
+    assert missing["ok"] is False and "does not exist" in missing["error"]
+
+    finished = await send(daemon.socket_path, "cancel", id=done)
+    assert finished["ok"] is False and "already done" in finished["error"]
+
+    blocker = (await send(daemon.socket_path, "add", argv=["sleep", "10"], cwd=CWD))["data"]["id"]
+    await wait_for_status(daemon.socket_path, blocker, {"running"})
+    wrong = await send(daemon.socket_path, "cancel", id=blocker, channel=2)
+    assert wrong["ok"] is False and "channel 1" in wrong["error"]
+    assert (await send(daemon.socket_path, "show", id=blocker))["data"]["status"] == "running"
+
+    right = await send(daemon.socket_path, "cancel", id=blocker, channel=1)
+    assert right["ok"]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_by_id_job_is_not_retried(daemon):
+    r = await send(daemon.socket_path, "add", argv=["sleep", "10"], cwd=CWD, max_retries=3)
+    job_id = r["data"]["id"]
+    await wait_for_status(daemon.socket_path, job_id, {"running"})
+    await send(daemon.socket_path, "cancel", id=job_id)
+    await wait_for_status(daemon.socket_path, job_id, {"cancelled"})
+    await asyncio.sleep(0.3)
+    listing = (await send(daemon.socket_path, "list"))["data"]
+    assert _ch(listing, 1)["queue"] == [] and _ch(listing, 1)["running"] is None
+
+
+# ---------------------------------------------------------------------------
+# notifications
+# ---------------------------------------------------------------------------
+
+TG_TOKEN = "123456789:AAH-test_token-0123456789abcdefghijk"
+
+
+@pytest.fixture
+def sent(monkeypatch, daemon):
+    """Notifications configured; Telegram replaced by a recorder."""
+    msgs: list[dict] = []
+    monkeypatch.setattr(notify, "_api", lambda token, method, params=None, timeout=0: msgs.append(params))
+    notify.save({"qur_id": "a3f9", "token": TG_TOKEN, "chat_ids": [111], "listen": False}, daemon.notify_path)
+    return msgs
+
+
+async def wait_msgs(msgs: list, n: int, timeout: float = 5.0) -> None:
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if len(msgs) >= n:
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError(f"expected {n} message(s), got {len(msgs)}: {msgs}")
+
+
+@pytest.mark.asyncio
+async def test_notifies_when_job_done(daemon, sent):
+    job_id = (await send(daemon.socket_path, "add", argv=["true"], cwd=CWD))["data"]["id"]
+    await wait_msgs(sent, 1)
+    assert sent[0]["chat_id"] == 111
+    assert f"done · job {job_id}" in sent[0]["text"]
+    assert "[a3f9]" in sent[0]["text"]
+    assert "exit 0" in sent[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_notifies_when_job_fails_with_exit_code(daemon, sent):
+    job_id = (await send(daemon.socket_path, "add", argv=["sh", "-c", "exit 3"], cwd=CWD))["data"]["id"]
+    await wait_msgs(sent, 1)
+    assert f"failed · job {job_id}" in sent[0]["text"] and "exit 3" in sent[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_notifies_on_timeout(daemon, sent):
+    await send(daemon.socket_path, "add", argv=["sleep", "30"], cwd=CWD, timeout_secs=1)
+    await wait_msgs(sent, 1, timeout=10.0)
+    assert "failed" in sent[0]["text"] and "timed out" in sent[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_notifies_on_failed_start_without_leaking_raw_note(daemon, sent, tmp_path):
+    # passes add-time validation (exists, executable) but cannot exec: bad shebang
+    script = tmp_path / "badshebang.sh"
+    script.write_text("#!/nonexistent/interpreter\n")
+    script.chmod(0o755)
+    job_id = (await send(daemon.socket_path, "add", argv=[str(script)], cwd=CWD))["data"]["id"]
+    job = await wait_for_status(daemon.socket_path, job_id, {"failed"})
+    assert job["note"].startswith("failed to start")
+    await wait_msgs(sent, 1)
+    assert f"failed · job {job_id}" in sent[0]["text"]
+    assert "failed to start" in sent[0]["text"]
+    # the raw OSError text (interpreter path) stays out; the command as typed is shown
+    assert "nonexistent" not in sent[0]["text"] and "Errno" not in sent[0]["text"]
+    assert f"$ {script}" in sent[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_notifies_when_running_job_cancelled(daemon, sent):
+    job_id = (await send(daemon.socket_path, "add", argv=["sleep", "10"], cwd=CWD))["data"]["id"]
+    await wait_for_status(daemon.socket_path, job_id, {"running"})
+    await send(daemon.socket_path, "cancel", id=job_id)
+    await wait_msgs(sent, 1)
+    assert f"cancelled · job {job_id}" in sent[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_notifies_when_queued_job_cancelled(daemon, sent):
+    blocker = (await send(daemon.socket_path, "add", argv=["sleep", "10"], cwd=CWD))["data"]["id"]
+    await wait_for_status(daemon.socket_path, blocker, {"running"})
+    queued = (await send(daemon.socket_path, "add", argv=["echo", "x"], cwd=CWD))["data"]["id"]
+    await send(daemon.socket_path, "cancel", id=queued)
+    await wait_msgs(sent, 1)
+    assert f"cancelled · job {queued}" in sent[0]["text"]
+    assert "cancelled while queued" in sent[0]["text"]
+    await send(daemon.socket_path, "cancel", id=blocker)  # cleanup
+
+
+@pytest.mark.asyncio
+async def test_retried_failure_is_silent_until_the_final_attempt(daemon, sent):
+    r = await send(daemon.socket_path, "add", argv=["false"], cwd=CWD, max_retries=1)
+    first = r["data"]["id"]
+    await wait_for_status(daemon.socket_path, first, {"failed"})
+    await wait_msgs(sent, 1)
+    await asyncio.sleep(0.4)  # nothing else may arrive
+    assert len(sent) == 1
+    assert f"job {first}" not in sent[0]["text"]  # the final job's, not the retried one's
+    assert "failed" in sent[0]["text"] and "attempt 2/2" in sent[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_no_message_without_config(daemon, monkeypatch):
+    calls: list = []
+    monkeypatch.setattr(notify, "_api", lambda *a, **k: calls.append(a))
+    job_id = (await send(daemon.socket_path, "add", argv=["true"], cwd=CWD))["data"]["id"]
+    await wait_for_status(daemon.socket_path, job_id, {"done"})
+    await asyncio.sleep(0.3)
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_connect_takes_effect_without_daemon_restart(daemon, monkeypatch):
+    calls: list = []
+    monkeypatch.setattr(notify, "_api", lambda token, method, params=None, timeout=0: calls.append(params))
+    first = (await send(daemon.socket_path, "add", argv=["true"], cwd=CWD))["data"]["id"]
+    await wait_for_status(daemon.socket_path, first, {"done"})
+    await asyncio.sleep(0.2)
+    assert calls == []
+
+    notify.save({"qur_id": "a3f9", "token": TG_TOKEN, "chat_ids": [111], "listen": False}, daemon.notify_path)
+    await send(daemon.socket_path, "add", argv=["true"], cwd=CWD)
+    await wait_msgs(calls, 1)
+
+
+@pytest.mark.asyncio
+async def test_telegram_failure_never_disturbs_the_queue(daemon, monkeypatch, capsys):
+    def boom(*a, **k):
+        raise notify.NotifyError("Telegram is down", 500)
+
+    monkeypatch.setattr(notify, "_api", boom)
+    notify.save({"qur_id": "a3f9", "token": TG_TOKEN, "chat_ids": [111], "listen": False}, daemon.notify_path)
+    a = (await send(daemon.socket_path, "add", argv=["true"], cwd=CWD))["data"]["id"]
+    b = (await send(daemon.socket_path, "add", argv=["true"], cwd=CWD))["data"]["id"]
+    assert (await wait_for_status(daemon.socket_path, a, {"done"}))["status"] == "done"
+    assert (await wait_for_status(daemon.socket_path, b, {"done"}))["status"] == "done"
+    await asyncio.sleep(0.3)
+    assert "notification failed" in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
+async def test_unexpected_error_in_sender_never_disturbs_the_queue(daemon, monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("bug in sender")
+
+    monkeypatch.setattr(notify, "send", boom)
+    notify.save({"qur_id": "a3f9", "token": TG_TOKEN, "chat_ids": [111], "listen": False}, daemon.notify_path)
+    a = (await send(daemon.socket_path, "add", argv=["true"], cwd=CWD))["data"]["id"]
+    b = (await send(daemon.socket_path, "add", argv=["true"], cwd=CWD))["data"]["id"]
+    assert (await wait_for_status(daemon.socket_path, b, {"done"}))["status"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_notifies_for_job_interrupted_by_daemon_restart(tmp_path, monkeypatch):
+    msgs: list = []
+    monkeypatch.setattr(notify, "_api", lambda token, method, params=None, timeout=0: msgs.append(params))
+    notify_path = tmp_path / "notify.json"
+    notify.save({"qur_id": "a3f9", "token": TG_TOKEN, "chat_ids": [111], "listen": False}, notify_path)
+
+    db_path = tmp_path / "queuer.db"
+    conn = db_module.connect(db_path)
+    db_module.init_db(conn)
+    job_id = db_module.enqueue(
+        conn, raw_cmd=["sleep", "999"], resolved_cmd=["/bin/sleep", "999"], cwd=CWD,
+        log_path=str(tmp_path / "logs" / "1.log"),
+    )
+    db_module.mark_running(conn, job_id, pid=999999, pgid=999999)
+    conn.close()
+
+    d = Daemon(db_path=db_path, socket_path=tmp_path / "queuer.sock", log_dir=tmp_path / "logs", notify_path=notify_path)
+    task = asyncio.create_task(d.serve())
+    try:
+        await wait_msgs(msgs, 1)
+        assert f"failed · job {job_id}" in msgs[0]["text"]
+        assert "interrupted by daemon restart" in msgs[0]["text"]
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Requeue button (Telegram listener)
+# ---------------------------------------------------------------------------
+
+class FakeBot:
+    """Replaces notify._api. Records every call except getUpdates; serves
+    scripted getUpdates batches, then empty ones."""
+
+    def __init__(self, batches=()):
+        self.batches = list(batches)
+        self.calls: list[tuple[str, dict]] = []
+        self.polls = 0
+
+    def api(self, token, method, params=None, timeout=0):
+        if method == "getUpdates":
+            self.polls += 1
+            return self.batches.pop(0) if self.batches else []
+        self.calls.append((method, params))
+        return {}
+
+    def of(self, method):
+        return [p for m, p in self.calls if m == method]
+
+
+async def wait_calls(bot: "FakeBot", method: str, n: int, timeout: float = 5.0) -> None:
+    class _Live:  # wait_msgs only needs len()
+        def __len__(self):
+            return len(bot.of(method))
+
+    await wait_msgs(_Live(), n, timeout)  # type: ignore[arg-type]
+
+
+def _press(update_id, job_id, qur_id="a3f9", chat_id=111, message_id=9, action="rq"):
+    return {"update_id": update_id, "callback_query": {
+        "id": f"cb{update_id}", "data": f"{action}:{qur_id}:{job_id}",
+        "message": {"message_id": message_id, "chat": {"id": chat_id}},
+    }}
+
+
+def _tg_cfg(daemon, **extra):
+    notify.save({"qur_id": "a3f9", "token": TG_TOKEN, **{"chat_ids": [111], **extra}}, daemon.notify_path)
+
+
+async def _finished_job(daemon) -> int:
+    job_id = (await send(daemon.socket_path, "add", argv=["sh", "-c", "exit 1"], cwd=CWD))["data"]["id"]
+    await wait_for_status(daemon.socket_path, job_id, {"failed"})
+    return job_id
+
+
+@pytest.mark.asyncio
+async def test_message_has_requeue_button_when_listening(daemon, monkeypatch):
+    bot = FakeBot()
+    monkeypatch.setattr(notify, "_api", bot.api)
+    _tg_cfg(daemon)  # listen defaults on
+    job_id = await _finished_job(daemon)
+    await wait_calls(bot, "sendMessage", 1)
+    row = bot.of("sendMessage")[0]["reply_markup"]["inline_keyboard"][0]
+    assert [b["callback_data"] for b in row] == [f"rq:a3f9:{job_id}", f"sh:a3f9:{job_id}"]
+
+
+@pytest.mark.asyncio
+async def test_no_button_and_no_polling_when_listen_off(daemon, monkeypatch):
+    bot = FakeBot()
+    monkeypatch.setattr(notify, "_api", bot.api)
+    _tg_cfg(daemon, listen=False)
+    await _finished_job(daemon)
+    await wait_calls(bot, "sendMessage", 1)
+    await asyncio.sleep(0.3)
+    assert "reply_markup" not in bot.of("sendMessage")[0]
+    assert bot.polls == 0
+
+
+@pytest.mark.asyncio
+async def test_button_press_requeues_job_and_confirms(daemon, monkeypatch):
+    job_id = await _finished_job(daemon)
+    bot = FakeBot([[_press(5, job_id)]])
+    monkeypatch.setattr(notify, "_api", bot.api)
+    _tg_cfg(daemon)
+    await wait_calls(bot, "sendMessage", 1)
+
+    listing = (await send(daemon.socket_path, "list"))["data"]
+    ids = [j["id"] for j in _ch(listing, 1)["backlog"]]
+    new = max(ids)
+    assert new != job_id
+    job = await wait_for_status(daemon.socket_path, new, {"done", "failed"})
+    assert job["origin"] == "requeue" and job["parent_id"] == job_id
+    assert bot.of("answerCallbackQuery")[0]["text"] == f"requeued as job {new}"
+    # Requeue is spent, Details stays
+    kb = bot.of("editMessageReplyMarkup")[0]["reply_markup"]["inline_keyboard"]
+    assert [b["callback_data"] for b in kb[0]] == [f"sh:a3f9:{job_id}"]
+    assert bot.of("editMessageReplyMarkup")[0]["message_id"] == 9
+    assert f"job {job_id} requeued as job {new}" in bot.of("sendMessage")[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_button_press_from_unpaired_chat_or_other_qur_is_not_acted_on(daemon, monkeypatch):
+    job_id = await _finished_job(daemon)
+    bot = FakeBot([[
+        _press(1, job_id, chat_id=999),            # stranger
+        _press(2, job_id, qur_id="zzzz"),          # other machine / old id
+        {"update_id": 3, "callback_query": {"id": "x", "data": "garbage", "message": {"message_id": 1, "chat": {"id": 111}}}},
+        {"update_id": 4, "message": {"text": "hi", "chat": {"id": 111}}},
+    ]])
+    monkeypatch.setattr(notify, "_api", bot.api)
+    _tg_cfg(daemon)
+    for _ in range(100):
+        if bot.polls >= 2:
+            break
+        await asyncio.sleep(0.05)
+    listing = (await send(daemon.socket_path, "list"))["data"]
+    assert [j["id"] for j in _ch(listing, 1)["backlog"]] == [job_id]  # nothing requeued
+    answers = bot.of("answerCallbackQuery")
+    assert len(answers) == 1 and "another machine" in answers[0]["text"]  # stranger gets no reply at all
+
+
+@pytest.mark.asyncio
+async def test_button_press_on_unfinished_or_missing_job_toasts_error(daemon, monkeypatch):
+    running = (await send(daemon.socket_path, "add", argv=["sleep", "10"], cwd=CWD))["data"]["id"]
+    await wait_for_status(daemon.socket_path, running, {"running"})
+    bot = FakeBot([[_press(1, running), _press(2, 4242)]])
+    monkeypatch.setattr(notify, "_api", bot.api)
+    _tg_cfg(daemon)
+    await wait_calls(bot, "answerCallbackQuery", 2)
+    texts = [a["text"] for a in bot.of("answerCallbackQuery")]
+    assert "only finished jobs" in texts[0] and "does not exist" in texts[1]
+    assert not bot.of("editMessageReplyMarkup") and not bot.of("sendMessage")
+
+
+@pytest.mark.asyncio
+async def test_listener_survives_poll_errors_and_pauses_for_pairing(daemon, monkeypatch):
+    monkeypatch.setattr("queuer.daemon.LISTEN_RETRY_SECS", 0.05)
+    job_id = await _finished_job(daemon)
+    bot = FakeBot([notify.NotifyError("Conflict", 409)])
+    real = bot.api
+
+    def flaky(token, method, params=None, timeout=0):
+        if method == "getUpdates" and bot.batches and isinstance(bot.batches[0], Exception):
+            raise bot.batches.pop(0)
+        return real(token, method, params, timeout)
+
+    monkeypatch.setattr(notify, "_api", flaky)
+    with notify.pairing_lock(daemon.notify_path):
+        _tg_cfg(daemon)
+        await asyncio.sleep(0.3)
+        assert bot.polls == 0  # stepped aside while pairing
+    bot.batches.append([_press(1, job_id)])
+    bot.batches.insert(0, notify.NotifyError("Conflict", 409))  # first poll fails, then recovers
+    await wait_calls(bot, "answerCallbackQuery", 1)
+    assert "requeued as job" in bot.of("answerCallbackQuery")[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_details_button_sends_html_details_to_pressing_chat_only(daemon, monkeypatch):
+    job_id = await _finished_job(daemon)
+    bot = FakeBot([[_press(1, job_id, action="sh")]])
+    monkeypatch.setattr(notify, "_api", bot.api)
+    _tg_cfg(daemon, chat_ids=[111, 222])
+    await wait_calls(bot, "sendMessage", 1)
+    (m,) = bot.of("sendMessage")
+    assert m["chat_id"] == 111 and m["parse_mode"] == "HTML"
+    assert f"<b>Job #{job_id}</b> · failed" in m["text"] and "<b>resolved command</b>" in m["text"]
+    assert "reply_markup" not in m
+    assert "text" not in bot.of("answerCallbackQuery")[0]
+    assert not bot.of("editMessageReplyMarkup")
+    listing = (await send(daemon.socket_path, "list"))["data"]
+    assert [j["id"] for j in _ch(listing, 1)["backlog"]] == [job_id]  # nothing requeued
+
+
+@pytest.mark.asyncio
+async def test_details_button_for_missing_job_toasts_error(daemon, monkeypatch):
+    bot = FakeBot([[_press(1, 4242, action="sh")]])
+    monkeypatch.setattr(notify, "_api", bot.api)
+    _tg_cfg(daemon)
+    await wait_calls(bot, "answerCallbackQuery", 1)
+    assert "does not exist" in bot.of("answerCallbackQuery")[0]["text"] and not bot.of("sendMessage")
+
+
+# ---------------------------------------------------------------------------
+# several bots
+# ---------------------------------------------------------------------------
+
+TG_TOKEN2 = "987654321:BBH-other_token-0123456789abcdefghijk"
+
+
+class MultiBot:
+    """Replaces notify._api for several bots: records (token, method, params)
+    and serves scripted getUpdates batches per token."""
+
+    def __init__(self, batches=None):
+        self.batches = {t: list(b) for t, b in (batches or {}).items()}
+        self.calls: list[tuple[str, str, dict]] = []
+        self.polls: dict[str, int] = {}
+
+    def api(self, token, method, params=None, timeout=0):
+        if method == "getUpdates":
+            self.polls[token] = self.polls.get(token, 0) + 1
+            queue = self.batches.get(token) or []
+            return queue.pop(0) if queue else []
+        self.calls.append((token, method, params))
+        return {}
+
+    def of(self, method, token=None):
+        return [(t, p) for t, m, p in self.calls if m == method and (token is None or t == token)]
+
+
+async def _wait(cond, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while not cond():
+        assert time.monotonic() < deadline, "timed out"
+        await asyncio.sleep(0.02)
+
+
+def _two_bots(daemon, *, listen1=True, listen2=True, chats1=(111,), chats2=(111, 222)):
+    notify.save({"qur_id": "a3f9", "bots": [
+        {"token": TG_TOKEN, "chat_ids": list(chats1), "listen": listen1},
+        {"token": TG_TOKEN2, "chat_ids": list(chats2), "listen": listen2},
+    ]}, daemon.notify_path)
+
+
+@pytest.mark.asyncio
+async def test_finished_job_is_sent_through_every_bot_to_each_of_its_chats(daemon, monkeypatch):
+    bot = MultiBot()
+    monkeypatch.setattr(notify, "_api", bot.api)
+    _two_bots(daemon)
+    job_id = await _finished_job(daemon)
+    await _wait(lambda: len(bot.of("sendMessage")) == 3)
+    sent = sorted((t, p["chat_id"]) for t, p in bot.of("sendMessage"))
+    assert sent == sorted([(TG_TOKEN, 111), (TG_TOKEN2, 111), (TG_TOKEN2, 222)])
+    for _t, p in bot.of("sendMessage"):
+        assert p["reply_markup"]["inline_keyboard"][0][0]["callback_data"] == f"rq:a3f9:{job_id}"
+
+
+@pytest.mark.asyncio
+async def test_only_bots_with_listen_on_get_buttons_and_get_polled(daemon, monkeypatch):
+    bot = MultiBot()
+    monkeypatch.setattr(notify, "_api", bot.api)
+    _two_bots(daemon, listen2=False)
+    await _finished_job(daemon)
+    await _wait(lambda: len(bot.of("sendMessage")) == 3)
+    await _wait(lambda: bot.polls.get(TG_TOKEN, 0) >= 2)
+    assert all("reply_markup" in p for _t, p in bot.of("sendMessage", TG_TOKEN))
+    assert all("reply_markup" not in p for _t, p in bot.of("sendMessage", TG_TOKEN2))  # send-only bot
+    assert TG_TOKEN2 not in bot.polls
+
+
+@pytest.mark.asyncio
+async def test_one_failing_bot_does_not_stop_the_others(daemon, monkeypatch):
+    bot = MultiBot()
+
+    def api(token, method, params=None, timeout=0):
+        if token == TG_TOKEN and method == "sendMessage":
+            raise notify.NotifyError("bot was blocked", 403)
+        return bot.api(token, method, params, timeout)
+
+    monkeypatch.setattr(notify, "_api", api)
+    _two_bots(daemon, listen1=False, listen2=False)
+    await _finished_job(daemon)
+    await _wait(lambda: len(bot.of("sendMessage", TG_TOKEN2)) == 2)
+
+
+@pytest.mark.asyncio
+async def test_press_on_each_bot_is_answered_through_that_same_bot(daemon, monkeypatch):
+    job_id = await _finished_job(daemon)
+    bot = MultiBot({
+        TG_TOKEN: [[_press(1, job_id, action="sh", chat_id=111)]],
+        TG_TOKEN2: [[_press(1, job_id, action="sh", chat_id=222)]],
+    })
+    monkeypatch.setattr(notify, "_api", bot.api)
+    _two_bots(daemon)
+    await _wait(lambda: len(bot.of("sendMessage")) == 2)
+    (t1, m1), = bot.of("sendMessage", TG_TOKEN)
+    (t2, m2), = bot.of("sendMessage", TG_TOKEN2)
+    assert m1["chat_id"] == 111 and m2["chat_id"] == 222 and m2["parse_mode"] == "HTML"
+    assert len(bot.of("answerCallbackQuery", TG_TOKEN)) == 1 and len(bot.of("answerCallbackQuery", TG_TOKEN2)) == 1
+
+
+@pytest.mark.asyncio
+async def test_requeue_press_on_second_bot_requeues_once_and_edits_via_second_bot(daemon, monkeypatch):
+    job_id = await _finished_job(daemon)
+    bot = MultiBot({TG_TOKEN2: [[_press(7, job_id, chat_id=222, message_id=42)]]})
+    monkeypatch.setattr(notify, "_api", bot.api)
+    _two_bots(daemon)
+    await _wait(lambda: len(bot.of("editMessageReplyMarkup")) == 1)
+    (tok, edit), = bot.of("editMessageReplyMarkup")
+    assert tok == TG_TOKEN2 and edit["chat_id"] == 222 and edit["message_id"] == 42
+    listing = (await send(daemon.socket_path, "list"))["data"]
+    new_ids = [j["id"] for j in _ch(listing, 1)["backlog"] if j["id"] != job_id]
+    assert len(new_ids) == 1  # exactly one requeue, from one press
+    assert not bot.of("editMessageReplyMarkup", TG_TOKEN)
+
+
+@pytest.mark.asyncio
+async def test_press_from_chat_paired_with_another_bot_only_is_ignored(daemon, monkeypatch):
+    job_id = await _finished_job(daemon)
+    # chat 222 is paired with bot 2 only; a press from it arriving on bot 1 must not count
+    bot = MultiBot({TG_TOKEN: [[_press(1, job_id, chat_id=222)]]})
+    monkeypatch.setattr(notify, "_api", bot.api)
+    _two_bots(daemon)
+    await _wait(lambda: bot.polls.get(TG_TOKEN, 0) >= 2)
+    assert not bot.of("answerCallbackQuery") and not bot.of("editMessageReplyMarkup")
+    listing = (await send(daemon.socket_path, "list"))["data"]
+    assert [j["id"] for j in _ch(listing, 1)["backlog"]] == [job_id]
+
+
+@pytest.mark.asyncio
+async def test_each_bot_has_its_own_poller_and_offset(daemon, monkeypatch):
+    seen: dict[str, list] = {}
+
+    def api(token, method, params=None, timeout=0):
+        if method == "getUpdates":
+            seen.setdefault(token, []).append((params or {}).get("offset"))
+            return [{"update_id": 10, "message": {"text": "x", "chat": {"id": 1}}}] if len(seen[token]) == 1 else []
+        return {}
+
+    monkeypatch.setattr(notify, "_api", api)
+    _two_bots(daemon)
+    await _wait(lambda: all(len(seen.get(t, [])) >= 2 for t in (TG_TOKEN, TG_TOKEN2)))
+    assert seen[TG_TOKEN][:2] == [None, 11] and seen[TG_TOKEN2][:2] == [None, 11]
+
+
+@pytest.mark.asyncio
+async def test_bot_added_or_removed_while_running_starts_and_stops_its_poller(daemon, monkeypatch):
+    bot = MultiBot()
+    monkeypatch.setattr(notify, "_api", bot.api)
+    notify.save({"qur_id": "a3f9", "token": TG_TOKEN, "chat_ids": [111]}, daemon.notify_path)  # old layout
+    await _wait(lambda: bot.polls.get(TG_TOKEN, 0) >= 2)
+    assert TG_TOKEN2 not in bot.polls
+    _two_bots(daemon)  # add the second bot: no daemon restart
+    await _wait(lambda: bot.polls.get(TG_TOKEN2, 0) >= 2)
+    notify.save({"qur_id": "a3f9", "bots": [{"token": TG_TOKEN2, "chat_ids": [111]}]}, daemon.notify_path)  # drop the first
+    await asyncio.sleep(0.4)
+    frozen = bot.polls[TG_TOKEN]
+    await asyncio.sleep(0.4)
+    assert bot.polls[TG_TOKEN] == frozen and bot.polls[TG_TOKEN2] > 2
+
+
+@pytest.mark.asyncio
+async def test_pairing_pauses_every_poller_and_offsets_survive_it(daemon, monkeypatch):
+    seen: dict[str, list] = {}
+
+    def api(token, method, params=None, timeout=0):
+        if method == "getUpdates":
+            seen.setdefault(token, []).append((params or {}).get("offset"))
+            return [{"update_id": 5, "message": {"text": "x", "chat": {"id": 1}}}] if len(seen[token]) == 1 else []
+        return {}
+
+    monkeypatch.setattr(notify, "_api", api)
+    _two_bots(daemon)
+    await _wait(lambda: all(len(seen.get(t, [])) >= 2 for t in (TG_TOKEN, TG_TOKEN2)))
+    with notify.pairing_lock(daemon.notify_path):
+        await asyncio.sleep(0.3)  # let the pollers notice and stop
+        counts = {t: len(v) for t, v in seen.items()}
+        await asyncio.sleep(0.3)
+        assert {t: len(v) for t, v in seen.items()} == counts
+    await _wait(lambda: all(len(seen[t]) > counts[t] for t in (TG_TOKEN, TG_TOKEN2)))
+    assert all(v[-1] == 6 for v in seen.values())  # resumed after the handled update, not from scratch
+
+
+@pytest.mark.asyncio
+async def test_bot_with_no_chats_is_not_polled_and_sends_nothing(daemon, monkeypatch):
+    bot = MultiBot()
+    monkeypatch.setattr(notify, "_api", bot.api)
+    _two_bots(daemon, chats1=())
+    await _finished_job(daemon)
+    await _wait(lambda: len(bot.of("sendMessage")) == 2)
+    await asyncio.sleep(0.3)
+    assert TG_TOKEN not in bot.polls and not bot.of("sendMessage", TG_TOKEN)

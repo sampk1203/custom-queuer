@@ -6,7 +6,9 @@ import json
 import os
 import shlex
 import shutil
+import socket
 import stat
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -17,7 +19,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from queuer import client, db
+from queuer import client, db, notify
 from queuer.daemon import _default_db_path, _default_log_dir
 from queuer.db import DEFAULT_CHANNEL
 from queuer.pathresolve import SHELL_INTERPRETERS
@@ -34,6 +36,8 @@ Quick start:
   qur show 12 14                       full detail for jobs 12 and 14
   qur logs 12 --tail                   follow job 12's output
   qur cancel                           kill the running job
+  qur cancel 12                        cancel job 12 (running, frozen or queued)
+  qur connect                          get Telegram alerts when jobs finish
 
 Run `qur <command> --help` for one command, or `qur --help-all` for every command's help.""",
 )
@@ -635,21 +639,36 @@ def show(
 
 @app.command()
 def cancel(
-    channel: int = typer.Option(DEFAULT_CHANNEL, "--channel", help="Channel whose running job to kill"),
+    job_id: Optional[int] = typer.Argument(
+        None, metavar="[JOB_ID]", help="Cancel this job, wherever it is (running, frozen, or queued)"
+    ),
+    channel: Optional[int] = typer.Option(
+        None, "--channel", help="Channel whose running job to kill (default 1). With JOB_ID, must match the job's channel."
+    ),
 ) -> None:
-    """Kill a channel's running job.
+    """Cancel a job.
 
-    Sends SIGTERM to the job's whole process group, then SIGKILL if it is still
-    alive after a short grace period. The job is recorded as `cancelled` and is
-    never auto-retried. Errors if nothing is running on the channel. To drop a job
-    that hasn't started yet, use `qur rm`.
+    With no JOB_ID: kills a channel's running job. With a JOB_ID: cancels that job
+    whatever state it is in -- running, frozen by `--now`, or still waiting in the
+    queue (a queued job is kept in history as `cancelled`; `qur rm` deletes it
+    instead).
+
+    Killing sends SIGTERM to the job's whole process group, then SIGKILL if it is
+    still alive after a short grace period. A cancelled job is never auto-retried.
+    Errors if nothing is running on the channel, or if the job is already finished.
 
     \b
     Examples:
       qur cancel
       qur cancel --channel 2
+      qur cancel 12
     """
-    data = _call("cancel", channel=channel)
+    kwargs: dict[str, Any] = {}
+    if job_id is not None:
+        kwargs["id"] = job_id
+    if channel is not None:
+        kwargs["channel"] = channel
+    data = _call("cancel", **kwargs)
     console.print(f"Cancelled job [bold]{data['cancelled']}[/bold] on channel [bold]{data['channel']}[/bold]")
 
 
@@ -740,6 +759,360 @@ def resume(
     """
     _call("resume", channel=channel)
     console.print(f"[green]Resumed[/green] channel {channel}")
+
+
+# ---------------------------------------------------------------------------
+# connect (Telegram notifications)
+# ---------------------------------------------------------------------------
+
+def _fail(msg: str) -> None:
+    typer.echo(f"Error: {msg}", err=True)
+    raise typer.Exit(code=1)
+
+
+def _warn_hello(bot_cfg: dict[str, Any]) -> None:
+    """Test message through one bot (flat view)."""
+    errors = notify.send(bot_cfg, notify.hello_text(bot_cfg))
+    for err in errors:
+        typer.echo(f"Warning: could not send the test message ({err})", err=True)
+
+
+def _fetch_export_over_ssh(target: str) -> str:
+    """Run `qur connect --export` on `target` over ssh and return its string.
+    ssh's own prompts (password, host key) show on the terminal as usual."""
+    if not target or target.startswith("-"):
+        _fail("--from takes [user@]host")
+    # ~/.local/bin is where `uv tool` puts qur, but a non-interactive ssh
+    # shell often lacks it on PATH
+    remote = 'PATH="$HOME/.local/bin:$PATH" qur connect --export'
+    typer.echo(f"Asking {target} over ssh...", err=True)
+    try:
+        res = subprocess.run(["ssh", "--", target, remote], stdout=subprocess.PIPE, text=True, timeout=120)
+    except FileNotFoundError:
+        _fail("ssh is not installed on this machine")
+    except subprocess.TimeoutExpired:
+        _fail(f"timed out talking to {target}")
+    if res.returncode != 0:
+        _fail(f"ssh to {target} failed (exit {res.returncode}); is qur set up there? (`qur connect` on that machine first)")
+    for line in res.stdout.splitlines():
+        if line.strip().startswith((notify.EXPORT_PREFIX, notify.EXPORT_PREFIX_MULTI)):
+            return line.strip()
+    _fail(f"{target} did not return a setup string; is qur connected there?")
+
+
+def _button_state(bot: dict[str, Any], long: bool = True) -> str:
+    if notify.listening(bot):
+        return "on"
+    return "off (another machine should handle it)" if long else "off"
+
+
+def _connected_line(cfg: dict[str, Any], prefix: str) -> str:
+    bots = cfg["bots"]
+    if len(bots) == 1:
+        bot = bots[0]
+        return (f"{prefix} This qur is [bold]{cfg['qur_id']}[/bold] ({len(bot['chat_ids'])} chat(s)). "
+                f"Requeue button: {_button_state(bot)}.")
+    lines = [f"{prefix} This qur is [bold]{cfg['qur_id']}[/bold], connected to {len(bots)} bots:"]
+    for bot in bots:
+        lines.append(f"  {notify.bot_label(bot)}: {len(bot['chat_ids'])} chat(s), Requeue button {_button_state(bot, long=False)}")
+    return "\n".join(lines)
+
+
+def _bot_ids_hint(cfg: dict[str, Any]) -> str:
+    return ", ".join(notify.bot_label(b) for b in cfg["bots"])
+
+
+def _bots_for(cfg: dict[str, Any] | None, ref: str | None) -> list[dict[str, Any]]:
+    """The bots a command applies to: the one named by --bot, else all."""
+    if cfg is None:
+        _fail("notifications are not set up on this machine -- run `qur connect`")
+    if ref is None:
+        return list(cfg["bots"])
+    found = notify.find_bots(cfg, ref)
+    if not found:
+        _fail(f"no connected bot matches '{ref}'. This machine has: {_bot_ids_hint(cfg)} (see `qur connect --list`)")
+    return found
+
+
+def _bot_username(token: str, required: bool) -> str | None:
+    """The bot's @username from Telegram. With `required`, an unusable token
+    is an error; otherwise failures are ignored (best effort)."""
+    try:
+        return notify.check_token(token)
+    except notify.NotifyError as e:
+        if required:
+            _fail(f"bot token rejected by Telegram: {e}")
+        return None
+
+
+@app.command()
+def connect(
+    export: bool = typer.Option(False, "--export", help="Print a string that sets up other machines (contains the bot tokens). With --bot, only that bot"),
+    import_: Optional[str] = typer.Option(None, "--import", help="Set this machine up from another machine's --export string (adds its bots to this machine's)"),
+    from_: Optional[str] = typer.Option(None, "--from", metavar="[USER@]HOST", help="Set this machine up over ssh from a machine that is already set up (no string to copy)"),
+    off: bool = typer.Option(False, "--off", "--remove-bot", help="Remove a bot from this machine (--bot ID), or everything if it has only one or you pass --all"),
+    list_: bool = typer.Option(False, "--list", help="Show this machine's setup: id, host, every bot with its paired chats and Requeue button on/off"),
+    remove_chat: Optional[int] = typer.Option(None, "--remove-chat", metavar="CHAT_ID", help="Stop sending to one paired chat/phone (ids are shown by --list), on every bot or just --bot. Keeps the bot tokens"),
+    id_: Optional[str] = typer.Option(None, "--id", help="Set this machine's id shown in messages (1-16 letters, digits, - or _)"),
+    listen: Optional[bool] = typer.Option(None, "--listen/--no-listen", help="Whether this machine handles the Requeue/Details buttons for a bot (all its bots unless --bot; only one machine per bot should; --import turns it off for new bots)"),
+    add_bot: bool = typer.Option(False, "--add-bot", help="Connect one more bot to this machine: asks for its token, then pairs a phone (QR) as usual"),
+    bot: Optional[str] = typer.Option(None, "--bot", metavar="BOT", help="Which connected bot a command applies to: its id or @username (shown by --list)"),
+    all_: bool = typer.Option(False, "--all", help="With --remove-bot: remove every bot, i.e. forget the whole setup"),
+) -> None:
+    """Get a Telegram message when a job finishes, on any machine running qur.
+
+    Messages say done / failed / cancelled, the job id, how long it took, the
+    command as you typed it, the exit code, and which machine sent it (hostname
+    plus that qur's id, shown when you connect; change it with --id). They never
+    include the working directory or resolved paths; use `qur show ID` on the
+    machine for those. A job that is auto-retried stays silent until its final try.
+
+    Each message has two buttons. Requeue re-runs the finished job (like `qur
+    requeue ID`). Details replies with everything `qur show ID` prints, formatted
+    for Telegram (this includes paths, sent only to your paired chats). Both are
+    handled by the daemon of the machine that polls that bot.
+
+    One qur can use several bots at once: every message goes through every bot
+    it is connected to, and presses on any of them come back to it. Telegram
+    lets only one program listen to a bot at a time, so give each machine its
+    own bot if you want its buttons to always reach it (`--add-bot` on that
+    machine), and use --import/--from on the others only to send through it.
+    Machines set up with --import send through the bot but show no buttons
+    (unless you pass --listen).
+
+    Manage this machine: --list shows its id, host, bots and paired chat ids
+    (other machines are not listed; run it on each). --id renames it.
+    --remove-chat CHAT_ID stops one phone/account; --remove-bot (same as --off)
+    removes a bot (--bot picks which; with one bot it removes the whole setup).
+    With several bots, --bot picks the one for --remove-bot, --export, --listen
+    and for pairing another phone. The other management options cannot be
+    combined with each other.
+
+    One-time setup, once per bot: in Telegram open @BotFather, send /newbot,
+    copy the token.
+
+    First machine: run `qur connect`, paste the token, scan the QR with your
+    phone, press Start. Running it again adds another phone or account (with
+    several bots, say which: `qur connect --bot @my_bot`). A second bot on the
+    same machine: `qur connect --add-bot`.
+
+    Other machines, easiest: `qur connect --from user@first-machine`. It logs in
+    over ssh, runs `qur connect --export` there and imports the result (all its
+    bots), so there is nothing to copy. Without ssh: run `qur connect --export`
+    on the first one, then `qur connect --import <string>` on each other one. No
+    scan needed. (Pair one machine at a time; sending from many machines at once
+    is fine.)
+
+    \b
+    Examples:
+      qur connect
+      qur connect --add-bot
+      qur connect --export
+      qur connect --from sampk@laptop
+      qur connect --import qurtg1:eyJ0Ijoi...
+      qur connect --id bigbox
+      qur connect --list
+      qur connect --bot @laptop_bot --no-listen
+      qur connect --remove-chat 123456789
+      qur connect --remove-bot --bot @old_bot
+      qur connect --remove-bot --all
+    """
+    actions = [export, import_ is not None, from_ is not None, off, list_, remove_chat is not None, add_bot]
+    if sum(actions) > 1:
+        _fail("use only one of --export, --import, --from, --off/--remove-bot, --list, --remove-chat, --add-bot")
+    if (export or off or list_ or remove_chat is not None) and (id_ is not None or listen is not None):
+        _fail("--id and --listen cannot be combined with --export, --off, --list or --remove-chat")
+    if id_ is not None and not notify.valid_qur_id(id_):
+        _fail("id must be 1-16 characters: letters, digits, - or _")
+    if bot is not None and (import_ is not None or from_ is not None or list_ or add_bot or id_ is not None):
+        _fail("--bot picks an already connected bot; it cannot be combined with --import, --from, --list, --add-bot or --id")
+    if all_ and not off:
+        _fail("--all only goes with --remove-bot")
+    if all_ and bot is not None:
+        _fail("use either --bot or --all, not both")
+
+    if from_ is not None:
+        import_ = _fetch_export_over_ssh(from_)
+
+    existing = notify.load()
+
+    # --id / --listen alone: change this machine's setup, no pairing
+    if import_ is None and not add_bot and existing is not None and (id_ is not None or listen is not None):
+        cfg = {"qur_id": id_ or existing["qur_id"], "bots": [dict(b) for b in existing["bots"]]}
+        if listen is not None:
+            targets = {b["token"] for b in _bots_for(existing, bot)}
+            for b in cfg["bots"]:
+                if b["token"] in targets:
+                    b["listen"] = listen
+        notify.save(cfg)
+        console.print(_connected_line(notify.load() or cfg, "Updated."))
+        return
+
+    if list_:
+        if existing is None:
+            console.print("[dim](notifications are not set up on this machine -- run `qur connect`)[/dim]")
+            return
+        table = Table(show_header=False, title="This machine")
+        table.add_row("id", existing["qur_id"])
+        table.add_row("host", socket.gethostname())
+        for i, b in enumerate(existing["bots"]):
+            if i:
+                table.add_section()
+            table.add_row("bot", notify.bot_label(b))  # bot id; never print the secret half
+            table.add_row("chats", ", ".join(str(c) for c in b["chat_ids"]) or "none -- run `qur connect` to pair one")
+            table.add_row("Requeue/Details buttons", "on" if notify.listening(b) else "off (send-only)")
+        table.add_section()
+        table.add_row("config", str(notify.default_path()))
+        console.print(table)
+        console.print("[dim]Other machines are not listed: each qur only knows itself. Run this on each.[/dim]")
+        return
+
+    if remove_chat is not None:
+        targets = [b for b in _bots_for(existing, bot) if remove_chat in b["chat_ids"]]
+        if existing is None or not targets:
+            _fail(f"chat {remove_chat} is not paired on this machine (see `qur connect --list`)")
+        hit = {b["token"] for b in targets}
+        cfg = {"qur_id": existing["qur_id"], "bots": [
+            {**b, "chat_ids": [c for c in b["chat_ids"] if c != remove_chat]} if b["token"] in hit else b
+            for b in existing["bots"]
+        ]}
+        notify.save(cfg)
+        if len(existing["bots"]) == 1:
+            left = len(cfg["bots"][0]["chat_ids"])
+            console.print(f"Removed chat {remove_chat}. {left} chat(s) left"
+                          + ("" if left else " -- no messages will be sent until you run `qur connect` to pair one") + ".")
+        else:
+            console.print(f"Removed chat {remove_chat} from {len(targets)} bot(s): "
+                          + ", ".join(notify.bot_label(b) for b in targets) + ".")
+            empty = [b for b in cfg["bots"] if not b["chat_ids"]]
+            for b in empty:
+                console.print(f"[yellow]{notify.bot_label(b)} has no chats left[/yellow] -- it sends nothing until you "
+                              f"run `qur connect --bot {notify.bot_id(b['token'])}` to pair one.")
+        return
+
+    if off:
+        if existing is None:
+            if notify.remove():  # unreadable config: still clean it up
+                console.print("Bot [yellow]removed[/yellow] from this machine.")
+            else:
+                console.print("[dim](notifications were not set up on this machine)[/dim]")
+            return
+        if bot is not None:
+            gone = _bots_for(existing, bot)
+            rest = existing
+            for b in gone:
+                rest = notify.without_bot(rest, b["token"]) if rest else None
+            if rest is not None:
+                notify.save(rest)
+                console.print("Bot [yellow]removed[/yellow]: " + ", ".join(notify.bot_label(b) for b in gone)
+                              + f". {len(rest['bots'])} bot(s) left. To invalidate the token everywhere, "
+                              "send /revoke to @BotFather.")
+                return
+        elif len(existing["bots"]) > 1 and not all_:
+            _fail(f"this machine has {len(existing['bots'])} bots ({_bot_ids_hint(existing)}); "
+                  "use --bot ID to remove one, or --all to remove them all")
+        notify.remove()
+        console.print("Bot [yellow]removed[/yellow] from this machine"
+                      + (" (all bots)" if len(existing["bots"]) > 1 else "") + ". "
+                      "To invalidate the bot token everywhere, send /revoke to @BotFather.")
+        return
+
+    if export:
+        chosen = [b for b in _bots_for(existing, bot) if b["chat_ids"]] if existing else []
+        if existing is None or not chosen:
+            _fail("nothing to export -- run `qur connect` first")
+        typer.echo(notify.export_string(existing, chosen))
+        typer.echo(f"Contains the bot token{'s' if len(chosen) > 1 else ''} -- keep it secret. "
+                   "Run `qur connect --import <string>` on another machine.", err=True)
+        return
+
+    if import_ is not None:
+        try:
+            items = notify.parse_export_bots(import_)
+        except ValueError as e:
+            _fail(str(e))
+        names: dict[str, str | None] = {}
+        for token, _chats in items:
+            try:
+                names[token] = notify.check_token(token)
+            except notify.NotifyError as e:
+                _fail(f"bot token rejected by Telegram: {e}")
+        cfg = existing
+        imported: list[str] = []
+        for token, chat_ids in items:
+            old = next((b for b in cfg["bots"] if b["token"] == token), None) if cfg else None
+            if old is not None:
+                # already connected: keep its settings, add any chats we lack
+                entry = {**old, "chat_ids": old["chat_ids"] + [c for c in chat_ids if c not in old["chat_ids"]]}
+                if listen is not None:
+                    entry["listen"] = listen
+            else:
+                # a bot another machine already uses: only one machine per bot
+                # can poll for button presses, so this one starts send-only
+                entry = {"token": token, "chat_ids": chat_ids, "listen": bool(listen)}
+            if names.get(token):
+                entry["username"] = names[token]
+            cfg = notify.with_bot(cfg, entry, id_)
+            imported.append(token)
+        assert cfg is not None
+        notify.save(cfg)
+        for bcfg in notify.bot_cfgs(cfg):
+            if bcfg["token"] in imported:
+                _warn_hello(bcfg)
+        console.print(_connected_line(cfg, "Connected."))
+        return
+
+    # pair a phone/account with a bot
+    username: str | None = None
+    if add_bot or existing is None:
+        token = typer.prompt("Bot token (from @BotFather /newbot)", hide_input=True).strip()
+        if not notify.TOKEN_RE.match(token):
+            _fail("that does not look like a bot token (expected 123456789:ABC...)")
+        username = _bot_username(token, required=add_bot)
+    else:
+        if bot is None and len(existing["bots"]) > 1:
+            _fail(f"this machine has {len(existing['bots'])} bots ({_bot_ids_hint(existing)}); pick the one to pair a phone "
+                  "with using --bot, or connect another bot with --add-bot")
+        target = _bots_for(existing, bot)
+        if len(target) > 1:
+            _fail(f"--bot matched {len(target)} bots; use the numeric bot id")
+        token = target[0]["token"]
+        username = target[0].get("username") or _bot_username(token, required=False)
+
+    def show_link(link: str) -> None:
+        import segno
+
+        typer.echo("Scan with your phone camera or Telegram, then press Start:\n")
+        segno.make(link, error="m").terminal(compact=True)
+        typer.echo(f"\n{link}\n")
+        typer.echo("Waiting for Start (Ctrl-C to cancel)...")
+
+    try:
+        with notify.pairing_lock():  # the daemon stops polling while we pair
+            chat_id = notify.pair(token, show_link)
+    except notify.PairingConflict as e:
+        _fail(str(e))
+    except notify.NotifyError as e:
+        _fail(str(e))
+    except TimeoutError as e:
+        _fail(str(e))
+    except KeyboardInterrupt:
+        _fail("cancelled")
+
+    old = next((b for b in existing["bots"] if b["token"] == token), None) if existing else None
+    entry = dict(old) if old else {"token": token, "chat_ids": []}
+    if chat_id not in entry["chat_ids"]:
+        entry["chat_ids"] = [*entry["chat_ids"], chat_id]
+    if listen is not None:
+        entry["listen"] = listen
+    if username:
+        entry["username"] = username
+    cfg = notify.with_bot(existing, entry, id_)
+    notify.save(cfg)
+    for bcfg in notify.bot_cfgs(cfg):
+        if bcfg["token"] == token:
+            _warn_hello(bcfg)
+    console.print(_connected_line(cfg, "Connected."))
 
 
 # ---------------------------------------------------------------------------

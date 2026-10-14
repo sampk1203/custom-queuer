@@ -433,6 +433,22 @@ def remove_from_queue(conn: sqlite3.Connection, job_id: int) -> None:
     conn.commit()
 
 
+def cancel_queued(conn: sqlite3.Connection, job_id: int) -> None:
+    """Cancel a job that has not started: it stays in history as
+    `cancelled` (unlike remove_from_queue, which deletes it). Works on both
+    the normal and the priority lane."""
+    job = get_job(conn, job_id)
+    if job is None:
+        raise ValueError(f"job {job_id} does not exist")
+    if job["status"] != "queued":
+        raise ValueError(f"job {job_id} is not queued (status={job['status']!r})")
+    conn.execute("UPDATE jobs SET position = NULL WHERE id = ?", (job_id,))
+    remaining = [i for i in _queued_ids_ordered(conn, job["channel"], bool(job["is_priority"])) if i != job_id]
+    _reindex_queue(conn, remaining)
+    conn.commit()
+    mark_finished(conn, job_id, status="cancelled", note="cancelled while queued")
+
+
 def reorder_before(conn: sqlite3.Connection, job_id: int, before_id: int) -> None:
     _reorder(conn, job_id, target_id=before_id, after=False)
 

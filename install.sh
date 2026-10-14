@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
-# Installs / re-installs queuerd as a systemd --user service.
+# Installs / re-installs queuerd as a systemd --user service, or uninstalls it.
 # Safe to re-run any time (e.g. after moving the project or pulling updates).
+#
+#   ./install.sh              asks: Enter = install, 1 = uninstall
+#   ./install.sh install      skip the question
+#   ./install.sh uninstall    skip the question
 #
 # Order of operations, and why: bootstrap uv -> sync venv -> run full test
 # suite -> install CLI + shell completion -> only then touch the running service. If the tests fail, the
@@ -13,6 +17,115 @@ SERVICE_DIR="$HOME/.config/systemd/user"
 SERVICE_FILE="$SERVICE_DIR/queuerd.service"
 
 cd "$PROJECT_DIR"
+
+# ---------------------------------------------------------------------------
+# 0. Install or uninstall? Enter = install, 1 = uninstall. (No terminal, e.g.
+#    piped in: install, unless told otherwise on the command line.)
+# ---------------------------------------------------------------------------
+
+ask() {  # ask "prompt" -> sets REPLY; empty when there is no terminal
+    REPLY=""
+    if [ -t 0 ]; then read -r -p "$1" REPLY || REPLY=""; fi
+}
+
+ACTION="${1:-}"
+if [ -z "$ACTION" ]; then
+    echo "What do you want to do?"
+    echo "  [Enter]  install (or re-install)"
+    echo "  [1]      uninstall -- remove everything this script installed"
+    ask "> "
+    case "$REPLY" in
+        1) ACTION=uninstall ;;
+        *) ACTION=install ;;
+    esac
+fi
+
+if [ "$ACTION" = "uninstall" ]; then
+    STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/queuer"
+    CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/queuer"
+    SOCKET="${XDG_RUNTIME_DIR:-/tmp}/queuer.sock"
+    ZSH_COMP=("$HOME/.zfunc/_qur" "$HOME/.zfunc/_queuer")
+    FISH_COMP=("$HOME/.config/fish/completions/qur.fish" "$HOME/.config/fish/completions/queuer.fish")
+    BASH_COMP=("$HOME/.bash_completions/qur.sh" "$HOME/.bash_completions/queuer.sh")
+
+    echo ""
+    echo "This will remove:"
+    echo "  - the queuerd service (stopped, disabled) and $SERVICE_FILE"
+    echo "  - the queuer / qur / queuerd commands (uv tool) and their shell completion"
+    echo "  - the project virtualenv $PROJECT_DIR/.venv"
+    echo "  - the job database (queue + history) in $STATE_DIR"
+    echo "  - the Telegram setup (bot token, chats, id) in $CONFIG_DIR"
+    echo "  - the daemon socket $SOCKET"
+    echo "It will NOT delete this project folder, uv itself, or the PATH line"
+    echo "that 'uv tool update-shell' added to your shell rc."
+    echo ""
+    ask "Proceed? [y/N] "
+    case "$REPLY" in y|Y|yes|YES) ;; *) echo "Cancelled. Nothing changed."; exit 0 ;; esac
+
+    ask "Also delete job logs ($STATE_DIR/logs)? [y/N] "
+    DEL_LOGS=no; case "$REPLY" in y|Y|yes|YES) DEL_LOGS=yes ;; esac
+    echo "Linger (keeps your user services running after logout) was enabled by the"
+    echo "installer. Other user services you run may rely on it."
+    ask "Disable linger for $USER? [y/N] "
+    DEL_LINGER=no; case "$REPLY" in y|Y|yes|YES) DEL_LINGER=yes ;; esac
+
+    echo "==> Stopping and disabling queuerd"
+    systemctl --user disable --now queuerd 2>/dev/null || true
+    pkill -x queuerd 2>/dev/null || true
+    sleep 1
+    if pgrep -x queuerd > /dev/null; then
+        echo "WARNING: a queuerd process is still running:" >&2
+        pgrep -a -x queuerd >&2
+        echo "Kill it (kill <pid>) and re-run to finish." >&2
+        exit 1
+    fi
+    rm -f "$SERVICE_FILE"
+    systemctl --user daemon-reload 2>/dev/null || true
+    systemctl --user reset-failed queuerd 2>/dev/null || true
+
+    if [ "$DEL_LINGER" = yes ]; then
+        echo "==> Disabling linger for $USER"
+        loginctl disable-linger "$USER" || echo "WARNING: could not disable linger." >&2
+    fi
+
+    echo "==> Removing the queuer / qur / queuerd commands"
+    if command -v uv > /dev/null 2>&1; then
+        uv tool uninstall queuer 2>/dev/null || echo "    (queuer was not installed as a uv tool)"
+    else
+        echo "    uv not found -- skipped; remove the commands yourself if they exist"
+    fi
+
+    echo "==> Removing shell completion"
+    rm -f "${ZSH_COMP[@]}" "${FISH_COMP[@]}" "${BASH_COMP[@]}"
+    if [ -f "$HOME/.bashrc" ]; then  # drop the lines typer added to .bashrc
+        sed -i -e "\|^source '$HOME/.bash_completions/qur.sh'\$|d" \
+               -e "\|^source '$HOME/.bash_completions/queuer.sh'\$|d" "$HOME/.bashrc"
+    fi
+
+    echo "==> Removing job database and Telegram setup"
+    rm -f "$STATE_DIR"/queuer.db "$STATE_DIR"/queuer.db-wal "$STATE_DIR"/queuer.db-shm
+    rm -rf "$CONFIG_DIR"
+    rm -f "$SOCKET"
+    if [ "$DEL_LOGS" = yes ]; then
+        echo "==> Removing job logs"
+        rm -rf "$STATE_DIR/logs"
+    else
+        echo "==> Keeping job logs in $STATE_DIR/logs"
+    fi
+    rmdir "$STATE_DIR" 2>/dev/null || true  # only if now empty
+
+    echo "==> Removing the virtualenv"
+    rm -rf "$PROJECT_DIR/.venv"
+
+    echo "==> Uninstalled. Open a new terminal so the removed commands and completion disappear."
+    echo "    To reinstall: ./install.sh"
+    exit 0
+fi
+
+if [ "$ACTION" != "install" ]; then
+    echo "Usage: $0 [install|uninstall]" >&2
+    exit 2
+fi
 
 echo "==> Project dir: $PROJECT_DIR"
 

@@ -27,11 +27,14 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-from queuer import db
+from queuer import db, notify
 from queuer.pathresolve import resolve_command
 
 MAX_LOG_BYTES = 50 * 1024 * 1024  # 50MB per-job log cap
 DEFAULT_GRACE_SECS = 5
+LISTEN_IDLE_SECS = 5  # recheck config when Telegram listening is off
+LISTEN_GAP_SECS = 0.1  # pause between polls
+LISTEN_RETRY_SECS = 30  # back off after a failed poll (offline, 409, ...)
 
 
 def _default_db_path() -> Path:
@@ -60,19 +63,29 @@ class Daemon:
         db_path: Path | None = None,
         socket_path: Path | None = None,
         log_dir: Path | None = None,
+        notify_path: Path | None = None,
     ) -> None:
         self.db_path = db_path or _default_db_path()
         self.socket_path = socket_path or _default_socket_path()
         self.log_dir = log_dir or _default_log_dir()
+        self.notify_path = notify_path or notify.default_path()
         self.conn: sqlite3.Connection | None = None
 
-        # all per-channel: each channel gets its own wake event, its own
-        # current-job slot, its own cancel flag, its own worker task.
+        # per-channel: each channel gets its own wake event, its own
+        # current-job slot, its own worker task.
         self._wake: dict[int, asyncio.Event] = {}
         self._current_proc: dict[int, asyncio.subprocess.Process] = {}
         self._current_job_id: dict[int, int] = {}
-        self._cancel_requested: dict[int, bool] = {}
         self._worker_tasks: dict[int, asyncio.Task] = {}
+
+        # ids of jobs a user asked to cancel while running. Per job, not per
+        # channel: a frozen (--now) job and the priority job that froze it
+        # share a channel, and cancelling one must not label the other.
+        self._cancelled: set[int] = set()
+
+        # in-flight notification sends (kept so they aren't garbage-collected)
+        self._notify_tasks: set[asyncio.Task] = set()
+        self._tg_offsets: dict[str, int] = {}  # bot token -> next getUpdates offset
 
         # `--now` priority lane: at most one job can be frozen per channel
         # at a time (a frozen normal job, held here with its own proc
@@ -104,13 +117,13 @@ class Daemon:
                     status="failed",
                     note="interrupted by daemon restart",
                 )
+                self._notify_finished(running["id"])
 
     def _ensure_channel_worker(self, channel: int) -> None:
         """Lazily spawn a channel's worker loop if it isn't running yet."""
         if channel in self._worker_tasks:
             return
         self._wake[channel] = asyncio.Event()
-        self._cancel_requested[channel] = False
         self._worker_tasks[channel] = asyncio.create_task(self.worker_loop(channel))
 
     # -- worker loop -------------------------------------------------------
@@ -219,13 +232,12 @@ class Daemon:
             )
         except (OSError, FileNotFoundError) as e:
             db.mark_finished(self.conn, job_id, status="failed", note=f"failed to start: {e}")
-            self._maybe_auto_retry(job_id)
+            self._after_finish(job_id)
             return
 
         db.mark_running(self.conn, job_id, pid=proc.pid, pgid=proc.pid)
         self._current_proc[channel] = proc
         self._current_job_id[channel] = job_id
-        self._cancel_requested[channel] = False
 
         log_task = asyncio.create_task(self._pump_log(proc, log_path))
         timeout = job["timeout_secs"]
@@ -240,33 +252,189 @@ class Daemon:
             exit_code = await proc.wait()
             await log_task
             db.mark_finished(self.conn, job_id, status="failed", exit_code=exit_code, note="timed out")
-            self._current_proc.pop(channel, None)
-            self._current_job_id.pop(channel, None)
-            self._maybe_auto_retry(job_id)
+            self._cancelled.discard(job_id)
+            self._release(channel, job_id)
+            self._after_finish(job_id)
             return
 
         await log_task
 
-        if self._cancel_requested[channel]:
+        if job_id in self._cancelled:
             status = "cancelled"
-            self._cancel_requested[channel] = False
+            self._cancelled.discard(job_id)
         else:
             status = "done" if exit_code == 0 else "failed"
         db.mark_finished(self.conn, job_id, status=status, exit_code=exit_code)
-        self._current_proc.pop(channel, None)
-        self._current_job_id.pop(channel, None)
-        self._maybe_auto_retry(job_id)
+        self._release(channel, job_id)
+        self._after_finish(job_id)
 
-    def _maybe_auto_retry(self, job_id: int) -> None:
+    def _release(self, channel: int, job_id: int) -> None:
+        """Clear a channel's current-job slot, but only if it still points at
+        `job_id`. A frozen job that is cancelled finishes while the priority
+        job that froze it owns the slot -- that slot must be left alone."""
+        if self._current_job_id.get(channel) == job_id:
+            self._current_proc.pop(channel, None)
+            self._current_job_id.pop(channel, None)
+
+    def _after_finish(self, job_id: int) -> None:
+        """A job just reached a terminal state: retry it if it has retries
+        left, otherwise tell the user. A failure that was requeued stays
+        silent -- you hear about the final outcome only."""
+        if not self._maybe_auto_retry(job_id):
+            self._notify_finished(job_id)
+
+    def _notify_finished(self, job_id: int) -> None:
+        """Fire-and-forget Telegram message for a finished job, sent through
+        every connected bot. No-op if notifications aren't set up (`qur
+        connect`). Config is re-read each time, so connecting needs no daemon
+        restart."""
+        assert self.conn is not None
+        cfg = notify.load(self.notify_path)
+        if cfg is None:
+            return
+        job = db.get_job(self.conn, job_id)
+        if job is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        for bcfg in notify.bot_cfgs(cfg):
+            if not bcfg["chat_ids"]:
+                continue
+            # the buttons only go out through bots this machine listens to
+            markup = notify.job_markup(bcfg, job_id) if notify.listening(bcfg) else None
+            task = loop.create_task(self._send_notification(bcfg, notify.format_job(job, bcfg), markup))
+            self._notify_tasks.add(task)
+            task.add_done_callback(self._notify_tasks.discard)
+
+    async def _send_notification(self, cfg: dict[str, Any], text: str, markup: dict[str, Any] | None = None) -> None:
+        """`cfg` is one bot's flat view. One task per bot, so a slow or
+        failing bot never delays the others."""
+        # urllib blocks, so run it off the event loop; and nothing that goes
+        # wrong here may ever touch the queue.
+        try:
+            errors = await asyncio.to_thread(notify.send, cfg, text, markup)
+        except Exception as e:
+            errors = [f"{type(e).__name__}: {e}"]
+        for err in errors:
+            print(f"[queuerd] notification failed (bot {notify.bot_id(cfg['token'])}): {err}", file=sys.stderr)
+
+    def _listening_bot(self, token: str) -> dict[str, Any] | None:
+        """The current flat config of the bot with this token, if it should
+        be polled right now (has chats, `listen` on, no pairing running)."""
+        cfg = notify.load(self.notify_path)
+        if cfg is None or notify.pairing_active(self.notify_path):
+            return None
+        for bcfg in notify.bot_cfgs(cfg):
+            if bcfg["token"] == token:
+                return bcfg if bcfg["chat_ids"] and notify.listening(bcfg) else None
+        return None
+
+    async def _telegram_listener(self) -> None:
+        """Supervisor: one poller task per connected bot that has `listen`
+        on, started and stopped as the config changes (re-read every few
+        seconds). Steps aside while `qur connect` pairs. No error may
+        escape."""
+        pollers: dict[str, asyncio.Task] = {}
+        try:
+            while True:
+                cfg = notify.load(self.notify_path)
+                wanted: set[str] = set()
+                if cfg is not None and not notify.pairing_active(self.notify_path):
+                    wanted = {b["token"] for b in notify.bot_cfgs(cfg) if b["chat_ids"] and notify.listening(b)}
+                for token in list(pollers):
+                    if token not in wanted or pollers[token].done():
+                        pollers.pop(token).cancel()
+                for token in wanted - set(pollers):
+                    pollers[token] = asyncio.create_task(self._poll_bot(token))
+                await asyncio.sleep(LISTEN_IDLE_SECS)
+        finally:
+            for task in pollers.values():
+                task.cancel()
+
+    async def _poll_bot(self, token: str) -> None:
+        """Poll one bot for Requeue/Details presses until it is removed,
+        stops listening, or pairing starts (the supervisor restarts it).
+        Nothing here may touch the queue except an explicit requeue, and no
+        error may escape."""
+        # kept across restarts of this poller (e.g. a pairing pause) so a
+        # press that was already handled is never handed to us again
+        offset: int | None = self._tg_offsets.get(token)
+        last_err: str | None = None
+        while True:
+            cfg = self._listening_bot(token)
+            if cfg is None:
+                return
+            try:
+                updates = await asyncio.to_thread(notify.get_updates, cfg, offset)
+                last_err = None
+            except Exception as e:
+                err = f"{type(e).__name__}: {e}"
+                if err != last_err:  # don't spam the journal while offline
+                    print(f"[queuerd] telegram listener (bot {notify.bot_id(token)}): {err}", file=sys.stderr)
+                    last_err = err
+                await asyncio.sleep(LISTEN_RETRY_SECS)
+                continue
+            for update in updates:
+                offset = self._tg_offsets[token] = update["update_id"] + 1
+                try:
+                    await self._handle_update(cfg, update)
+                except Exception as e:
+                    print(f"[queuerd] telegram update failed: {type(e).__name__}: {e}", file=sys.stderr)
+            await asyncio.sleep(LISTEN_GAP_SECS)  # never hot-loop on instant empty replies
+
+    async def _handle_update(self, cfg: dict[str, Any], update: dict[str, Any]) -> None:
+        """A Requeue or Details button press that arrived on the bot `cfg`
+        (its flat view). Only presses from a chat paired with that bot count,
+        and replies go out through that same bot."""
+        cq = update.get("callback_query")
+        if not cq:
+            return
+        msg = cq.get("message") or {}
+        chat_id = (msg.get("chat") or {}).get("id")
+        parsed = notify.parse_callback(cq.get("data"))
+        if parsed is None or chat_id not in cfg["chat_ids"]:
+            return
+        action, qur_id, job_id = parsed
+        reply = lambda text: asyncio.to_thread(notify.answer_callback, cfg, cq["id"], text)  # noqa: E731
+        if qur_id != cfg["qur_id"]:
+            await reply("this message came from another machine or an old id")
+            return
+        to_chat = {**cfg, "chat_ids": [chat_id]}
+
+        if action == "sh":
+            assert self.conn is not None
+            job = db.get_job(self.conn, job_id)
+            if job is None:
+                await reply(f"job {job_id} does not exist")
+                return
+            await reply("")
+            await asyncio.to_thread(notify.send, to_chat, notify.format_details(job, cfg), None, "HTML")
+            return
+
+        try:
+            new_id = await self._requeue_job(job_id)
+        except ValueError as e:
+            await reply(str(e))
+            return
+        await reply(f"requeued as job {new_id}")
+        # Requeue is spent; Details stays
+        await asyncio.to_thread(notify.edit_markup, cfg, chat_id, msg["message_id"], notify.details_markup(cfg, job_id))
+        text = f"🔁 job {job_id} requeued as job {new_id}\n{notify._who(cfg)}"
+        await asyncio.to_thread(notify.send, to_chat, text)
+
+    def _maybe_auto_retry(self, job_id: int) -> bool:
         """If a just-finished job failed and still has retries left,
         requeue it at the end of its channel's normal queue as a new job
         (same command/cwd/env/timeout/max_retries, attempt + 1). Cancelled
         and done jobs are never retried. The failed job's note records the
-        retry so `show` explains where it went."""
+        retry so `show` explains where it went. Returns True if a retry was
+        queued."""
         assert self.conn is not None
         job = db.get_job(self.conn, job_id)
         if job is None or job["status"] != "failed" or job["attempt"] >= job["max_retries"]:
-            return
+            return False
         attempt = job["attempt"] + 1
         new_id = db.requeue(self.conn, job_id, log_path="pending", auto=True)
         log_path = str(self.log_dir / f"{new_id}.log")
@@ -276,6 +444,7 @@ class Daemon:
         self.conn.execute("UPDATE jobs SET note = ? WHERE id = ?", (note, job_id))
         self.conn.commit()
         self._wake_worker(job["channel"])
+        return True
 
     async def _pump_log(self, proc: asyncio.subprocess.Process, log_path: Path) -> None:
         """Stream the job's combined stdout/stderr to its log file, capped
@@ -443,25 +612,75 @@ class Daemon:
         return {"removed": args["id"]}
 
     async def _cmd_cancel(self, args: dict[str, Any]) -> dict[str, Any]:
-        channel = args.get("channel") or db.DEFAULT_CHANNEL
-        proc = self._current_proc.get(channel)
-        job_id = self._current_job_id.get(channel)
-        if proc is None or job_id is None:
-            raise ValueError(f"no job is currently running on channel {channel}")
-        self._cancel_requested[channel] = True
-        await self._kill_process_group(proc)
+        """Without `id`: kill the running job on `channel` (default 1), as
+        before. With `id`: cancel that job wherever it is -- running, frozen
+        by `--now`, or still queued (kept in history as `cancelled`). If
+        `channel` is also given it must match the job's channel."""
+        assert self.conn is not None
+        job_id = args.get("id")
+        channel = args.get("channel")
+
+        if job_id is None:
+            channel = channel or db.DEFAULT_CHANNEL
+            proc = self._current_proc.get(channel)
+            job_id = self._current_job_id.get(channel)
+            if proc is None or job_id is None:
+                raise ValueError(f"no job is currently running on channel {channel}")
+            await self._cancel_running(job_id, proc)
+            return {"cancelled": job_id, "channel": channel}
+
+        job = db.get_job(self.conn, job_id)
+        if job is None:
+            raise ValueError(f"job {job_id} does not exist")
+        channel = job["channel"] if channel is None else channel
+        if channel != job["channel"]:
+            raise ValueError(f"job {job_id} is on channel {job['channel']}, not channel {channel}")
+
+        status = job["status"]
+        if status == "queued":
+            db.cancel_queued(self.conn, job_id)
+            self._notify_finished(job_id)
+        elif status == "running":
+            proc = self._current_proc.get(channel)
+            if proc is None or self._current_job_id.get(channel) != job_id:
+                raise ValueError(f"job {job_id} is not running")
+            await self._cancel_running(job_id, proc)
+        elif status == "stopped":
+            frozen = self._frozen.get(channel)
+            if frozen is None or frozen[0] != job_id:
+                raise ValueError(f"job {job_id} is not frozen")
+            # drop it from the frozen slot first so the priority lane does
+            # not try to resume a job that is about to die
+            del self._frozen[channel]
+            await self._cancel_running(job_id, frozen[1], frozen=True)
+        else:
+            raise ValueError(f"job {job_id} is already {status}")
         return {"cancelled": job_id, "channel": channel}
 
+    async def _cancel_running(self, job_id: int, proc: asyncio.subprocess.Process, frozen: bool = False) -> None:
+        self._cancelled.add(job_id)
+        if frozen:
+            # a SIGSTOPped group never acts on SIGTERM until continued
+            try:
+                os.killpg(proc.pid, signal.SIGCONT)
+            except ProcessLookupError:
+                pass
+        await self._kill_process_group(proc)
+
     async def _cmd_requeue(self, args: dict[str, Any]) -> dict[str, Any]:
+        return {"id": await self._requeue_job(args["id"])}
+
+    async def _requeue_job(self, job_id: int) -> int:
+        """Manual requeue, shared by `qur requeue` and the Telegram button."""
         assert self.conn is not None
-        new_id = db.requeue(self.conn, args["id"], log_path="pending")
+        new_id = db.requeue(self.conn, job_id, log_path="pending")
         log_path = str(self.log_dir / f"{new_id}.log")
         self.conn.execute("UPDATE jobs SET log_path = ? WHERE id = ?", (log_path, new_id))
         self.conn.commit()
         new_job = db.get_job(self.conn, new_id)
         assert new_job is not None
         self._wake_worker(new_job["channel"])
-        return {"id": new_id}
+        return new_id
 
     async def _cmd_pause(self, args: dict[str, Any]) -> dict[str, Any]:
         assert self.conn is not None
@@ -517,7 +736,11 @@ class Daemon:
         server = await asyncio.start_unix_server(self._handle_client, path=str(self.socket_path))
 
         async with server:
-            await asyncio.gather(server.serve_forever(), *self._worker_tasks.values())
+            listener = asyncio.create_task(self._telegram_listener())
+            try:
+                await asyncio.gather(server.serve_forever(), *self._worker_tasks.values())
+            finally:
+                listener.cancel()
 
 
 def main() -> None:

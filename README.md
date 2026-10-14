@@ -29,6 +29,20 @@ linger so it survives logout.
 
 `qur` is a short alias for `queuer` — same command, less typing.
 
+Running `./install.sh` asks what to do: **Enter** installs (or re-installs), **1**
+uninstalls. `./install.sh install` / `./install.sh uninstall` skip the question.
+
+**Uninstall** lists what it will remove and asks to proceed (default no), then asks
+separately whether to delete the job logs and whether to disable linger (both
+default no). It stops and disables `queuerd`, deletes the systemd unit, runs
+`uv tool uninstall queuer`, removes the shell completion files and the lines typer
+added to `~/.bashrc`, deletes the job database (queue and history), the Telegram
+setup (`~/.config/queuer`, bot token included), the socket and the project
+`.venv`. It does not delete the project folder, uv itself, or the PATH line `uv tool
+update-shell` added to your shell rc, since other tools use those. Logs stay unless
+you say yes. The Telegram bot token is not revoked; send `/revoke` to @BotFather
+for that.
+
 To confirm it worked:
 ```bash
 systemctl --user status queuerd
@@ -46,7 +60,7 @@ queuer add [--channel N] [--before ID | --after ID | --now] [--timeout SECONDS] 
 queuer list [--channel N] [--full] [--json]
 queuer status [--json]
 queuer show ID [ID...] [--json]
-queuer cancel [--channel N]
+queuer cancel [JOB_ID] [--channel N]
 queuer clear [--channel N]
 queuer rm ID
 queuer requeue ID
@@ -54,6 +68,7 @@ queuer pause [--channel N]
 queuer resume [--channel N]
 queuer logs ID [--tail]
 queuer clean-logs [--days N] [--dry-run]
+queuer connect [--export | --import STRING | --from [USER@]HOST | --add-bot | --off] [--id NAME] [--listen | --no-listen] [--list] [--remove-chat CHAT_ID] [--remove-bot [--all]] [--bot ID_OR_@NAME]
 ```
 
 ### `add`
@@ -109,11 +124,26 @@ Full detail on one or more jobs — both command forms, cwd, every timestamp,
 duration, exit code, timeout, auto-retry count, pid, and log path. With
 `--json`, one ID prints an object; several print a list.
 
-### `cancel`
+### `cancel [JOB_ID]`
 
-Kills the currently running job (SIGTERM to its whole process group,
-then SIGKILL if it's still alive after the grace period). Errors clearly
-if nothing is running.
+With no `JOB_ID`, kills the currently running job on a channel (default 1;
+`--channel N` for another) — SIGTERM to its whole process group, then SIGKILL
+if it's still alive after the grace period. Errors clearly if nothing is
+running there.
+
+With a `JOB_ID`, cancels **that job**, wherever it is:
+
+- **running** — killed as above.
+- **frozen** by a `--now` job — continued and killed (a stopped process never
+  acts on SIGTERM, so it is sent SIGCONT first). The `--now` job that froze it
+  keeps running.
+- **queued** — marked `cancelled` and kept in history (`qur rm` deletes it
+  instead).
+- already finished, or no such ID — error.
+
+The job's channel is looked up from its ID, so you don't need `--channel`; if
+you give both and they disagree, it errors rather than guessing. Cancelled jobs
+are never auto-retried.
 
 ### `rm ID`
 
@@ -132,6 +162,120 @@ of the queue. Handy for rerunning a job that failed without retyping it.
 `pause` stops the daemon from starting new jobs — the current job (if
 any) keeps running to completion. State persists across daemon
 restarts, so a paused queue doesn't silently resume after a crash.
+
+### `connect`
+
+Telegram messages when a job finishes, from every machine running qur, into
+one chat on your phone.
+
+```
+✅ done · job 12 · 2h13m
+$ python train.py --epochs 50
+bigbox [a3f9] · ch 1 · exit 0
+[ 🔁 Requeue ] [ ℹ️ Details ]
+```
+
+Sent for **done**, **failed** (including timeouts, failed starts, and jobs
+interrupted by a daemon restart) and **cancelled** (running or queued). Each
+qur has its own short id (`a3f9` above, shown when you connect), so with
+several machines you can see exactly which one a message came from. A job with
+`--retries` stays silent while retries remain; you get one message for its
+final outcome, marked `attempt 3/3`. Messages show the command as you typed it
+(one line, capped at 120 characters) but never the working directory, resolved
+paths or raw error text — use `qur show ID` on that machine for those.
+
+**Details button.** Replies with everything `qur show ID` prints (raw and
+resolved command, cwd, timestamps, duration, exit code, timeout, origin, pid, log
+path, note), laid out for Telegram: bold labels, monospace commands and paths.
+This is the one place paths leave the machine, and only to your paired chats, on
+request. `qur show` itself is unchanged.
+
+**Requeue button.** Pressing it re-runs the finished job exactly like
+`qur requeue ID` (same command, cwd, timeout, retries; end of its channel's
+queue) and replies `🔁 job 12 requeued as job 13`; the Requeue button is then
+removed from that message (Details stays). Only chats you paired can use either
+button, and these are the only actions the bot accepts. Both need the daemon to listen
+to Telegram, which Telegram allows for one machine per bot: the machine that owns
+the bot (`listen` on by default) handles them, and bots added with `--import` are
+send-only and show no buttons. Change that with `qur connect --listen` /
+`--no-listen` (add `--bot` for one bot). **Best setup: one bot per machine** (see
+"Several bots on one machine" below), so a press always reaches the machine that
+sent the message. Old buttons stop working if you
+rename the machine, and a press is ignored if the job is not finished.
+
+**See this machine's setup:** `qur connect --list` shows its id, hostname, every
+bot (id and @username), its paired chat ids, whether the buttons are on, and the
+config path. Other machines
+are not listed — each qur only knows itself, so run it on each machine.
+
+**Remove one phone/account:** `qur connect --remove-chat CHAT_ID` (ids from
+`--list`). It stops getting messages and can no longer press buttons; the bot
+token and other chats stay (with several bots it is removed from all of them
+unless you add `--bot`). **Remove a bot from this machine:**
+`qur connect --remove-bot` (same as `--off`; with several bots add `--bot ID`, or
+`--all` to forget the whole setup).
+
+**Rename this machine:** `qur connect --id bigbox` (1–16 letters, digits, `-`,
+`_`). Takes effect on the next message; nothing else changes. `--id` also works
+on first setup and with `--import`.
+
+**One-time setup, once per person:** in Telegram open **@BotFather**, send
+`/newbot`, pick a name, copy the token.
+
+**First machine:**
+
+```bash
+qur connect          # paste the token, scan the QR with your phone, press Start
+```
+
+If the QR won't scan, open the `t.me` link printed under it. Run `qur connect` again to add another phone or
+account — every paired chat gets every message.
+
+**Every other machine** — no scan, no waiting. Easiest, over ssh:
+
+```bash
+qur connect --from sampk@laptop       # on the new machine; nothing to copy
+qur connect --from sampk@laptop --id desktop   # same, and name it
+```
+
+It runs `qur connect --export` on that machine over ssh (adding `~/.local/bin` to
+the remote PATH, since non-interactive ssh often lacks it) and imports the result.
+ssh prompts (password, host key) appear as usual. The other machine must already
+be set up. Without ssh, copy the string by hand:
+
+```bash
+qur connect --export                  # on the first machine: prints one string
+qur connect --import qurtg1:eyJ0...   # on each other machine
+```
+
+Each machine gets its own id on import and is send-only (no buttons; the first
+machine keeps them). The string contains the bot token, so keep it private.
+
+`qur connect --off` deletes this machine's saved setup. To invalidate the bot
+token on all machines, send `/revoke` to @BotFather.
+
+**How it works / limits:**
+
+- Any number of machines can *send* through one bot at the same time. Listening
+  happens in two places only: the daemon on the one `listen` machine (polling for
+  Requeue presses), and the pairing step in `qur connect`. Telegram allows one
+  listener per bot token, so the daemon steps aside while `qur connect` pairs.
+  Pair **one machine at a time**; if two overlap you get a clear "another qur may
+  be pairing" error — wait and retry. That is why other machines use `--import`
+  instead of scanning.
+- If two machines both have `listen` on, they take turns killing each other's
+  polls and the button is unreliable. Turn one off with `--no-listen`.
+- While Telegram is unreachable the daemon retries every 30 s and logs the
+  error once to the journal. A button pressed during an outage is handled when
+  it is back (Telegram keeps unconfirmed presses for ~24 h).
+- The config (`notify.json`, mode 0600) holds the bot token. It is re-read for
+  every message, so connecting or disconnecting needs no daemon restart.
+- Telegram can read message content (bot messages are not end-to-end
+  encrypted). That is why messages are kept minimal.
+- Pairing only accepts a `/start` carrying the random code from your own QR, so
+  a stranger who finds the bot can't subscribe themselves.
+- A failed send (offline, Telegram down) is logged to the daemon's journal and
+  dropped. It never delays or fails a job. Messages are not queued for later.
 
 ### `logs ID [--tail]`
 
@@ -159,7 +303,8 @@ sends to the journal.
 If `queuerd` dies while a job is running (crash, `kill -9`, reboot), that
 job is never silently lost or blindly re-run. On startup, any job still
 marked `running` from a previous instance is marked `failed` with
-`note: interrupted by daemon restart`. Note this only updates the job's
+`note: interrupted by daemon restart` (and, if notifications are set up, you get
+a message for it). Note this only updates the job's
 record — if the job's own subprocess is still alive (it runs in its own
 process group, independent of the daemon's), it keeps running
 unsupervised until it finishes or you kill it manually (`pgrep`/`kill`).
@@ -175,10 +320,11 @@ reboots without any special handling.
 | Job database | `~/.local/state/queuer/queuer.db` |
 | Job logs | `~/.local/state/queuer/logs/<id>.log` |
 | Socket | `$XDG_RUNTIME_DIR/queuer.sock` |
+| Notification config (bot token, chats, this qur's id) | `~/.config/queuer/notify.json` |
 | systemd unit | `~/.config/systemd/user/queuerd.service` |
 
-All three of the first paths can be overridden with `QUEUER_DB_PATH`,
-`QUEUER_LOG_DIR`, and `QUEUER_SOCKET_PATH` env vars — mainly useful for
+The database, log, socket and notification paths can be overridden with `QUEUER_DB_PATH`,
+`QUEUER_LOG_DIR`, `QUEUER_SOCKET_PATH`, and `QUEUER_NOTIFY_PATH` env vars — mainly useful for
 running the daemon against a scratch location during manual testing,
 without touching real state.
 
@@ -196,9 +342,41 @@ For a design/architecture writeup and the phase-by-phase build plan, see
 
 - Serial within a channel — one job at a time per channel (channels run in parallel).
 - Retries are opt-in per job (`--retries`), immediate, and go to the end of the queue.
+- Notifications are Telegram-only, best-effort (a send that fails is dropped,
+  not retried), and visible to Telegram. Pair one machine at a time (see
+  `connect`).
 - No sandboxing — jobs run with your own user permissions, same as
   running them directly in a shell.
 - Nothing currently prevents two `queuerd` processes from running
   against the same database at once if you start one manually alongside
   the systemd-managed one — always manage it through `systemctl --user`,
   not by backgrounding `queuerd` directly.
+
+
+## Several bots on one machine
+
+One qur can be connected to any number of Telegram bots. Every finished-job
+message goes through every bot (to every chat paired with it), and the daemon
+polls each bot that has `listen` on, so Requeue / Details presses on any of
+them come back to this machine and are answered through the same bot.
+
+Telegram allows only one program to poll a bot, so for buttons that always
+reach the right machine, give each machine its own bot (`/newbot` in
+@BotFather) and add them to the same Telegram group if you want one feed.
+
+```
+qur connect                         # first bot: paste token, scan QR, press Start
+qur connect --add-bot               # another bot on this machine (token prompt + QR)
+qur connect --list                  # every bot, its chats, buttons on/off
+qur connect --bot @second_bot       # pair another phone with one bot (needed when there are several)
+qur connect --bot @second_bot --no-listen   # per-bot buttons (no --bot = all bots)
+qur connect --remove-chat 123456789 [--bot ID]   # all bots that have it, or just one
+qur connect --remove-bot --bot ID   # drop one bot; --all drops everything
+qur connect --export [--bot ID]     # all bots (qurtg2:) or one (qurtg1:)
+qur connect --import STRING         # adds the string's bots, send-only unless --listen
+```
+
+`--bot` takes the numeric bot id or the @username shown by `--list`. `--import`
+and `--from` merge into what the machine already has. Old single-bot
+`notify.json` files keep working and are rewritten in the new layout on the
+next change. Pairing a phone pauses button polling for all bots while it runs.

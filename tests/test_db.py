@@ -761,3 +761,47 @@ def test_init_db_migrates_pre_retry_database(tmp_path):
     assert job["origin"] is None
     assert job["parent_id"] is None
     c.close()
+
+
+# ---------------------------------------------------------------------------
+# cancel_queued
+# ---------------------------------------------------------------------------
+
+def test_cancel_queued_keeps_job_in_history_as_cancelled(conn):
+    a, b = _mk(conn, "a"), _mk(conn, "b")
+    db.cancel_queued(conn, b)
+    job = db.get_job(conn, b)
+    assert job["status"] == "cancelled"
+    assert job["note"] == "cancelled while queued"
+    assert job["finished_at"] is not None and job["position"] is None
+    assert [j["id"] for j in db.get_queue(conn)] == [a]
+    assert b in [j["id"] for j in db.get_backlog(conn)]
+
+
+def test_cancel_queued_reindexes_remaining_queue(conn):
+    a, b, c = _mk(conn, "a"), _mk(conn, "b"), _mk(conn, "c")
+    db.cancel_queued(conn, a)
+    assert [(j["id"], j["position"]) for j in db.get_queue(conn)] == [(b, 0), (c, 1)]
+
+
+def test_cancel_queued_only_touches_its_own_lane_and_channel(conn):
+    a = _mk(conn, "a", channel=1)
+    b = _mk(conn, "b", channel=2)
+    p1 = _mk(conn, "p1", channel=1, is_priority=True)
+    p2 = _mk(conn, "p2", channel=1, is_priority=True)
+    db.cancel_queued(conn, p1)
+    assert [(j["id"], j["position"]) for j in db.get_queue(conn, 1, is_priority=True)] == [(p2, 0)]
+    assert [j["id"] for j in db.get_queue(conn, 1)] == [a]
+    assert [j["id"] for j in db.get_queue(conn, 2)] == [b]
+
+
+def test_cancel_queued_rejects_missing_running_and_finished(conn):
+    a = _mk(conn, "a")
+    with pytest.raises(ValueError):
+        db.cancel_queued(conn, 999)
+    db.mark_running(conn, a, pid=1, pgid=1)
+    with pytest.raises(ValueError):
+        db.cancel_queued(conn, a)
+    db.mark_finished(conn, a, status="done", exit_code=0)
+    with pytest.raises(ValueError):
+        db.cancel_queued(conn, a)
