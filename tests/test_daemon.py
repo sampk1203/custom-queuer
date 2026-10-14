@@ -1601,7 +1601,7 @@ async def test_menu_status_list_picker_and_channel_list_with_requeue(daemon, mon
     assert [b["callback_data"] for b in msgs[1]["reply_markup"]["inline_keyboard"][0]] == ["lc:a3f9:1"]  # picker
     assert msgs[2]["reply_markup"]["is_persistent"]  # /start brings the keys back
     assert msgs[3]["text"].startswith("<b>List · channel 1</b>") and f"#{job_id}" in msgs[3]["text"]
-    assert msgs[3]["reply_markup"]["inline_keyboard"][0][0]["callback_data"] == f"rl:a3f9:{job_id}"
+    assert [b["callback_data"] for b in msgs[3]["reply_markup"]["inline_keyboard"][0]] == [f"lg:a3f9:{job_id}", f"rl:a3f9:{job_id}"]
     assert all(m["chat_id"] == 111 for m in msgs)  # stranger ignored
     listing = (await send(daemon.socket_path, "list"))["data"]
     assert [j["id"] for j in _ch(listing, 1)["backlog"]] == [job_id]  # queue untouched
@@ -1621,6 +1621,113 @@ async def test_requeue_from_list_drops_only_that_button(daemon, monkeypatch):
     assert [b["callback_data"] for r in kb for b in r] == ["rl:a3f9:999"]
     listing = (await send(daemon.socket_path, "list"))["data"]
     assert any(j["origin"] == "requeue" for j in _ch(listing, 1)["backlog"] + _ch(listing, 1)["queue"] + [_ch(listing, 1)["running"] or {}])
+
+
+async def _add(daemon, argv, channel=1) -> int:
+    return (await send(daemon.socket_path, "add", argv=argv, cwd=CWD, channel=channel))["data"]["id"]
+
+
+@pytest.mark.asyncio
+async def test_list_shows_log_and_cancel_buttons_for_running_and_queued(daemon, monkeypatch):
+    running = await _add(daemon, ["sh", "-c", "echo out-1; sleep 30"])
+    queued = await _add(daemon, ["sleep", "30"])
+    await wait_for_status(daemon.socket_path, running, {"running"})
+    bot = FakeBot([[_press(1, 1, action="lc")]])
+    monkeypatch.setattr(notify, "_api", bot.api)
+    _tg_cfg(daemon)
+    await wait_calls(bot, "sendMessage", 1)
+    rows = bot.of("sendMessage")[0]["reply_markup"]["inline_keyboard"]
+    assert [[b["callback_data"] for b in r] for r in rows] == [
+        [f"lg:a3f9:{running}", f"cn:a3f9:{running}"], [f"cn:a3f9:{queued}"]]
+
+
+@pytest.mark.asyncio
+async def test_logs_button_works_on_a_running_job(daemon, monkeypatch):
+    running = await _add(daemon, ["sh", "-c", "for i in 1 2 3 4 5 6 7 8 9 10 11 12; do echo row-$i; done; sleep 30"])
+    await wait_for_status(daemon.socket_path, running, {"running"})
+    for _ in range(100):  # wait until the output reached the log file
+        if "row-12" in (daemon.log_dir / f"{running}.log").read_text():
+            break
+        await asyncio.sleep(0.05)
+    bot = FakeBot([[_press(1, running, action="lg")]])
+    monkeypatch.setattr(notify, "_api", bot.api)
+    _tg_cfg(daemon)
+    await wait_calls(bot, "sendMessage", 1)
+    text = bot.of("sendMessage")[0]["text"]
+    assert "· running" in text and all(f"row-{i}" in text for i in range(3, 13))  # at least the last 10 lines
+
+
+@pytest.mark.asyncio
+async def test_logs_button_ignores_db_log_path(daemon, monkeypatch, tmp_path):
+    secret = tmp_path / "secret.txt"
+    secret.write_text("TOP-SECRET")
+    job_id = await _finished_job(daemon)
+    daemon.conn.execute("UPDATE jobs SET log_path = ? WHERE id = ?", (str(secret), job_id))
+    daemon.conn.commit()
+    bot = FakeBot([[_press(1, job_id, action="lg")]])
+    monkeypatch.setattr(notify, "_api", bot.api)
+    _tg_cfg(daemon)
+    await wait_calls(bot, "sendMessage", 1)
+    assert "TOP-SECRET" not in bot.of("sendMessage")[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_cancel_button_cancels_by_id_a_queued_job_not_the_running_one(daemon, monkeypatch):
+    running = await _add(daemon, ["sleep", "30"])
+    queued = await _add(daemon, ["sleep", "30"])
+    await wait_for_status(daemon.socket_path, running, {"running"})
+    press = _press(1, queued, action="cn")
+    press["callback_query"]["message"]["reply_markup"] = {"inline_keyboard": [[
+        {"text": "x", "callback_data": f"cn:a3f9:{queued}"}, {"text": "y", "callback_data": f"cn:a3f9:{running}"}]]}
+    bot = FakeBot([[press]])
+    monkeypatch.setattr(notify, "_api", bot.api)
+    _tg_cfg(daemon)
+    await wait_calls(bot, "editMessageReplyMarkup", 1)
+    assert bot.of("answerCallbackQuery")[0]["text"] == f"cancelled job {queued}"
+    kb = bot.of("editMessageReplyMarkup")[0]["reply_markup"]["inline_keyboard"]
+    assert [b["callback_data"] for r in kb for b in r] == [f"cn:a3f9:{running}"]
+    assert (await send(daemon.socket_path, "show", id=queued))["data"]["status"] == "cancelled"
+    assert (await send(daemon.socket_path, "show", id=running))["data"]["status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_cancel_button_kills_a_running_job(daemon, monkeypatch):
+    running = await _add(daemon, ["sleep", "30"])
+    await wait_for_status(daemon.socket_path, running, {"running"})
+    bot = FakeBot([[_press(1, running, action="cn")]])
+    monkeypatch.setattr(notify, "_api", bot.api)
+    _tg_cfg(daemon)
+    job = await wait_for_status(daemon.socket_path, running, {"cancelled"})
+    assert job["status"] == "cancelled"
+    await wait_calls(bot, "answerCallbackQuery", 1)
+    assert bot.of("answerCallbackQuery")[0]["text"] == f"cancelled job {running}"
+
+
+@pytest.mark.asyncio
+async def test_cancel_button_on_finished_or_missing_job_toasts_error(daemon, monkeypatch):
+    done = await _finished_job(daemon)
+    bot = FakeBot([[_press(1, done, action="cn"), _press(2, 4242, action="cn")]])
+    monkeypatch.setattr(notify, "_api", bot.api)
+    _tg_cfg(daemon)
+    await wait_calls(bot, "answerCallbackQuery", 2)
+    toasts = [c["text"] for c in bot.of("answerCallbackQuery")]
+    assert "already failed" in toasts[0] and "does not exist" in toasts[1]
+    assert not bot.of("editMessageReplyMarkup")
+
+
+@pytest.mark.asyncio
+async def test_cancel_and_other_buttons_refuse_strangers_and_other_machines(daemon, monkeypatch):
+    running = await _add(daemon, ["sleep", "30"])
+    await wait_for_status(daemon.socket_path, running, {"running"})
+    bot = FakeBot([[_press(1, running, action="cn", chat_id=999), _press(2, running, action="cn", qur_id="beef"),
+                    _press(3, running, action="lg", chat_id=999), _menu_msg(4, notify.MENU_LIST, chat_id=999)]])
+    monkeypatch.setattr(notify, "_api", bot.api)
+    _tg_cfg(daemon)
+    await wait_calls(bot, "answerCallbackQuery", 1)
+    await asyncio.sleep(0.3)
+    assert "another machine" in bot.of("answerCallbackQuery")[0]["text"]  # the stranger got nothing at all
+    assert len(bot.of("answerCallbackQuery")) == 1 and not bot.of("sendMessage")
+    assert (await send(daemon.socket_path, "show", id=running))["data"]["status"] == "running"
 
 
 # ---------------------------------------------------------------------------

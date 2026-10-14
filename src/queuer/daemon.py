@@ -413,8 +413,19 @@ class Daemon:
                 await reply(f"channel {job_id} has no jobs")
                 return
             await reply("")
-            markup = notify.list_markup(cfg, data["channels"][job_id]["backlog"])
+            markup = notify.list_markup(cfg, data["channels"][job_id])
             await asyncio.to_thread(notify.send, to_chat, notify.format_list(data, cfg, job_id), markup, "HTML")
+            return
+
+        if action == "cn":  # always by id: same as `qur cancel <id>`, never "whatever runs on the channel"
+            try:
+                await self._cmd_cancel({"id": job_id})
+            except ValueError as e:
+                await reply(str(e))
+                return
+            await reply(f"cancelled job {job_id}")  # the job's own "cancelled" message follows
+            spent = notify.without_button(msg.get("reply_markup"), cq["data"])
+            await asyncio.to_thread(notify.edit_markup, cfg, chat_id, msg["message_id"], spent)
             return
 
         if action in ("sh", "lg"):
@@ -427,7 +438,8 @@ class Daemon:
             if action == "sh":
                 await asyncio.to_thread(notify.send, to_chat, notify.format_details(job, cfg), None, "HTML")
             else:
-                tail = await asyncio.to_thread(notify.read_log_tail, job.get("log_path"))
+                # path from our own log dir + the integer id, not the DB's log_path column
+                tail = await asyncio.to_thread(notify.read_log_tail, self.log_dir / f"{job_id}.log")
                 await asyncio.to_thread(notify.send, to_chat, notify.format_log(job, tail, cfg), None, "HTML")
             return
 
@@ -514,6 +526,7 @@ class Daemon:
                 else:
                     f.write(chunk)
                     written += len(chunk)
+                f.flush()  # so a running job's log can be read (qur logs --tail, Telegram Logs)
 
     async def _kill_process_group(self, proc: asyncio.subprocess.Process, grace: float = DEFAULT_GRACE_SECS) -> None:
         """SIGTERM the job's whole process group, wait up to `grace`

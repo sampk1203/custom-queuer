@@ -61,12 +61,14 @@ EXPORT_PREFIX = "qurtg1:"  # one bot
 EXPORT_PREFIX_MULTI = "qurtg2:"  # several bots
 TOKEN_RE = re.compile(r"^\d+:[A-Za-z0-9_-]+$")
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,16}$")
-CALLBACK_ACTIONS = ("rq", "sh", "lg", "lc", "rl")  # requeue, details, log tail, list one channel (3rd field = channel), requeue from a list
+CALLBACK_ACTIONS = ("rq", "sh", "lg", "lc", "rl", "cn")  # requeue, details, log tail, list one channel (3rd field = channel), requeue from a list, cancel
 DETAIL_CMD_MAX_CHARS = 500
 CMD_MAX_CHARS = 120
 LIST_CMD_MAX_CHARS = 60
 TG_MAX_CHARS = 4096
-LOG_TAIL_BYTES = 3000  # raw log bytes read for the Logs button
+LOG_TAIL_LINES = 20  # lines the Logs button shows (fewer if they would not fit in one message)
+LOG_READ_BYTES = 16384  # how far back from the end of the log file to read
+LIST_MAX_QUEUE_BUTTONS = 20  # Telegram allows 100 buttons per message
 MENU_STATUS = "📊 Status"
 MENU_LIST = "📋 List"
 MENU_ACTIONS = {MENU_STATUS: "status", MENU_LIST: "list", "/status": "status", "/list": "list", "/menu": "menu"}
@@ -500,11 +502,18 @@ def list_picker_markup(cfg: dict[str, Any], channels: list[int]) -> dict[str, An
     return {"inline_keyboard": [btns[i:i + 4] for i in range(0, len(btns), 4)]}
 
 
-def list_markup(cfg: dict[str, Any], jobs: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """Requeue button per finished job in a channel list, 3 per row (None if
-    there are none)."""
-    btns = [_button(cfg, j["id"], "rl", f"🔁 #{j['id']}") for j in jobs]
-    return {"inline_keyboard": [btns[i:i + 3] for i in range(0, len(btns), 3)]} if btns else None
+def list_markup(cfg: dict[str, Any], chan: dict[str, Any]) -> dict[str, Any] | None:
+    """Buttons under a channel list, one row per job in the same order as the
+    text: running/frozen -> Logs + Cancel, queued -> Cancel, finished -> Logs
+    + Requeue (None if the channel has no jobs)."""
+    def btn(job: dict[str, Any], action: str, icon: str) -> dict[str, str]:
+        return _button(cfg, job["id"], action, f"{icon} #{job['id']}")
+
+    rows = [[btn(j, "lg", "📄"), btn(j, "cn", "❌")] for j in (chan.get("frozen"), chan.get("running")) if j]
+    queued = ((chan.get("priority_queue") or []) + chan["queue"])[:LIST_MAX_QUEUE_BUTTONS]
+    rows += [[btn(j, "cn", "❌")] for j in queued]
+    rows += [[btn(j, "lg", "📄"), btn(j, "rl", "🔁")] for j in chan["backlog"]]
+    return {"inline_keyboard": rows} if rows else None
 
 
 def without_button(markup: dict[str, Any] | None, data: str) -> dict[str, Any]:
@@ -775,23 +784,34 @@ def format_list(data: dict[str, Any], cfg: dict[str, Any], channel: int) -> str:
     return _fit(f"<b>List · channel {channel}</b> · {html.escape(_who(cfg))}", lines or ["(idle, nothing yet)"])
 
 
-def read_log_tail(log_path: str | None) -> str | None:
-    """Last LOG_TAIL_BYTES of a log file as text, None if it can't be read."""
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+_CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+
+
+def read_log_tail(log_path: Any, lines: int = LOG_TAIL_LINES) -> str | None:
+    """Last `lines` lines of a log file as clean text (colour codes and control
+    characters dropped, \\r treated as a newline), None if it can't be read."""
     if not log_path:
         return None
     try:
         with open(log_path, "rb") as f:
             f.seek(0, os.SEEK_END)
             size = f.tell()
-            f.seek(max(0, size - LOG_TAIL_BYTES))
-            return f.read().decode(errors="replace")
+            f.seek(max(0, size - LOG_READ_BYTES))
+            data = f.read()
     except OSError:
         return None
+    text = data.decode(errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+    text = _CTRL_RE.sub("", _ANSI_RE.sub("", text))
+    parts = text.rstrip("\n").split("\n")
+    if size > LOG_READ_BYTES:
+        parts = parts[1:]  # the first line is cut in the middle
+    return "\n".join(parts[-lines:])
 
 
 def format_log(job: dict[str, Any], tail: str | None, cfg: dict[str, Any]) -> str:
     """Log tail for one job as Telegram HTML (<pre>). Escaping can grow the
-    text, so the tail is trimmed from the front until the message fits."""
+    text, so whole lines are dropped from the front until the message fits."""
     head = f"📄 <b>Log · job #{job['id']}</b> · {html.escape(job['status'])}\n{html.escape(_who(cfg))}\n"
     if tail is None:
         return head + "(no log file)"
@@ -803,5 +823,5 @@ def format_log(job: dict[str, Any], tail: str | None, cfg: dict[str, Any]) -> st
         body = f"{cut}<pre>{html.escape(tail)}</pre>"
         if len(head) + len(body) <= TG_MAX_CHARS:
             return head + body
-        tail = tail[len(tail) // 10 + 1:]  # drop the oldest ~10% and retry
+        tail = tail.split("\n", 1)[1] if "\n" in tail else tail[len(tail) // 10 + 1:]
         cut = "… (earlier output cut)\n"

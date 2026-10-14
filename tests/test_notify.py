@@ -560,9 +560,18 @@ def test_new_buttons_and_menu():
     assert notify.parse_callback("lg:a3f9:7") == ("lg", "a3f9", 7)
     picker = notify.list_picker_markup(CFG, [1, 2, 3, 4, 5])["inline_keyboard"]
     assert [len(r) for r in picker] == [4, 1] and picker[0][1]["callback_data"] == "lc:a3f9:2"
-    lm = notify.list_markup(CFG, [{"id": i} for i in range(4)])
-    assert [len(r) for r in lm["inline_keyboard"]] == [3, 1] and notify.list_markup(CFG, []) is None
-    assert notify.without_button(lm, "rl:a3f9:1")["inline_keyboard"][0][1]["callback_data"] == "rl:a3f9:2"
+    assert notify.parse_callback("cn:a3f9:47") == ("cn", "a3f9", 47)
+    chan = {"frozen": {"id": 5}, "running": {"id": 6}, "priority_queue": [{"id": 7}], "queue": [{"id": 8}], "backlog": [{"id": 1}, {"id": 2}]}
+    rows = notify.list_markup(CFG, chan)["inline_keyboard"]
+    assert [[b["callback_data"] for b in r] for r in rows] == [
+        ["lg:a3f9:5", "cn:a3f9:5"], ["lg:a3f9:6", "cn:a3f9:6"], ["cn:a3f9:7"], ["cn:a3f9:8"],
+        ["lg:a3f9:1", "rl:a3f9:1"], ["lg:a3f9:2", "rl:a3f9:2"]]
+    assert notify.list_markup(CFG, {"queue": [], "backlog": []}) is None
+    many = {"queue": [{"id": i} for i in range(500)], "backlog": [{"id": 900 + i} for i in range(10)]}
+    n_buttons = sum(len(r) for r in notify.list_markup(CFG, many)["inline_keyboard"])
+    assert n_buttons == notify.LIST_MAX_QUEUE_BUTTONS + 20 <= 100  # Telegram's cap
+    assert notify.without_button(notify.list_markup(CFG, chan), "rl:a3f9:1")["inline_keyboard"][4] == [
+        {"text": "📄 #1", "callback_data": "lg:a3f9:1"}]
     assert notify.without_button({"inline_keyboard": [[{"text": "x", "callback_data": "a"}]]}, "a") == {"inline_keyboard": []}
     kb = notify.menu_markup()
     assert kb["is_persistent"] and [k["text"] for k in kb["keyboard"][0]] == [notify.MENU_STATUS, notify.MENU_LIST]
@@ -575,13 +584,27 @@ def test_format_log_escapes_and_fits(tmp_path):
     assert "<pre>a &lt;b&gt;</pre>" in notify.format_log(job, "a <b>\n", CFG)
     assert "(no log file)" in notify.format_log(job, None, CFG)
     assert "(log is empty)" in notify.format_log(job, "  \n", CFG)
-    big = notify.format_log(job, "<" * 3000, CFG)
+    big = notify.format_log(job, "\n".join("<" * 100 for _ in range(30)), CFG)  # escaping x4 would overflow
     assert len(big) <= notify.TG_MAX_CHARS and "earlier output cut" in big
+    assert "<script>" not in notify.format_log(job, "<script>alert(1)</script>", CFG)
+    assert notify.format_log({"id": 3, "status": "<b>"}, "x", CFG).count("<b>") == 1  # only our own tag
+    # one giant line still fits
+    assert len(notify.format_log(job, "<" * 9000, CFG)) <= notify.TG_MAX_CHARS
+
+
+def test_read_log_tail_lines_and_cleaning(tmp_path):
     log = tmp_path / "x.log"
-    log.write_bytes(b"x" * 5000 + b"END")
-    tail = notify.read_log_tail(str(log))
-    assert len(tail) == notify.LOG_TAIL_BYTES and tail.endswith("END")
-    assert notify.read_log_tail(str(tmp_path / "none")) is None
+    log.write_text("".join(f"line {i}\n" for i in range(100)))
+    tail = notify.read_log_tail(log).split("\n")
+    assert len(tail) == notify.LOG_TAIL_LINES >= 10 and tail[-1] == "line 99"
+    assert notify.read_log_tail(log, lines=3) == "line 97\nline 98\nline 99"
+    log.write_text("short\n")
+    assert notify.read_log_tail(log) == "short"
+    log.write_bytes(b"\x1b[31mred\x1b[0m\x00 bell\x07\rprogress 50%\rprogress 100%\n")
+    assert notify.read_log_tail(log) == "red bell\nprogress 50%\nprogress 100%"
+    log.write_bytes(b"x" * (notify.LOG_READ_BYTES + 10) + b"\nlast\n")  # cut-off first line is dropped
+    assert notify.read_log_tail(log) == "last"
+    assert notify.read_log_tail(tmp_path / "none") is None and notify.read_log_tail(None) is None
 
 
 def test_format_status_and_list():
