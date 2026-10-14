@@ -1601,7 +1601,8 @@ async def test_menu_status_list_picker_and_channel_list_with_requeue(daemon, mon
     assert [b["callback_data"] for b in msgs[1]["reply_markup"]["inline_keyboard"][0]] == ["lc:a3f9:1"]  # picker
     assert msgs[2]["reply_markup"]["is_persistent"]  # /start brings the keys back
     assert msgs[3]["text"].startswith("<b>List · channel 1</b>") and f"#{job_id}" in msgs[3]["text"]
-    assert [b["callback_data"] for b in msgs[3]["reply_markup"]["inline_keyboard"][0]] == [f"lg:a3f9:{job_id}", f"rl:a3f9:{job_id}"]
+    assert [b["callback_data"] for b in msgs[3]["reply_markup"]["inline_keyboard"][0]] == [
+        f"sh:a3f9:{job_id}", f"lg:a3f9:{job_id}", f"rl:a3f9:{job_id}"]
     assert all(m["chat_id"] == 111 for m in msgs)  # stranger ignored
     listing = (await send(daemon.socket_path, "list"))["data"]
     assert [j["id"] for j in _ch(listing, 1)["backlog"]] == [job_id]  # queue untouched
@@ -1638,7 +1639,22 @@ async def test_list_shows_log_and_cancel_buttons_for_running_and_queued(daemon, 
     await wait_calls(bot, "sendMessage", 1)
     rows = bot.of("sendMessage")[0]["reply_markup"]["inline_keyboard"]
     assert [[b["callback_data"] for b in r] for r in rows] == [
-        [f"lg:a3f9:{running}", f"cn:a3f9:{running}"], [f"cn:a3f9:{queued}"]]
+        [f"sh:a3f9:{running}", f"lg:a3f9:{running}", f"cn:a3f9:{running}"], [f"sh:a3f9:{queued}", f"cn:a3f9:{queued}"]]
+
+
+@pytest.mark.asyncio
+async def test_details_button_works_on_running_and_queued_jobs(daemon, monkeypatch):
+    running = await _add(daemon, ["sleep", "30"])
+    queued = await _add(daemon, ["sleep", "31"])
+    await wait_for_status(daemon.socket_path, running, {"running"})
+    bot = FakeBot([[_press(1, running, action="sh"), _press(2, queued, action="sh")]])
+    monkeypatch.setattr(notify, "_api", bot.api)
+    _tg_cfg(daemon)
+    await wait_calls(bot, "sendMessage", 2)
+    a, b = (m["text"] for m in bot.of("sendMessage"))
+    assert f"<b>Job #{running}</b> · running" in a and "<b>duration</b> " in a and "<b>duration</b> -" not in a
+    assert f"<b>Job #{queued}</b> · queued" in b and "<b>started</b> -" in b
+    assert (await send(daemon.socket_path, "show", id=running))["data"]["status"] == "running"  # read-only
 
 
 @pytest.mark.asyncio

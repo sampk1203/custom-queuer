@@ -62,9 +62,11 @@ EXPORT_PREFIX_MULTI = "qurtg2:"  # several bots
 TOKEN_RE = re.compile(r"^\d+:[A-Za-z0-9_-]+$")
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,16}$")
 CALLBACK_ACTIONS = ("rq", "sh", "lg", "lc", "rl", "cn")  # requeue, details, log tail, list one channel (3rd field = channel), requeue from a list, cancel
-DETAIL_CMD_MAX_CHARS = 500
-CMD_MAX_CHARS = 120
-LIST_CMD_MAX_CHARS = 60
+DETAIL_CMD_MAX_CHARS = 1200  # each command in Details (halved until the message fits)
+DETAIL_FIELD_MAX_CHARS = 500  # cwd, log path, note in Details
+CMD_MAX_CHARS = 1000  # command in the finished-job message
+LIST_CMD_MAX_CHARS = 300  # command per line in a channel list, at most (less when the list is long)
+LIST_CMD_MIN_CHARS = 40
 TG_MAX_CHARS = 4096
 LOG_TAIL_LINES = 20  # lines the Logs button shows (fewer if they would not fit in one message)
 LOG_READ_BYTES = 16384  # how far back from the end of the log file to read
@@ -504,15 +506,15 @@ def list_picker_markup(cfg: dict[str, Any], channels: list[int]) -> dict[str, An
 
 def list_markup(cfg: dict[str, Any], chan: dict[str, Any]) -> dict[str, Any] | None:
     """Buttons under a channel list, one row per job in the same order as the
-    text: running/frozen -> Logs + Cancel, queued -> Cancel, finished -> Logs
-    + Requeue (None if the channel has no jobs)."""
+    text, every job with Details: running/frozen -> Logs + Cancel, queued ->
+    Cancel, finished -> Logs + Requeue (None if the channel has no jobs)."""
     def btn(job: dict[str, Any], action: str, icon: str) -> dict[str, str]:
         return _button(cfg, job["id"], action, f"{icon} #{job['id']}")
 
-    rows = [[btn(j, "lg", "📄"), btn(j, "cn", "❌")] for j in (chan.get("frozen"), chan.get("running")) if j]
+    rows = [[btn(j, "sh", "ℹ️"), btn(j, "lg", "📄"), btn(j, "cn", "❌")] for j in (chan.get("frozen"), chan.get("running")) if j]
     queued = ((chan.get("priority_queue") or []) + chan["queue"])[:LIST_MAX_QUEUE_BUTTONS]
-    rows += [[btn(j, "cn", "❌")] for j in queued]
-    rows += [[btn(j, "lg", "📄"), btn(j, "rl", "🔁")] for j in chan["backlog"]]
+    rows += [[btn(j, "sh", "ℹ️"), btn(j, "cn", "❌")] for j in queued]
+    rows += [[btn(j, "sh", "ℹ️"), btn(j, "lg", "📄"), btn(j, "rl", "🔁")] for j in chan["backlog"]]
     return {"inline_keyboard": rows} if rows else None
 
 
@@ -608,11 +610,29 @@ def _reason(note: str | None) -> str | None:
     return None
 
 
+def _display_quote(word: str) -> str:
+    """One argv word quoted for display, same rule as cli.py's `_display_quote`
+    (copied: cli imports this module). Plain words stay bare; a word whose only
+    special character is an embedded `'` gets "double quotes" instead of
+    shlex's `'"'"'` soup; anything else falls back to shlex.quote."""
+    if not word:
+        return "''"
+    if shlex.quote(word) == word:
+        return word
+    if not any(c in word for c in '"$`\\\n'):
+        return f'"{word}"'
+    return shlex.quote(word)
+
+
+def _display_join(argv: list[str]) -> str:
+    return " ".join(_display_quote(w) for w in argv)
+
+
 def _command(job: dict[str, Any]) -> str | None:
     """The command as typed (raw, not the resolved absolute-path form),
     collapsed to one line and capped."""
     try:
-        text = " ".join(shlex.join(json.loads(job["raw_cmd"])).split())
+        text = " ".join(_display_join(json.loads(job["raw_cmd"])).split())
     except (KeyError, TypeError, ValueError):
         return None
     if len(text) > CMD_MAX_CHARS:
@@ -651,23 +671,34 @@ def _local(ts: str | None) -> str:
     return datetime.fromisoformat(ts).astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _cap(text: str) -> str:
-    return text if len(text) <= DETAIL_CMD_MAX_CHARS else text[: DETAIL_CMD_MAX_CHARS - 1] + "…"
+def _cap(text: str, limit: int = DETAIL_FIELD_MAX_CHARS) -> str:
+    return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
 def format_details(job: dict[str, Any], cfg: dict[str, Any]) -> str:
     """Everything `qur show` prints, as Telegram HTML (parse_mode="HTML"):
     bold labels, monospace commands/paths, all dynamic text escaped. Sent only
-    to paired chats, on request (Details button). Stays under Telegram's
-    4096-character limit: each command is capped, the rest is short."""
+    to paired chats, on request (Details button). Works for any job, running
+    or queued included. Commands are shown in full up to DETAIL_CMD_MAX_CHARS;
+    that cap is halved until the message fits Telegram's 4096 characters."""
+    cap = DETAIL_CMD_MAX_CHARS
+    while True:
+        text = _format_details(job, cfg, cap)
+        if len(text) <= TG_MAX_CHARS or cap <= 50:
+            return text
+        cap //= 2
+
+
+def _format_details(job: dict[str, Any], cfg: dict[str, Any], cmd_cap: int) -> str:
     esc = html.escape
+    field_cap = min(cmd_cap, DETAIL_FIELD_MAX_CHARS)
 
     def row(label: str, value: str, code: bool = False) -> str:
         return f"<b>{label}</b> " + (f"<code>{esc(value)}</code>" if code else esc(value))
 
     def cmd(key: str) -> str:
         try:
-            return _cap(" ".join(shlex.join(json.loads(job[key])).split()))
+            return _cap(" ".join(_display_join(json.loads(job[key])).split()), cmd_cap)
         except (KeyError, TypeError, ValueError):
             return "-"
 
@@ -690,7 +721,7 @@ def format_details(job: dict[str, Any], cfg: dict[str, Any]) -> str:
         row("channel", str(job["channel"])),
         row("raw command", cmd("raw_cmd"), code=True),
         row("resolved command", cmd("resolved_cmd"), code=True),
-        row("cwd", _cap(job.get("cwd") or "-"), code=True),
+        row("cwd", _cap(job.get("cwd") or "-", field_cap), code=True),
         row("enqueued", _local(job.get("enqueued_at"))),
         row("started", _local(job.get("started_at"))),
         row("finished", _local(job.get("finished_at"))),
@@ -702,9 +733,9 @@ def format_details(job: dict[str, Any], cfg: dict[str, Any]) -> str:
     if job.get("max_retries"):
         lines.append(row("auto-retries", f"{job['attempt']} of {job['max_retries']} used"))
     lines.append(row("pid", str(job["pid"]) if job.get("pid") else "-"))
-    lines.append(row("log", _cap(job.get("log_path") or "-"), code=True))
+    lines.append(row("log", _cap(job.get("log_path") or "-", field_cap), code=True))
     if job.get("note"):
-        lines.append(row("note", _cap(job["note"])))
+        lines.append(row("note", _cap(job["note"], field_cap)))
     return "\n".join(lines)
 
 
@@ -713,12 +744,12 @@ def format_details(job: dict[str, Any], cfg: dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _short_cmd(job: dict[str, Any]) -> str:
+def _short_cmd(job: dict[str, Any], limit: int = LIST_CMD_MAX_CHARS) -> str:
     try:
-        text = " ".join(shlex.join(json.loads(job["raw_cmd"])).split())
+        text = " ".join(_display_join(json.loads(job["raw_cmd"])).split())
     except (KeyError, TypeError, ValueError):
         return "-"
-    return text if len(text) <= LIST_CMD_MAX_CHARS else text[: LIST_CMD_MAX_CHARS - 1] + "…"
+    return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
 def _since(ts: str | None) -> str:
@@ -741,8 +772,8 @@ def _fit(header: str, lines: list[str]) -> str:
     return "\n".join(out)
 
 
-def _job_line(job: dict[str, Any], icon: str, extra: str = "") -> str:
-    return f"{icon} #{job['id']} <code>{html.escape(_short_cmd(job))}</code>{extra}"
+def _job_line(job: dict[str, Any], icon: str, extra: str = "", limit: int = LIST_CMD_MAX_CHARS) -> str:
+    return f"{icon} #{job['id']} <code>{html.escape(_short_cmd(job, limit))}</code>{extra}"
 
 
 def format_status(data: dict[str, Any], cfg: dict[str, Any]) -> str:
@@ -766,21 +797,23 @@ def format_status(data: dict[str, Any], cfg: dict[str, Any]) -> str:
 
 def format_list(data: dict[str, Any], cfg: dict[str, Any], channel: int) -> str:
     """`qur list` for ONE channel as Telegram HTML: running job, queue and the
-    recent finished jobs. Long output is cut at whole lines."""
+    recent finished jobs. Commands are shown in full (up to LIST_CMD_MAX_CHARS)
+    and shortened only as far as needed to keep every job in the message."""
     chan = data["channels"][channel]
-    lines: list[str] = []
-    if chan.get("paused"):
-        lines.append("⏸ paused")
+    entries: list[tuple[dict[str, Any], str, str]] = []
     if chan.get("frozen"):
-        lines.append(_job_line(chan["frozen"], "🧊", " frozen"))
+        entries.append((chan["frozen"], "🧊", " frozen"))
     if chan.get("running"):
-        lines.append(_job_line(chan["running"], "▶️", f" · {_since(chan['running'].get('started_at'))}"))
+        entries.append((chan["running"], "▶️", f" · {_since(chan['running'].get('started_at'))}"))
     for job in (chan.get("priority_queue") or []) + chan["queue"]:
-        lines.append(_job_line(job, "⏳", f" · queued {_since(job.get('enqueued_at'))}"))
+        entries.append((job, "⏳", f" · queued {_since(job.get('enqueued_at'))}"))
     for job in chan["backlog"]:
         dur = _duration(job)
         exit_s = f" · exit {job['exit_code']}" if job.get("exit_code") is not None else ""
-        lines.append(_job_line(job, _ICONS.get(job["status"], "•"), (f" · {dur}" if dur else "") + exit_s))
+        entries.append((job, _ICONS.get(job["status"], "•"), (f" · {dur}" if dur else "") + exit_s))
+    limit = max(LIST_CMD_MIN_CHARS, min(LIST_CMD_MAX_CHARS, (TG_MAX_CHARS - 300) // max(1, len(entries)) - 50))
+    lines = ["⏸ paused"] if chan.get("paused") else []
+    lines += [_job_line(job, icon, extra, limit) for job, icon, extra in entries]
     return _fit(f"<b>List · channel {channel}</b> · {html.escape(_who(cfg))}", lines or ["(idle, nothing yet)"])
 
 

@@ -295,8 +295,9 @@ def test_format_never_leaks_cwd_resolved_paths_or_raw_notes():
 
 def test_format_shows_raw_command_quoted_one_line_and_capped():
     t = notify.format_job(_job(raw_cmd=json.dumps(["echo", "a b", "x\ny"])), CFG)
-    assert "$ echo 'a b' 'x y'\n" in t
-    long = notify.format_job(_job(raw_cmd=json.dumps(["echo", "z" * 500])), CFG)
+    assert "$ echo \"a b\" 'x y'\n" in t
+    assert "z" * 500 in notify.format_job(_job(raw_cmd=json.dumps(["echo", "z" * 500])), CFG)  # not cut any more
+    long = notify.format_job(_job(raw_cmd=json.dumps(["echo", "z" * 2000])), CFG)
     cmd_line = long.splitlines()[1]
     assert cmd_line.endswith("…") and len(cmd_line) == 2 + notify.CMD_MAX_CHARS
 
@@ -564,14 +565,15 @@ def test_new_buttons_and_menu():
     chan = {"frozen": {"id": 5}, "running": {"id": 6}, "priority_queue": [{"id": 7}], "queue": [{"id": 8}], "backlog": [{"id": 1}, {"id": 2}]}
     rows = notify.list_markup(CFG, chan)["inline_keyboard"]
     assert [[b["callback_data"] for b in r] for r in rows] == [
-        ["lg:a3f9:5", "cn:a3f9:5"], ["lg:a3f9:6", "cn:a3f9:6"], ["cn:a3f9:7"], ["cn:a3f9:8"],
-        ["lg:a3f9:1", "rl:a3f9:1"], ["lg:a3f9:2", "rl:a3f9:2"]]
+        ["sh:a3f9:5", "lg:a3f9:5", "cn:a3f9:5"], ["sh:a3f9:6", "lg:a3f9:6", "cn:a3f9:6"],
+        ["sh:a3f9:7", "cn:a3f9:7"], ["sh:a3f9:8", "cn:a3f9:8"],
+        ["sh:a3f9:1", "lg:a3f9:1", "rl:a3f9:1"], ["sh:a3f9:2", "lg:a3f9:2", "rl:a3f9:2"]]
     assert notify.list_markup(CFG, {"queue": [], "backlog": []}) is None
     many = {"queue": [{"id": i} for i in range(500)], "backlog": [{"id": 900 + i} for i in range(10)]}
     n_buttons = sum(len(r) for r in notify.list_markup(CFG, many)["inline_keyboard"])
-    assert n_buttons == notify.LIST_MAX_QUEUE_BUTTONS + 20 <= 100  # Telegram's cap
+    assert n_buttons == notify.LIST_MAX_QUEUE_BUTTONS * 2 + 10 * 3 <= 100  # Telegram's cap
     assert notify.without_button(notify.list_markup(CFG, chan), "rl:a3f9:1")["inline_keyboard"][4] == [
-        {"text": "📄 #1", "callback_data": "lg:a3f9:1"}]
+        {"text": "ℹ️ #1", "callback_data": "sh:a3f9:1"}, {"text": "📄 #1", "callback_data": "lg:a3f9:1"}]
     assert notify.without_button({"inline_keyboard": [[{"text": "x", "callback_data": "a"}]]}, "a") == {"inline_keyboard": []}
     kb = notify.menu_markup()
     assert kb["is_persistent"] and [k["text"] for k in kb["keyboard"][0]] == [notify.MENU_STATUS, notify.MENU_LIST]
@@ -615,3 +617,43 @@ def test_format_status_and_list():
     assert "paused" in st and "&lt;hi&gt;" in st and "#1" in st
     ls = notify.format_list(data, CFG, 1)
     assert len(ls) <= notify.TG_MAX_CHARS and "more lines" in ls and "channel 1" in ls
+
+
+def _list_job(i, cmd):
+    return {"id": i, "raw_cmd": json.dumps(cmd), "status": "done", "exit_code": 0, "started_at": None, "finished_at": None,
+            "enqueued_at": "2026-01-01T00:00:00+00:00"}
+
+
+def test_list_shows_long_commands_in_full_and_shortens_only_when_crowded():
+    word = "w" * 250
+    few = {"channels": {1: {"queue": [], "backlog": [_list_job(i, ["run", word]) for i in range(5)]}}}
+    assert notify.format_list(few, CFG, 1).count(word) == 5  # all five in full
+    many = {"channels": {1: {"queue": [], "backlog": [_list_job(i, ["run", word]) for i in range(30)]}}}
+    text = notify.format_list(many, CFG, 1)
+    assert len(text) <= notify.TG_MAX_CHARS and "…" in text and "more lines" not in text  # shortened, all 30 kept
+    huge = {"channels": {1: {"queue": [], "backlog": [_list_job(1, ["run", "q" * 5000])]}}}
+    assert len(notify.format_list(huge, CFG, 1)) < 600  # one job: capped at LIST_CMD_MAX_CHARS
+
+
+def test_details_shows_a_1000_char_command_in_full_and_still_fits():
+    job = _job(raw_cmd=json.dumps(["echo", "a" * 1000]), resolved_cmd=json.dumps(["/bin/echo", "b" * 1000]))
+    t = notify.format_details(job, CFG)
+    assert "a" * 1000 in t and "b" * 1000 in t and len(t) <= notify.TG_MAX_CHARS
+    nasty = _job(raw_cmd=json.dumps(["&" * 3000]), resolved_cmd=json.dumps(["<" * 3000]), cwd="&" * 900, log_path=">" * 900, note="&" * 900)
+    assert len(notify.format_details(nasty, CFG)) <= notify.TG_MAX_CHARS  # escaping grows text; the cap shrinks to fit
+
+
+def test_commands_have_no_quote_soup_and_match_the_cli_display():
+    from queuer import cli
+
+    argvs = [
+        ["python", "-c", "print('a'); print('b')"],
+        ["bash", "-c", "g16 < in.gjf > out.log"],
+        ["echo", "it's", "$HOME", "", "plain", 'say "hi"'],
+    ]
+    for argv in argvs:
+        assert notify._display_join(argv) == cli._display_join(argv)
+        job = _job(raw_cmd=json.dumps(argv), resolved_cmd=json.dumps(argv))
+        for text in (notify.format_job(job, CFG), notify.format_details(job, CFG), notify._short_cmd(job)):
+            assert "'\"'\"'" not in text and "&#x27;\"&#x27;" not in text
+    assert notify._display_join(argvs[0]) == "python -c \"print('a'); print('b')\""
