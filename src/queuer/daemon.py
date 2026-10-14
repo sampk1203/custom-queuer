@@ -385,9 +385,13 @@ class Daemon:
             await asyncio.sleep(LISTEN_GAP_SECS)  # never hot-loop on instant empty replies
 
     async def _handle_update(self, cfg: dict[str, Any], update: dict[str, Any]) -> None:
-        """A Requeue or Details button press that arrived on the bot `cfg`
-        (its flat view). Only presses from a chat paired with that bot count,
-        and replies go out through that same bot."""
+        """A button press that arrived on the bot `cfg` (its flat view): an
+        inline Requeue/Details/Logs button, or a Status/List menu key. Only
+        presses from a chat paired with that bot count, and replies go out
+        through that same bot."""
+        if update.get("message"):
+            await self._handle_menu(cfg, update["message"])
+            return
         cq = update.get("callback_query")
         if not cq:
             return
@@ -403,14 +407,28 @@ class Daemon:
             return
         to_chat = {**cfg, "chat_ids": [chat_id]}
 
-        if action == "sh":
+        if action == "lc":  # job_id slot carries the channel here
+            data = await self._cmd_list({})
+            if job_id not in data["channels"]:
+                await reply(f"channel {job_id} has no jobs")
+                return
+            await reply("")
+            markup = notify.list_markup(cfg, data["channels"][job_id]["backlog"])
+            await asyncio.to_thread(notify.send, to_chat, notify.format_list(data, cfg, job_id), markup, "HTML")
+            return
+
+        if action in ("sh", "lg"):
             assert self.conn is not None
             job = db.get_job(self.conn, job_id)
             if job is None:
                 await reply(f"job {job_id} does not exist")
                 return
             await reply("")
-            await asyncio.to_thread(notify.send, to_chat, notify.format_details(job, cfg), None, "HTML")
+            if action == "sh":
+                await asyncio.to_thread(notify.send, to_chat, notify.format_details(job, cfg), None, "HTML")
+            else:
+                tail = await asyncio.to_thread(notify.read_log_tail, job.get("log_path"))
+                await asyncio.to_thread(notify.send, to_chat, notify.format_log(job, tail, cfg), None, "HTML")
             return
 
         try:
@@ -419,10 +437,37 @@ class Daemon:
             await reply(str(e))
             return
         await reply(f"requeued as job {new_id}")
-        # Requeue is spent; Details stays
-        await asyncio.to_thread(notify.edit_markup, cfg, chat_id, msg["message_id"], notify.details_markup(cfg, job_id))
+        if action == "rl":  # from a list: drop only this job's button
+            spent = notify.without_button(msg.get("reply_markup"), cq["data"])
+        else:  # from a finished-job message: Details and Logs stay
+            spent = notify.details_markup(cfg, job_id)
+        await asyncio.to_thread(notify.edit_markup, cfg, chat_id, msg["message_id"], spent)
         text = f"🔁 job {job_id} requeued as job {new_id}\n{notify._who(cfg)}"
         await asyncio.to_thread(notify.send, to_chat, text)
+
+    async def _handle_menu(self, cfg: dict[str, Any], msg: dict[str, Any]) -> None:
+        """Persistent Status / List keys (or /status, /list; /menu and /start
+        bring the keys back). Read-only: never touches the queue."""
+        chat = msg.get("chat") or {}
+        if chat.get("id") not in cfg["chat_ids"]:
+            return
+        text = (msg.get("text") or "").strip()
+        action = "menu" if text.startswith("/start") else notify.parse_menu(text)
+        if action is None:
+            return
+        to_chat = {**cfg, "chat_ids": [chat["id"]]}
+        if action == "menu":
+            await asyncio.to_thread(notify.send, to_chat, notify.hello_text(cfg), notify.menu_markup())
+            return
+        if action == "status":
+            data = await self._cmd_status({})
+            await asyncio.to_thread(notify.send, to_chat, notify.format_status(data, cfg), None, "HTML")
+            return
+        data = await self._cmd_list({})
+        if not data["channels"]:
+            await asyncio.to_thread(notify.send, to_chat, "nothing has ever been queued")
+            return
+        await asyncio.to_thread(notify.send, to_chat, "📋 List: pick a channel", notify.list_picker_markup(cfg, sorted(data["channels"])))
 
     def _maybe_auto_retry(self, job_id: int) -> bool:
         """If a just-finished job failed and still has retries left,

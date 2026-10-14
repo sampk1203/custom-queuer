@@ -380,7 +380,7 @@ def test_format_details_handles_unstarted_job_and_stays_under_telegram_limit():
     assert len(t) < 4096
 
 
-def test_get_updates_asks_only_for_callbacks_and_handles_none(monkeypatch):
+def test_get_updates_asks_for_callbacks_and_messages_and_handles_none(monkeypatch):
     seen = []
 
     def fake(token, method, params=None, timeout=0):
@@ -389,7 +389,7 @@ def test_get_updates_asks_only_for_callbacks_and_handles_none(monkeypatch):
     monkeypatch.setattr(notify, "_api", fake)
     assert notify.get_updates(CFG, 7) == []
     assert seen[0][0] == "getUpdates"
-    assert seen[0][1]["allowed_updates"] == ["callback_query"] and seen[0][1]["offset"] == 7
+    assert seen[0][1]["allowed_updates"] == ["callback_query", "message"] and seen[0][1]["offset"] == 7
 
 
 def test_pairing_lock_marks_and_clears(tmp_path):
@@ -551,3 +551,44 @@ def test_parse_export_string_refuses_multi_but_parse_export_bots_rejects_garbage
                 enc({"b": [{"t": TOKEN, "c": [1]}, {"t": TOKEN, "c": [2]}]}), enc({"x": 1}), "qurtg2:!!!"):
         with pytest.raises(ValueError):
             notify.parse_export_bots(bad)
+
+
+def test_new_buttons_and_menu():
+    rows = notify.job_markup(CFG, 42)["inline_keyboard"]
+    assert [b["callback_data"] for r in rows for b in r] == ["rq:a3f9:42", "sh:a3f9:42", "lg:a3f9:42"]
+    assert [b["callback_data"] for b in notify.details_markup(CFG, 5)["inline_keyboard"][0]] == ["sh:a3f9:5", "lg:a3f9:5"]
+    assert notify.parse_callback("lg:a3f9:7") == ("lg", "a3f9", 7)
+    picker = notify.list_picker_markup(CFG, [1, 2, 3, 4, 5])["inline_keyboard"]
+    assert [len(r) for r in picker] == [4, 1] and picker[0][1]["callback_data"] == "lc:a3f9:2"
+    lm = notify.list_markup(CFG, [{"id": i} for i in range(4)])
+    assert [len(r) for r in lm["inline_keyboard"]] == [3, 1] and notify.list_markup(CFG, []) is None
+    assert notify.without_button(lm, "rl:a3f9:1")["inline_keyboard"][0][1]["callback_data"] == "rl:a3f9:2"
+    assert notify.without_button({"inline_keyboard": [[{"text": "x", "callback_data": "a"}]]}, "a") == {"inline_keyboard": []}
+    kb = notify.menu_markup()
+    assert kb["is_persistent"] and [k["text"] for k in kb["keyboard"][0]] == [notify.MENU_STATUS, notify.MENU_LIST]
+    assert notify.parse_menu(notify.MENU_LIST) == "list" and notify.parse_menu("/status") == "status"
+    assert notify.parse_menu("hello") is None and notify.parse_menu(None) is None
+
+
+def test_format_log_escapes_and_fits(tmp_path):
+    job = {"id": 3, "status": "failed"}
+    assert "<pre>a &lt;b&gt;</pre>" in notify.format_log(job, "a <b>\n", CFG)
+    assert "(no log file)" in notify.format_log(job, None, CFG)
+    assert "(log is empty)" in notify.format_log(job, "  \n", CFG)
+    big = notify.format_log(job, "<" * 3000, CFG)
+    assert len(big) <= notify.TG_MAX_CHARS and "earlier output cut" in big
+    log = tmp_path / "x.log"
+    log.write_bytes(b"x" * 5000 + b"END")
+    tail = notify.read_log_tail(str(log))
+    assert len(tail) == notify.LOG_TAIL_BYTES and tail.endswith("END")
+    assert notify.read_log_tail(str(tmp_path / "none")) is None
+
+
+def test_format_status_and_list():
+    job = {"id": 1, "raw_cmd": json.dumps(["echo", "<hi>"]), "started_at": "2026-01-01T00:00:00+00:00",
+           "enqueued_at": "2026-01-01T00:00:00+00:00", "status": "done", "exit_code": 0, "finished_at": "2026-01-01T00:01:00+00:00"}
+    data = {"channels": {1: {"running": job, "frozen": None, "paused": True, "queue": [job], "priority_queue": [], "backlog": [job] * 500}}}
+    st = notify.format_status(data, CFG)
+    assert "paused" in st and "&lt;hi&gt;" in st and "#1" in st
+    ls = notify.format_list(data, CFG, 1)
+    assert len(ls) <= notify.TG_MAX_CHARS and "more lines" in ls and "channel 1" in ls

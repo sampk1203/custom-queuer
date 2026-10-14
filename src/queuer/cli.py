@@ -772,7 +772,8 @@ def _fail(msg: str) -> None:
 
 def _warn_hello(bot_cfg: dict[str, Any]) -> None:
     """Test message through one bot (flat view)."""
-    errors = notify.send(bot_cfg, notify.hello_text(bot_cfg))
+    menu = notify.menu_markup() if notify.listening(bot_cfg) else None  # Status/List keys only where presses are handled
+    errors = notify.send(bot_cfg, notify.hello_text(bot_cfg), menu)
     for err in errors:
         typer.echo(f"Warning: could not send the test message ({err})", err=True)
 

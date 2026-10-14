@@ -1478,7 +1478,7 @@ async def test_button_press_requeues_job_and_confirms(daemon, monkeypatch):
     assert bot.of("answerCallbackQuery")[0]["text"] == f"requeued as job {new}"
     # Requeue is spent, Details stays
     kb = bot.of("editMessageReplyMarkup")[0]["reply_markup"]["inline_keyboard"]
-    assert [b["callback_data"] for b in kb[0]] == [f"sh:a3f9:{job_id}"]
+    assert [b["callback_data"] for b in kb[0]] == [f"sh:a3f9:{job_id}", f"lg:a3f9:{job_id}"]
     assert bot.of("editMessageReplyMarkup")[0]["message_id"] == 9
     assert f"job {job_id} requeued as job {new}" in bot.of("sendMessage")[0]["text"]
 
@@ -1564,6 +1564,63 @@ async def test_details_button_for_missing_job_toasts_error(daemon, monkeypatch):
     _tg_cfg(daemon)
     await wait_calls(bot, "answerCallbackQuery", 1)
     assert "does not exist" in bot.of("answerCallbackQuery")[0]["text"] and not bot.of("sendMessage")
+
+
+def _menu_msg(update_id, text, chat_id=111):
+    return {"update_id": update_id, "message": {"message_id": 5, "chat": {"id": chat_id, "type": "private"}, "text": text}}
+
+
+@pytest.mark.asyncio
+@pytest.mark.asyncio
+def _menu_msg(update_id, text, chat_id=111):
+    return {"update_id": update_id, "message": {"message_id": 5, "chat": {"id": chat_id, "type": "private"}, "text": text}}
+
+
+@pytest.mark.asyncio
+async def test_logs_button_sends_log_tail_to_pressing_chat(daemon, monkeypatch):
+    job_id = (await send(daemon.socket_path, "add", argv=["sh", "-c", "echo hello-log; exit 1"], cwd=CWD))["data"]["id"]
+    await wait_for_status(daemon.socket_path, job_id, {"failed"})
+    bot = FakeBot([[_press(1, job_id, action="lg")]])
+    monkeypatch.setattr(notify, "_api", bot.api)
+    _tg_cfg(daemon, chat_ids=[111, 222])
+    await wait_calls(bot, "sendMessage", 1)
+    (m,) = bot.of("sendMessage")
+    assert m["chat_id"] == 111 and m["parse_mode"] == "HTML" and "<pre>hello-log</pre>" in m["text"]
+
+
+@pytest.mark.asyncio
+async def test_menu_status_list_picker_and_channel_list_with_requeue(daemon, monkeypatch):
+    job_id = await _finished_job(daemon)
+    bot = FakeBot([[_menu_msg(1, notify.MENU_STATUS), _menu_msg(2, notify.MENU_LIST), _menu_msg(3, "/list", chat_id=999),
+                    _menu_msg(4, "random chatter"), _menu_msg(5, "/start"), _press(6, 1, action="lc")]])
+    monkeypatch.setattr(notify, "_api", bot.api)
+    _tg_cfg(daemon)
+    await wait_calls(bot, "sendMessage", 4)
+    msgs = bot.of("sendMessage")
+    assert msgs[0]["text"].startswith("<b>Status</b>")
+    assert [b["callback_data"] for b in msgs[1]["reply_markup"]["inline_keyboard"][0]] == ["lc:a3f9:1"]  # picker
+    assert msgs[2]["reply_markup"]["is_persistent"]  # /start brings the keys back
+    assert msgs[3]["text"].startswith("<b>List · channel 1</b>") and f"#{job_id}" in msgs[3]["text"]
+    assert msgs[3]["reply_markup"]["inline_keyboard"][0][0]["callback_data"] == f"rl:a3f9:{job_id}"
+    assert all(m["chat_id"] == 111 for m in msgs)  # stranger ignored
+    listing = (await send(daemon.socket_path, "list"))["data"]
+    assert [j["id"] for j in _ch(listing, 1)["backlog"]] == [job_id]  # queue untouched
+
+
+@pytest.mark.asyncio
+async def test_requeue_from_list_drops_only_that_button(daemon, monkeypatch):
+    job_id = await _finished_job(daemon)
+    press = _press(1, job_id, action="rl")
+    press["callback_query"]["message"]["reply_markup"] = {"inline_keyboard": [[
+        {"text": "a", "callback_data": f"rl:a3f9:{job_id}"}, {"text": "b", "callback_data": "rl:a3f9:999"}]]}
+    bot = FakeBot([[press]])
+    monkeypatch.setattr(notify, "_api", bot.api)
+    _tg_cfg(daemon)
+    await wait_calls(bot, "editMessageReplyMarkup", 1)
+    kb = bot.of("editMessageReplyMarkup")[0]["reply_markup"]["inline_keyboard"]
+    assert [b["callback_data"] for r in kb for b in r] == ["rl:a3f9:999"]
+    listing = (await send(daemon.socket_path, "list"))["data"]
+    assert any(j["origin"] == "requeue" for j in _ch(listing, 1)["backlog"] + _ch(listing, 1)["queue"] + [_ch(listing, 1)["running"] or {}])
 
 
 # ---------------------------------------------------------------------------

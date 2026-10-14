@@ -61,9 +61,15 @@ EXPORT_PREFIX = "qurtg1:"  # one bot
 EXPORT_PREFIX_MULTI = "qurtg2:"  # several bots
 TOKEN_RE = re.compile(r"^\d+:[A-Za-z0-9_-]+$")
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,16}$")
-CALLBACK_ACTIONS = ("rq", "sh")  # requeue, show details
+CALLBACK_ACTIONS = ("rq", "sh", "lg", "lc", "rl")  # requeue, details, log tail, list one channel (3rd field = channel), requeue from a list
 DETAIL_CMD_MAX_CHARS = 500
 CMD_MAX_CHARS = 120
+LIST_CMD_MAX_CHARS = 60
+TG_MAX_CHARS = 4096
+LOG_TAIL_BYTES = 3000  # raw log bytes read for the Logs button
+MENU_STATUS = "📊 Status"
+MENU_LIST = "📋 List"
+MENU_ACTIONS = {MENU_STATUS: "status", MENU_LIST: "list", "/status": "status", "/list": "list", "/menu": "menu"}
 
 
 class NotifyError(Exception):
@@ -476,12 +482,47 @@ def _button(cfg: dict[str, Any], job_id: int, action: str, text: str) -> dict[st
 
 
 def details_markup(cfg: dict[str, Any], job_id: int) -> dict[str, Any]:
-    return {"inline_keyboard": [[_button(cfg, job_id, "sh", "ℹ️ Details")]]}
+    """What stays under a message once Requeue is spent: Details and Logs."""
+    return {"inline_keyboard": [[_button(cfg, job_id, "sh", "ℹ️ Details"), _button(cfg, job_id, "lg", "📄 Logs")]]}
 
 
 def job_markup(cfg: dict[str, Any], job_id: int) -> dict[str, Any]:
-    """Buttons under a finished-job message: Requeue and Details."""
-    return {"inline_keyboard": [[_button(cfg, job_id, "rq", "🔁 Requeue"), _button(cfg, job_id, "sh", "ℹ️ Details")]]}
+    """Buttons under a finished-job message: Requeue, Details, Logs."""
+    return {"inline_keyboard": [
+        [_button(cfg, job_id, "rq", "🔁 Requeue"), _button(cfg, job_id, "sh", "ℹ️ Details")],
+        [_button(cfg, job_id, "lg", "📄 Logs")],
+    ]}
+
+
+def list_picker_markup(cfg: dict[str, Any], channels: list[int]) -> dict[str, Any]:
+    """One button per existing channel, 4 per row; a press shows that channel's list."""
+    btns = [{"text": f"ch {c}", "callback_data": f"lc:{cfg['qur_id']}:{c}"} for c in channels]
+    return {"inline_keyboard": [btns[i:i + 4] for i in range(0, len(btns), 4)]}
+
+
+def list_markup(cfg: dict[str, Any], jobs: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Requeue button per finished job in a channel list, 3 per row (None if
+    there are none)."""
+    btns = [_button(cfg, j["id"], "rl", f"🔁 #{j['id']}") for j in jobs]
+    return {"inline_keyboard": [btns[i:i + 3] for i in range(0, len(btns), 3)]} if btns else None
+
+
+def without_button(markup: dict[str, Any] | None, data: str) -> dict[str, Any]:
+    """`markup` minus the button whose callback_data is `data` (empty rows dropped)."""
+    rows = [[b for b in row if b.get("callback_data") != data] for row in (markup or {}).get("inline_keyboard", [])]
+    return {"inline_keyboard": [r for r in rows if r]}
+
+
+def menu_markup() -> dict[str, Any]:
+    """Persistent keyboard at the bottom of the chat (not tied to a job).
+    Telegram keeps it until another reply keyboard replaces it; a press is
+    sent as a plain message with the key's text."""
+    return {"keyboard": [[{"text": MENU_STATUS}, {"text": MENU_LIST}]], "resize_keyboard": True, "is_persistent": True}
+
+
+def parse_menu(text: Any) -> str | None:
+    """"status", "list" or "menu" for a menu key / slash command, else None."""
+    return MENU_ACTIONS.get(text.strip()) if isinstance(text, str) else None
 
 
 def parse_callback(data: Any) -> tuple[str, str, int] | None:
@@ -495,9 +536,9 @@ def parse_callback(data: Any) -> tuple[str, str, int] | None:
 
 
 def get_updates(cfg: dict[str, Any], offset: int | None) -> list[dict[str, Any]]:
-    """One long-poll for button presses. Raises NotifyError (409 = another
-    process is polling this bot)."""
-    params: dict[str, Any] = {"timeout": POLL_SECS, "allowed_updates": ["callback_query"]}
+    """One long-poll for button presses (inline buttons and menu keys).
+    Raises NotifyError (409 = another process is polling this bot)."""
+    params: dict[str, Any] = {"timeout": POLL_SECS, "allowed_updates": ["callback_query", "message"]}
     if offset is not None:
         params["offset"] = offset
     return _api(cfg["token"], "getUpdates", params, timeout=POLL_SECS + 10) or []
@@ -656,3 +697,111 @@ def format_details(job: dict[str, Any], cfg: dict[str, Any]) -> str:
     if job.get("note"):
         lines.append(row("note", _cap(job["note"])))
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# status / list / logs messages (Telegram HTML)
+# ---------------------------------------------------------------------------
+
+
+def _short_cmd(job: dict[str, Any]) -> str:
+    try:
+        text = " ".join(shlex.join(json.loads(job["raw_cmd"])).split())
+    except (KeyError, TypeError, ValueError):
+        return "-"
+    return text if len(text) <= LIST_CMD_MAX_CHARS else text[: LIST_CMD_MAX_CHARS - 1] + "…"
+
+
+def _since(ts: str | None) -> str:
+    if not ts:
+        return "-"
+    then = datetime.fromisoformat(ts)
+    return _fmt_secs(max(0.0, (datetime.now(then.tzinfo) - then).total_seconds()))
+
+
+def _fit(header: str, lines: list[str]) -> str:
+    """Join `header` + whole lines up to Telegram's limit; never cuts inside
+    an HTML tag."""
+    out, size = [header], len(header)
+    for i, line in enumerate(lines):
+        if size + len(line) + 1 > TG_MAX_CHARS - 40:
+            out.append(f"… ({len(lines) - i} more lines)")
+            break
+        out.append(line)
+        size += len(line) + 1
+    return "\n".join(out)
+
+
+def _job_line(job: dict[str, Any], icon: str, extra: str = "") -> str:
+    return f"{icon} #{job['id']} <code>{html.escape(_short_cmd(job))}</code>{extra}"
+
+
+def format_status(data: dict[str, Any], cfg: dict[str, Any]) -> str:
+    """`qur status` as Telegram HTML: running job per channel, paused and
+    frozen flags."""
+    lines: list[str] = []
+    for channel in sorted(data["channels"], key=int):
+        chan = data["channels"][channel]
+        flags = " · paused" if chan.get("paused") else ""
+        lines.append(f"<b>channel {channel}</b>{flags}")
+        frozen, running = chan.get("frozen"), chan.get("running")
+        if frozen:
+            lines.append(_job_line(frozen, "🧊", " frozen (--now)"))
+        if running:
+            pri = " (priority)" if running.get("is_priority") else ""
+            lines.append(_job_line(running, "▶️", f"{pri} · running {_since(running.get('started_at'))}"))
+        elif not frozen:
+            lines.append("💤 idle")
+    return _fit(f"<b>Status</b> · {html.escape(_who(cfg))}", lines if lines else ["(nothing has ever been queued)"])
+
+
+def format_list(data: dict[str, Any], cfg: dict[str, Any], channel: int) -> str:
+    """`qur list` for ONE channel as Telegram HTML: running job, queue and the
+    recent finished jobs. Long output is cut at whole lines."""
+    chan = data["channels"][channel]
+    lines: list[str] = []
+    if chan.get("paused"):
+        lines.append("⏸ paused")
+    if chan.get("frozen"):
+        lines.append(_job_line(chan["frozen"], "🧊", " frozen"))
+    if chan.get("running"):
+        lines.append(_job_line(chan["running"], "▶️", f" · {_since(chan['running'].get('started_at'))}"))
+    for job in (chan.get("priority_queue") or []) + chan["queue"]:
+        lines.append(_job_line(job, "⏳", f" · queued {_since(job.get('enqueued_at'))}"))
+    for job in chan["backlog"]:
+        dur = _duration(job)
+        exit_s = f" · exit {job['exit_code']}" if job.get("exit_code") is not None else ""
+        lines.append(_job_line(job, _ICONS.get(job["status"], "•"), (f" · {dur}" if dur else "") + exit_s))
+    return _fit(f"<b>List · channel {channel}</b> · {html.escape(_who(cfg))}", lines or ["(idle, nothing yet)"])
+
+
+def read_log_tail(log_path: str | None) -> str | None:
+    """Last LOG_TAIL_BYTES of a log file as text, None if it can't be read."""
+    if not log_path:
+        return None
+    try:
+        with open(log_path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - LOG_TAIL_BYTES))
+            return f.read().decode(errors="replace")
+    except OSError:
+        return None
+
+
+def format_log(job: dict[str, Any], tail: str | None, cfg: dict[str, Any]) -> str:
+    """Log tail for one job as Telegram HTML (<pre>). Escaping can grow the
+    text, so the tail is trimmed from the front until the message fits."""
+    head = f"📄 <b>Log · job #{job['id']}</b> · {html.escape(job['status'])}\n{html.escape(_who(cfg))}\n"
+    if tail is None:
+        return head + "(no log file)"
+    tail = tail.rstrip()
+    if not tail:
+        return head + "(log is empty)"
+    cut = ""
+    while True:
+        body = f"{cut}<pre>{html.escape(tail)}</pre>"
+        if len(head) + len(body) <= TG_MAX_CHARS:
+            return head + body
+        tail = tail[len(tail) // 10 + 1:]  # drop the oldest ~10% and retry
+        cut = "… (earlier output cut)\n"
