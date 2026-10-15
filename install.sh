@@ -41,9 +41,9 @@ if [ -z "$ACTION" ]; then
 fi
 
 if [ "$ACTION" = "uninstall" ]; then
-    STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/queuer"
+    STATE_DIR="$HOME/.local/state/queuer"  # where the daemon really keeps it (it ignores XDG_STATE_HOME)
     CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/queuer"
-    SOCKET="${XDG_RUNTIME_DIR:-/tmp}/queuer.sock"
+    SOCKET="${XDG_RUNTIME_DIR:-/tmp/queuer-$(id -u)}/queuer.sock"
     ZSH_COMP=("$HOME/.zfunc/_qur" "$HOME/.zfunc/_queuer")
     FISH_COMP=("$HOME/.config/fish/completions/qur.fish" "$HOME/.config/fish/completions/queuer.fish")
     BASH_COMP=("$HOME/.bash_completions/qur.sh" "$HOME/.bash_completions/queuer.sh")
@@ -106,6 +106,7 @@ if [ "$ACTION" = "uninstall" ]; then
     rm -f "$STATE_DIR"/queuer.db "$STATE_DIR"/queuer.db-wal "$STATE_DIR"/queuer.db-shm
     rm -rf "$CONFIG_DIR"
     rm -f "$SOCKET"
+    rmdir "/tmp/queuer-$(id -u)" 2>/dev/null || true  # private fallback dir, only if empty
     if [ "$DEL_LOGS" = yes ]; then
         echo "==> Removing job logs"
         rm -rf "$STATE_DIR/logs"
@@ -135,7 +136,11 @@ echo "==> Project dir: $PROJECT_DIR"
 
 if ! command -v uv > /dev/null 2>&1; then
     echo "==> uv not found -- installing it"
-    curl -LsSf https://astral.sh/uv/install.sh | sh
+    # download first, run second: a cut-off download is never executed
+    UV_INSTALLER="$(mktemp)"
+    trap 'rm -f "$UV_INSTALLER"' EXIT
+    curl --proto '=https' --tlsv1.2 -LsSf https://astral.sh/uv/install.sh -o "$UV_INSTALLER"
+    sh "$UV_INSTALLER"
     # the official installer puts uv in ~/.local/bin; make it visible to the
     # rest of this script without requiring a new shell
     export PATH="$HOME/.local/bin:$PATH"
@@ -209,6 +214,21 @@ if pgrep -x queuerd > /dev/null; then
     echo "WARNING: a queuerd process is still running after attempting to stop it." >&2
     pgrep -a -x queuerd >&2
     exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# 4b. Tighten permissions of state created by older versions (daemon is
+#     stopped, nothing is writing): owner-only db, logs, config.
+# ---------------------------------------------------------------------------
+
+STATE_DIR="$HOME/.local/state/queuer"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/queuer"
+echo "==> Making db, logs and config owner-only"
+for dir in "$STATE_DIR" "$STATE_DIR/logs" "$CONFIG_DIR"; do
+    if [ -d "$dir" ] && [ ! -L "$dir" ]; then chmod 700 "$dir"; fi
+done
+if [ -d "$STATE_DIR" ]; then
+    find "$STATE_DIR" -maxdepth 2 -type f \( -name 'queuer.db*' -o -name '*.log' \) -exec chmod 600 {} +
 fi
 
 # ---------------------------------------------------------------------------

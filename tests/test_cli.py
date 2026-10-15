@@ -1004,3 +1004,26 @@ def test_old_single_bot_config_file_keeps_working(tg2, tmp_path):
     assert "bots" in json.loads(path.read_text())  # rewritten in the new layout
     assert runner.invoke(app, ["connect", "--add-bot"], input=TG_TOKEN2 + "\n").exit_code == 0
     assert len(notify.load()["bots"]) == 2
+
+
+def test_import_dash_reads_string_from_stdin_without_warning(tg, tmp_path, monkeypatch):
+    runner.invoke(app, ["connect"], input=TG_TOKEN + "\n")
+    a = _one()
+    exported = runner.invoke(app, ["connect", "--export"]).stdout.strip().splitlines()[0]
+    monkeypatch.setenv("QUEUER_NOTIFY_PATH", str(tmp_path / "other" / "notify.json"))
+    res = runner.invoke(app, ["connect", "--import", "-"], input=exported + "\n")
+    assert res.exit_code == 0, res.output
+    assert _one()["token"] == a["token"]
+    assert "visible in `ps`" not in res.output
+
+
+def test_import_dash_empty_stdin_fails(tg):
+    res = runner.invoke(app, ["connect", "--import", "-"], input="")
+    assert res.exit_code == 1 and "nothing on stdin" in res.output
+
+
+def test_import_on_argv_warns(tg):
+    runner.invoke(app, ["connect"], input=TG_TOKEN + "\n")
+    s = notify.export_string(_one())
+    res = runner.invoke(app, ["connect", "--import", s])
+    assert res.exit_code == 0 and "visible in `ps`" in res.output

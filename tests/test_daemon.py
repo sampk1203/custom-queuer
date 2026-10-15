@@ -1936,3 +1936,296 @@ async def test_bot_with_no_chats_is_not_polled_and_sends_nothing(daemon, monkeyp
     await _wait(lambda: len(bot.of("sendMessage")) == 2)
     await asyncio.sleep(0.3)
     assert TG_TOKEN not in bot.polls and not bot.of("sendMessage", TG_TOKEN)
+
+
+# ---------------------------------------------------------------------------
+# hardening: file modes, bad requests
+# ---------------------------------------------------------------------------
+
+def _mode(path):
+    return os.stat(path).st_mode & 0o777
+
+
+@pytest.mark.asyncio
+async def test_socket_db_and_log_modes_are_private_even_under_umask_000(tmp_path):
+    old = os.umask(0o000)
+    try:
+        d = Daemon(db_path=tmp_path / "s" / "queuer.db", socket_path=tmp_path / "queuer.sock", log_dir=tmp_path / "logs")
+        task = asyncio.create_task(d.serve())
+        for _ in range(100):
+            if d.socket_path.exists():
+                break
+            await asyncio.sleep(0.02)
+        resp = await send(d.socket_path, "add", argv=["echo", "hi"], cwd=CWD)
+        job = await wait_for_status(d.socket_path, resp["data"]["id"], {"done", "failed"})
+        assert _mode(d.socket_path) == 0o600
+        assert _mode(d.db_path) == 0o600
+        assert _mode(d.db_path.parent) == 0o700
+        assert _mode(d.log_dir) == 0o700
+        assert _mode(job["log_path"]) == 0o600
+    finally:
+        os.umask(old)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+async def _raw(socket_path, payload: bytes) -> bytes:
+    reader, writer = await asyncio.open_unix_connection(str(socket_path))
+    writer.write(payload)
+    await writer.drain()
+    data = await reader.read()
+    writer.close()
+    return data
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", [b"\xff\xfe\n", b"x" * 200_000 + b"\n", b"not json\n"])
+async def test_bad_request_gets_error_reply_not_a_crash(daemon, payload, capsys):
+    data = await _raw(daemon.socket_path, payload)
+    resp = json.loads(data)
+    assert resp["ok"] is False and "invalid request" in resp["error"]
+    assert "UnboundLocalError" not in capsys.readouterr().err
+    # daemon still serves
+    assert (await send(daemon.socket_path, "status"))["ok"]
+
+
+# ---------------------------------------------------------------------------
+# hardening: peer uid, private fallback socket dir
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_connection_from_another_uid_is_refused(daemon):
+    real = daemon._uid
+    daemon._uid = real + 1  # pretend we are someone else: our own connection is now "foreign"
+    try:
+        reply = await _raw(daemon.socket_path, b'{"cmd": "status"}\n')
+    except ConnectionResetError:  # closed on us before we finished writing: also a refusal
+        reply = b""
+    assert reply == b""
+    daemon._uid = real
+    assert (await send(daemon.socket_path, "status"))["ok"]
+
+
+def test_default_socket_path_falls_back_to_private_dir_not_bare_tmp(monkeypatch):
+    from queuer.daemon import _default_socket_path
+
+    for unset in (None, ""):
+        if unset is None:
+            monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+        else:
+            monkeypatch.setenv("XDG_RUNTIME_DIR", unset)
+        monkeypatch.delenv("QUEUER_SOCKET_PATH", raising=False)
+        path = _default_socket_path()
+        assert path == Path(f"/tmp/queuer-{os.getuid()}/queuer.sock")
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/1")
+    assert _default_socket_path() == Path("/run/user/1/queuer.sock")
+
+
+def test_ensure_private_dir(tmp_path, monkeypatch):
+    from queuer.daemon import _ensure_private_dir
+
+    d = tmp_path / "q"
+    _ensure_private_dir(d)
+    assert _mode(d) == 0o700
+    os.chmod(d, 0o755)  # ours but loose -> tightened
+    _ensure_private_dir(d)
+    assert _mode(d) == 0o700
+    link = tmp_path / "link"
+    link.symlink_to(d)  # symlink planted in place of the dir -> refused
+    with pytest.raises(RuntimeError):
+        _ensure_private_dir(link)
+    monkeypatch.setattr(os, "getuid", lambda: os.stat(d).st_uid + 1)  # someone else's dir -> refused
+    with pytest.raises(RuntimeError):
+        _ensure_private_dir(d)
+
+
+@pytest.mark.asyncio
+async def test_serve_creates_private_fallback_dir(tmp_path, monkeypatch):
+    fb = tmp_path / "queuer-fallback"
+    monkeypatch.setattr("queuer.daemon._fallback_socket_dir", lambda: fb)
+    d = Daemon(db_path=tmp_path / "q.db", socket_path=fb / "queuer.sock", log_dir=tmp_path / "logs")
+    task = asyncio.create_task(d.serve())
+    try:
+        for _ in range(100):
+            if d.socket_path.exists():
+                break
+            await asyncio.sleep(0.02)
+        assert _mode(fb) == 0o700 and _mode(d.socket_path) == 0o600
+        assert (await send(d.socket_path, "status"))["ok"]
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# hardening: one daemon per socket, state-folder modes
+# ---------------------------------------------------------------------------
+
+async def _stop(task):
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_second_daemon_refuses_and_leaves_first_untouched(daemon, tmp_path):
+    from queuer.daemon import AlreadyRunning
+
+    resp = await send(daemon.socket_path, "add", argv=["sleep", "30"], cwd=CWD)
+    job_id = resp["data"]["id"]
+    await wait_for_status(daemon.socket_path, job_id, {"running"})
+
+    second = Daemon(db_path=daemon.db_path, socket_path=daemon.socket_path, log_dir=daemon.log_dir)
+    with pytest.raises(AlreadyRunning):
+        await second.serve()
+    assert second.conn is None  # never touched the db (would have failed the running job)
+
+    shown = await send(daemon.socket_path, "show", id=job_id)
+    assert shown["data"]["status"] == "running"
+    assert (await send(daemon.socket_path, "status"))["ok"]  # socket not stolen
+    await send(daemon.socket_path, "cancel", id=job_id)
+
+
+@pytest.mark.asyncio
+async def test_stale_socket_file_does_not_block_start(tmp_path):
+    import socket as sk
+
+    sock = tmp_path / "queuer.sock"
+    s = sk.socket(sk.AF_UNIX)
+    s.bind(str(sock))
+    s.close()  # leftover file, nobody listening
+    d = Daemon(db_path=tmp_path / "q.db", socket_path=sock, log_dir=tmp_path / "logs")
+    task = asyncio.create_task(d.serve())
+    try:
+        for _ in range(100):
+            if (await _try_status(sock)):
+                break
+            await asyncio.sleep(0.02)
+        else:
+            pytest.fail("daemon did not come up over a stale socket")
+    finally:
+        await _stop(task)
+
+
+async def _try_status(sock):
+    try:
+        return (await send(sock, "status"))["ok"]
+    except OSError:
+        return False
+
+
+def test_main_exits_1_with_message_when_already_running(monkeypatch, capsys):
+    from queuer import daemon as dmod
+
+    async def boom(self):
+        raise dmod.AlreadyRunning("queuerd is already running (x)")
+
+    monkeypatch.setattr(dmod.Daemon, "serve", boom)
+    with pytest.raises(SystemExit) as e:
+        dmod.main()
+    assert e.value.code == 1
+    assert "already running" in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
+async def test_default_state_folders_are_tightened(tmp_path, monkeypatch):
+    state = tmp_path / "state"
+    state.mkdir(mode=0o755)
+    os.chmod(state, 0o755)
+    monkeypatch.setattr(db_module, "DEFAULT_DB_PATH", state / "queuer.db")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("QUEUER_DB_PATH", raising=False)
+    monkeypatch.delenv("QUEUER_LOG_DIR", raising=False)
+    logs = tmp_path / "home" / ".local" / "state" / "queuer" / "logs"
+    logs.mkdir(parents=True)
+    os.chmod(logs, 0o755)
+    d = Daemon(socket_path=tmp_path / "queuer.sock")
+    assert d.log_dir == logs and d.db_path.parent == state
+    task = asyncio.create_task(d.serve())
+    try:
+        for _ in range(100):
+            if d.socket_path.exists():
+                break
+            await asyncio.sleep(0.02)
+        assert _mode(state) == 0o700 and _mode(logs) == 0o700
+    finally:
+        await _stop(task)
+
+
+@pytest.mark.asyncio
+async def test_user_chosen_folders_are_never_chmoded_only_warned(tmp_path, capsys):
+    shared_db, shared_logs = tmp_path / "shared-db", tmp_path / "shared-logs"
+    for p in (shared_db, shared_logs):
+        p.mkdir()
+        os.chmod(p, 0o755)
+    d = Daemon(db_path=shared_db / "q.db", socket_path=tmp_path / "queuer.sock", log_dir=shared_logs)
+    task = asyncio.create_task(d.serve())
+    try:
+        for _ in range(100):
+            if d.socket_path.exists():
+                break
+            await asyncio.sleep(0.02)
+        assert _mode(shared_db) == 0o755 and _mode(shared_logs) == 0o755
+        err = capsys.readouterr().err
+        assert str(shared_db) in err and str(shared_logs) in err and "warning" in err
+        assert _mode(shared_db / "q.db") == 0o600  # the files themselves stay private
+    finally:
+        await _stop(task)
+
+
+# ---------------------------------------------------------------------------
+# robustness: bad add fields, unwritable log, large uids
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", [
+    {"timeout_secs": "abc"}, {"timeout_secs": -1}, {"timeout_secs": True}, {"timeout_secs": 1.5},
+    {"channel": "x"}, {"channel": -2}, {"before": "a"}, {"after": [1]},
+    {"argv": "echo hi"}, {"argv": ["echo", 1]}, {"cwd": 5},
+])
+async def test_add_rejects_bad_field_types_and_daemon_survives(daemon, bad):
+    args = {"argv": ["echo", "x"], "cwd": CWD, **bad}
+    resp = await send(daemon.socket_path, "add", **args)
+    assert resp["ok"] is False
+    await asyncio.sleep(1.3)  # a bad value used to kill the worker, and with it the daemon
+    ok = await send(daemon.socket_path, "add", argv=["echo", "fine"], cwd=CWD)
+    job = await wait_for_status(daemon.socket_path, ok["data"]["id"], {"done", "failed"})
+    assert job["status"] == "done"
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not os.path.exists("/dev/full"), reason="needs /dev/full")
+async def test_unwritable_log_does_not_kill_job_or_daemon(daemon, capsys):
+    (daemon.log_dir / "1.log").symlink_to("/dev/full")  # every write fails with ENOSPC
+    resp = await send(daemon.socket_path, "add", argv=["echo", "x"], cwd=CWD)
+    job = await wait_for_status(daemon.socket_path, resp["data"]["id"], {"done", "failed"})
+    assert job["status"] == "done" and job["exit_code"] == 0
+    assert "cannot write log" in capsys.readouterr().err
+    assert (await send(daemon.socket_path, "status"))["ok"]
+
+
+def test_peer_check_reads_uid_as_unsigned(daemon):
+    import struct
+
+    big = 4294967294  # e.g. a rootless-container uid; "3i" would read it as -2
+
+    class Sock:
+        def getsockopt(self, *a):
+            return struct.pack("iII", 1, big, 1)
+
+    class Writer:
+        def get_extra_info(self, name):
+            return Sock()
+
+    daemon._uid = big
+    assert daemon._peer_is_me(Writer()) is True
+    daemon._uid = 1000
+    assert daemon._peer_is_me(Writer()) is False

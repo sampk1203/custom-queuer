@@ -849,7 +849,7 @@ def _bot_username(token: str, required: bool) -> str | None:
 @app.command()
 def connect(
     export: bool = typer.Option(False, "--export", help="Print a string that sets up other machines (contains the bot tokens). With --bot, only that bot"),
-    import_: Optional[str] = typer.Option(None, "--import", help="Set this machine up from another machine's --export string (adds its bots to this machine's)"),
+    import_: Optional[str] = typer.Option(None, "--import", help="Set this machine up from another machine's --export string (adds its bots to this machine's). Use `--import -` to read the string from stdin so the token stays out of ps and shell history"),
     from_: Optional[str] = typer.Option(None, "--from", metavar="[USER@]HOST", help="Set this machine up over ssh from a machine that is already set up (no string to copy)"),
     off: bool = typer.Option(False, "--off", "--remove-bot", help="Remove a bot from this machine (--bot ID), or everything if it has only one or you pass --all"),
     list_: bool = typer.Option(False, "--list", help="Show this machine's setup: id, host, every bot with its paired chats and Requeue button on/off"),
@@ -868,9 +868,11 @@ def connect(
     include the working directory or resolved paths; use `qur show ID` on the
     machine for those. A job that is auto-retried stays silent until its final try.
 
-    Each message has two buttons. Requeue re-runs the finished job (like `qur
+    Each message has three buttons. Requeue re-runs the finished job (like `qur
     requeue ID`). Details replies with everything `qur show ID` prints, formatted
-    for Telegram (this includes paths, sent only to your paired chats). Both are
+    for Telegram (this includes paths, sent only to your paired chats). Logs
+    replies with the last lines of the job's output, so anything the job prints
+    (secrets included) goes through Telegram when you press it. All are
     handled by the daemon of the machine that polls that bot.
 
     One qur can use several bots at once: every message goes through every bot
@@ -911,6 +913,7 @@ def connect(
       qur connect --export
       qur connect --from sampk@laptop
       qur connect --import qurtg1:eyJ0Ijoi...
+      qur connect --import -   (string read from stdin)
       qur connect --id bigbox
       qur connect --list
       qur connect --bot @laptop_bot --no-listen
@@ -934,6 +937,13 @@ def connect(
 
     if from_ is not None:
         import_ = _fetch_export_over_ssh(from_)
+    elif import_ == "-":
+        import_ = sys.stdin.read().strip()
+        if not import_:
+            _fail("--import -: nothing on stdin")
+    elif import_ is not None:
+        typer.echo("Warning: the string holds bot tokens and is now visible in `ps` and shell history. "
+                   "Prefer `--from [user@]host` or `qur connect --import -` (string on stdin).", err=True)
 
     existing = notify.load()
 

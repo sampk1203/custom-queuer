@@ -14,6 +14,7 @@ table gets a row the first time a job lands on that channel, so a channel
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -65,7 +66,15 @@ CREATE TABLE IF NOT EXISTS daemon_state (
 
 def connect(db_path: Path | str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     db_path = Path(db_path)
-    db_path.parent.mkdir(parents=True, exist_ok=True)
+    new_dir = not db_path.parent.exists()
+    db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # 0700 for a folder we made or queuer's default one; never chmod a folder the
+    # user pointed QUEUER_DB_PATH at (it may be $HOME) -- the daemon warns instead
+    if new_dir or db_path.parent == DEFAULT_DB_PATH.parent:
+        os.chmod(db_path.parent, 0o700)
+    # create the file 0600 ourselves; sqlite would use the umask
+    os.close(os.open(db_path, os.O_RDWR | os.O_CREAT, 0o600))
+    os.chmod(db_path, 0o600)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     return conn

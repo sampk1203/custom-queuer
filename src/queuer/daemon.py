@@ -21,7 +21,10 @@ import asyncio
 import json
 import os
 import signal
+import socket
 import sqlite3
+import stat
+import struct
 import sys
 import traceback
 from pathlib import Path
@@ -46,8 +49,29 @@ def _default_socket_path() -> Path:
     override = os.environ.get("QUEUER_SOCKET_PATH")
     if override:
         return Path(override)
-    runtime_dir = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
-    return Path(runtime_dir) / "queuer.sock"
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR")  # unset or empty -> private fallback
+    return (Path(runtime_dir) if runtime_dir else _fallback_socket_dir()) / "queuer.sock"
+
+
+def _fallback_socket_dir() -> Path:
+    """Per-user dir used when XDG_RUNTIME_DIR is unset (cron, sudo, ...). Never
+    a bare /tmp: another user could pre-create the socket path there."""
+    return Path("/tmp") / f"queuer-{os.getuid()}"
+
+
+def _ensure_private_dir(path: Path) -> None:
+    """Create `path` (0700), or accept an existing one only if it is a real
+    directory (not a symlink) owned by us; loose modes are tightened. Anything
+    else could be a trap planted by another user, so refuse."""
+    try:
+        path.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    st = os.lstat(path)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+        raise RuntimeError(f"refusing to use {path}: not a directory owned by you")
+    if st.st_mode & 0o077:
+        os.chmod(path, 0o700)
 
 
 def _default_log_dir() -> Path:
@@ -55,6 +79,33 @@ def _default_log_dir() -> Path:
     if override:
         return Path(override)
     return Path.home() / ".local" / "state" / "queuer" / "logs"
+
+
+class AlreadyRunning(RuntimeError):
+    """Another queuerd already answers on the socket."""
+
+
+def _socket_answers(path: Path) -> bool:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(1)
+    try:
+        s.connect(str(path))
+        return True
+    except OSError:  # missing, refused (stale file) or not ours
+        return False
+    finally:
+        s.close()
+
+
+def _tighten_or_warn(path: Path, created: bool, ours_by_default: bool) -> None:
+    """State folders: 0700 when we made them or they are queuer's own default
+    location. A folder the user pointed QUEUER_* at is never chmod'ed (it may be
+    $HOME); its files are still 0600, so we only warn if it is open to others."""
+    if created or ours_by_default:
+        os.chmod(path, 0o700)
+    elif path.stat().st_mode & 0o077:
+        print(f"[queuerd] warning: {path} is accessible to other users (files inside are 0600; "
+              f"chmod 700 it if it is dedicated to queuer)", file=sys.stderr)
 
 
 class Daemon:
@@ -70,6 +121,7 @@ class Daemon:
         self.log_dir = log_dir or _default_log_dir()
         self.notify_path = notify_path or notify.default_path()
         self.conn: sqlite3.Connection | None = None
+        self._uid = os.getuid()  # the only user whose socket requests are served
 
         # per-channel: each channel gets its own wake event, its own
         # current-job slot, its own worker task.
@@ -101,6 +153,7 @@ class Daemon:
     def _connect(self) -> None:
         self.conn = db.connect(self.db_path)
         db.init_db(self.conn)
+        _tighten_or_warn(self.db_path.parent, created=False, ours_by_default=False)  # warn only
 
     def _recover_on_startup(self) -> None:
         """A row still marked 'running' from a previous daemon instance
@@ -219,7 +272,7 @@ class Daemon:
         env = {"PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", "")}
         env.update(env_extra)
         log_path = Path(job["log_path"])
-        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -505,28 +558,45 @@ class Daemon:
 
     async def _pump_log(self, proc: asyncio.subprocess.Process, log_path: Path) -> None:
         """Stream the job's combined stdout/stderr to its log file, capped
-        at MAX_LOG_BYTES with a single truncation marker line."""
+        at MAX_LOG_BYTES with a single truncation marker line. If the log
+        cannot be opened or written (disk full, ...) the output is dropped
+        but still drained, so the job keeps running and the daemon stays up."""
         written = 0
         truncated = False
-        with open(log_path, "wb") as f:
+        f = None
+        try:
+            f = os.fdopen(os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb")
+        except OSError as e:
+            print(f"[queuerd] cannot open log {log_path}: {e}", file=sys.stderr)
+        try:
             assert proc.stdout is not None
             while True:
                 chunk = await proc.stdout.read(65536)
                 if not chunk:
                     break
-                if truncated:
+                if truncated or f is None:
                     continue
-                if written + len(chunk) > MAX_LOG_BYTES:
-                    remaining = MAX_LOG_BYTES - written
-                    if remaining > 0:
-                        f.write(chunk[:remaining])
-                    f.write(f"\n[queuer] log truncated at {MAX_LOG_BYTES} bytes\n".encode())
+                try:
+                    if written + len(chunk) > MAX_LOG_BYTES:
+                        remaining = MAX_LOG_BYTES - written
+                        if remaining > 0:
+                            f.write(chunk[:remaining])
+                        f.write(f"\n[queuer] log truncated at {MAX_LOG_BYTES} bytes\n".encode())
+                        truncated = True
+                        written = MAX_LOG_BYTES
+                    else:
+                        f.write(chunk)
+                        written += len(chunk)
+                    f.flush()  # so a running job's log can be read (qur logs --tail, Telegram Logs)
+                except OSError as e:
+                    print(f"[queuerd] cannot write log {log_path}: {e}; dropping the rest of its output", file=sys.stderr)
                     truncated = True
-                    written = MAX_LOG_BYTES
-                else:
-                    f.write(chunk)
-                    written += len(chunk)
-                f.flush()  # so a running job's log can be read (qur logs --tail, Telegram Logs)
+        finally:
+            if f is not None:
+                try:
+                    f.close()
+                except OSError:
+                    pass
 
     async def _kill_process_group(self, proc: asyncio.subprocess.Process, grace: float = DEFAULT_GRACE_SECS) -> None:
         """SIGTERM the job's whole process group, wait up to `grace`
@@ -576,6 +646,16 @@ class Daemon:
         max_retries = args.get("max_retries") or 0
         if not argv:
             raise ValueError("empty command")
+        if not (isinstance(argv, list) and all(isinstance(a, str) for a in argv)) or not isinstance(cwd, str):
+            raise ValueError("argv must be a list of strings and cwd a string")
+        if type(channel) is not int or channel < 1:
+            raise ValueError("channel must be a positive integer")
+        timeout_secs = args.get("timeout_secs")
+        if timeout_secs is not None and (type(timeout_secs) is not int or timeout_secs < 0):
+            raise ValueError("timeout must be a non-negative integer")
+        for key in ("before", "after"):
+            if args.get(key) is not None and type(args[key]) is not int:
+                raise ValueError(f"{key} must be a job id")
         if not isinstance(max_retries, int) or max_retries < 0:
             raise ValueError("retries must be a non-negative integer")
         if now and (args.get("before") is not None or args.get("after") is not None):
@@ -608,7 +688,7 @@ class Daemon:
             cwd=cwd,
             log_path="pending",
             channel=channel,
-            timeout_secs=args.get("timeout_secs"),
+            timeout_secs=timeout_secs,
             before=args.get("before"),
             after=args.get("after"),
             is_priority=now,
@@ -755,7 +835,25 @@ class Daemon:
 
     # -- socket server ------------------------------------------------------
 
+    def _peer_is_me(self, writer: asyncio.StreamWriter) -> bool:
+        """Defense in depth behind the 0600 socket: the connecting process
+        must run as our uid (SO_PEERCRED, Linux). Elsewhere the mode is the guard."""
+        sock = writer.get_extra_info("socket")
+        so_peercred = getattr(socket, "SO_PEERCRED", None)
+        if sock is None or so_peercred is None:
+            return True
+        try:
+            _pid, uid, _gid = struct.unpack("iII", sock.getsockopt(socket.SOL_SOCKET, so_peercred, struct.calcsize("iII")))  # pid, uid, gid
+        except (OSError, struct.error):
+            return False
+        return uid == self._uid
+
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        if not self._peer_is_me(writer):
+            print("[queuerd] refused a connection from another user", file=sys.stderr)
+            writer.close()
+            return
+        req: Any = None
         try:
             line = await reader.readline()
             if not line:
@@ -764,8 +862,8 @@ class Daemon:
                 return
             req = json.loads(line.decode())
             resp = await self.handle_request(req)
-        except json.JSONDecodeError:
-            resp = {"ok": False, "error": "invalid JSON request"}
+        except ValueError:  # bad JSON, bad UTF-8, or line over the stream limit
+            resp = {"ok": False, "error": "invalid request"}
         except Exception as e:  # last-resort guard: one bad request must not kill the daemon
             print(f"[queuerd] unexpected error handling request {req!r}:", file=sys.stderr)
             traceback.print_exc(file=sys.stderr)
@@ -776,13 +874,23 @@ class Daemon:
         await writer.wait_closed()
 
     async def serve(self) -> None:
+        if self.socket_path.parent == _fallback_socket_dir():
+            _ensure_private_dir(self.socket_path.parent)
+        else:
+            self.socket_path.parent.mkdir(parents=True, exist_ok=True)
+        # before touching the db: a second daemon must not mark the first's
+        # running job failed, nor steal its socket
+        if _socket_answers(self.socket_path):
+            raise AlreadyRunning(f"queuerd is already running (socket {self.socket_path} answers)")
+        if self.socket_path.exists():
+            self.socket_path.unlink()
+
         self._connect()
         self._recover_on_startup()
 
-        if self.socket_path.exists():
-            self.socket_path.unlink()
-        self.socket_path.parent.mkdir(parents=True, exist_ok=True)
-        self.log_dir.mkdir(parents=True, exist_ok=True)
+        new_log_dir = not self.log_dir.exists()
+        self.log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        _tighten_or_warn(self.log_dir, new_log_dir, self.log_dir == _default_log_dir())
 
         # channel 1 always gets a worker, plus one for every other channel
         # that already has rows from a previous run.
@@ -791,7 +899,13 @@ class Daemon:
         for channel in db.list_channels(self.conn):
             self._ensure_channel_worker(channel)
 
-        server = await asyncio.start_unix_server(self._handle_client, path=str(self.socket_path))
+        # umask 077 while binding: socket is born 0600, no window where it is looser
+        old_umask = os.umask(0o077)
+        try:
+            server = await asyncio.start_unix_server(self._handle_client, path=str(self.socket_path))
+        finally:
+            os.umask(old_umask)
+        os.chmod(self.socket_path, 0o600)
 
         async with server:
             listener = asyncio.create_task(self._telegram_listener())
@@ -807,6 +921,9 @@ def main() -> None:
         asyncio.run(daemon.serve())
     except KeyboardInterrupt:
         pass
+    except AlreadyRunning as e:
+        print(f"[queuerd] {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

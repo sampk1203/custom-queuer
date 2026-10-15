@@ -25,7 +25,12 @@ the project directory) — it syncs the venv, runs the test suite, installs
 shell tab-completion for `qur`/`queuer` (for your login shell), stops
 any existing `queuerd` process (systemd-managed or stray), rewrites the
 systemd unit with the correct path, enables + starts it, and enables
-linger so it survives logout.
+linger so it survives logout. It also makes any state left by an older version
+owner-only (db, logs, config; see [Security and permissions](#security-and-permissions)).
+If uv is missing it downloads uv's installer from astral.sh over HTTPS to a temp
+file and runs it only once the download finished (no `curl | sh`); there is no
+checksum check, so if you want one, install uv from your package manager first and
+the script skips the download.
 
 `qur` is a short alias for `queuer` — same command, less typing.
 
@@ -37,8 +42,9 @@ separately whether to delete the job logs and whether to disable linger (both
 default no). It stops and disables `queuerd`, deletes the systemd unit, runs
 `uv tool uninstall queuer`, removes the shell completion files and the lines typer
 added to `~/.bashrc`, deletes the job database (queue and history), the Telegram
-setup (`~/.config/queuer`, bot token included), the socket and the project
-`.venv`. It does not delete the project folder, uv itself, or the PATH line `uv tool
+setup (`~/.config/queuer`, bot token included), the socket (and its private
+`/tmp/queuer-<uid>` folder if that was used) and the project `.venv`. The job database and
+logs are looked up in `~/.local/state/queuer`, the same place the daemon uses. It does not delete the project folder, uv itself, or the PATH line `uv tool
 update-shell` added to your shell rc, since other tools use those. Logs stay unless
 you say yes. The Telegram bot token is not revoked; send `/revoke` to @BotFather
 for that.
@@ -172,7 +178,7 @@ one chat on your phone.
 ✅ done · job 12 · 2h13m
 $ python train.py --epochs 50
 bigbox [a3f9] · ch 1 · exit 0
-[ 🔁 Requeue ] [ ℹ️ Details ]
+[ 🔁 Requeue ] [ ℹ️ Details ] [ 📄 Logs ]
 ```
 
 Sent for **done**, **failed** (including timeouts, failed starts, and jobs
@@ -181,7 +187,7 @@ qur has its own short id (`a3f9` above, shown when you connect), so with
 several machines you can see exactly which one a message came from. A job with
 `--retries` stays silent while retries remain; you get one message for its
 final outcome, marked `attempt 3/3`. Messages show the command as you typed it
-(one line, capped at 120 characters) but never the working directory, resolved
+(one line, capped at 1000 characters) but never the working directory, resolved
 paths or raw error text — use `qur show ID` on that machine for those.
 
 **Details button.** Replies with everything `qur show ID` prints (raw and
@@ -189,6 +195,11 @@ resolved command, cwd, timestamps, duration, exit code, timeout, origin, pid, lo
 path, note), laid out for Telegram: bold labels, monospace commands and paths.
 This is the one place paths leave the machine, and only to your paired chats, on
 request. `qur show` itself is unchanged.
+
+**Logs button.** Replies with the last ~20 lines of the job's output (colour codes
+stripped). Whatever the job printed, secrets included, then goes through Telegram, to
+your paired chats only and only when you press it. Don't press it for jobs that print
+secrets.
 
 **Requeue button.** Pressing it re-runs the finished job exactly like
 `qur requeue ID` (same command, cwd, timeout, retries; end of its channel's
@@ -246,7 +257,12 @@ be set up. Without ssh, copy the string by hand:
 ```bash
 qur connect --export                  # on the first machine: prints one string
 qur connect --import qurtg1:eyJ0...   # on each other machine
+echo 'qurtg1:eyJ0...' | qur connect --import -   # same, string from stdin
 ```
+
+A string given on the command line is visible in `ps` and your shell history, so
+`qur connect` prints a warning. Prefer `--from user@host` (nothing to copy) or
+`--import -` (string on stdin).
 
 Each machine gets its own id on import and is send-only (no buttons; the first
 machine keeps them). The string contains the bot token, so keep it private.
@@ -319,14 +335,58 @@ reboots without any special handling.
 |---|---|
 | Job database | `~/.local/state/queuer/queuer.db` |
 | Job logs | `~/.local/state/queuer/logs/<id>.log` |
-| Socket | `$XDG_RUNTIME_DIR/queuer.sock` |
-| Notification config (bot token, chats, this qur's id) | `~/.config/queuer/notify.json` |
+| Socket | `$XDG_RUNTIME_DIR/queuer.sock`, or `/tmp/queuer-<uid>/queuer.sock` (private dir) if that is unset |
+| Notification config (bot token, chats, this qur's id) | `~/.config/queuer/notify.json` (0600) |
 | systemd unit | `~/.config/systemd/user/queuerd.service` |
 
 The database, log, socket and notification paths can be overridden with `QUEUER_DB_PATH`,
 `QUEUER_LOG_DIR`, `QUEUER_SOCKET_PATH`, and `QUEUER_NOTIFY_PATH` env vars — mainly useful for
 running the daemon against a scratch location during manual testing,
 without touching real state.
+
+## Security and permissions
+
+queuerd runs any command a connected client sends, so the socket is the trust
+boundary. What is enforced:
+
+- **Socket.** Created mode 0600 (the daemon sets a private umask while binding, so your
+  umask doesn't matter). On Linux the daemon also checks the connecting process's uid
+  (`SO_PEERCRED`) and drops anyone who isn't you.
+- **Socket location.** `$XDG_RUNTIME_DIR/queuer.sock`. If that is unset or empty (cron,
+  `sudo`), the fallback is `/tmp/queuer-<uid>/queuer.sock`, never a bare `/tmp`. The folder
+  is created 0700; an existing one is used only if it is a real folder (not a symlink)
+  owned by you, and a loose mode is tightened. Otherwise the daemon refuses to start.
+- **One daemon per socket.** A second `queuerd` exits with `queuerd is already running`
+  before it opens the database, so it can't steal the socket or mark the first one's
+  running job as failed. A stale socket file left by a crash does not block startup.
+- **Database, logs, config.** Files are created 0600 (database, its `-wal`/`-shm`, every job
+  log, `notify.json`), and folders queuer creates are 0700, whatever your umask. queuer's
+  own default folders (`~/.local/state/queuer`, its `logs`) are tightened to 0700 on
+  start, and `install.sh` also fixes older files. A folder you chose with
+  `QUEUER_DB_PATH` / `QUEUER_LOG_DIR` is never chmod'ed (it could be `$HOME`); the files in
+  it are still 0600 and the daemon prints a warning in the journal if the folder is open to
+  other users. Job logs hold whatever your jobs print and the database holds your commands.
+- **Bad requests.** A request that isn't valid JSON, isn't UTF-8, or is longer than 64 KB
+  gets `invalid request` and the daemon carries on (it used to log a traceback and
+  send no reply). `add` rejects wrongly typed fields (timeout, channel, argv, cwd,
+  before/after) with an error instead of failing later inside the worker. A job log that
+  cannot be opened or written (disk full) is logged to the journal and the job's output is
+  dropped; the job and the daemon keep going.
+- **Bot token.** Never appears in logs or error text. `qur connect --import -` takes the
+  setup string on stdin; on the command line it is visible in `ps` and shell history
+  (a warning is printed). The setup string and `notify.json` contain the token, so
+  keep them private; `/revoke` to @BotFather invalidates it.
+- **Telegram.** Only chats paired with a bot can press its buttons, and pairing needs your
+  own random code. Finished-job messages include the command as typed (up to 1000
+  characters; Details up to 1200 per command), and the **Logs** button sends output (see above). Don't put secrets in
+  command arguments, and don't press Logs for jobs that print them.
+- **Errors you may see.** `permission denied on <socket>` means the socket isn't yours
+  with mode 0600 (is `queuerd` running as another user?). `stale socket` means the
+  file exists but nothing answers: `systemctl --user restart queuerd`. The CLI gives up
+  with `did not answer` if the daemon is silent for 60 s.
+
+Not covered: jobs are not sandboxed (see below), and a process running as **you** can
+always queue commands, which is by design.
 
 ## Development
 
@@ -347,10 +407,10 @@ For a design/architecture writeup and the phase-by-phase build plan, see
   `connect`).
 - No sandboxing — jobs run with your own user permissions, same as
   running them directly in a shell.
-- Nothing currently prevents two `queuerd` processes from running
-  against the same database at once if you start one manually alongside
-  the systemd-managed one — always manage it through `systemctl --user`,
-  not by backgrounding `queuerd` directly.
+- A second `queuerd` refuses to start while one already answers on the socket
+  (`queuerd is already running`, exit 1) and touches nothing. Different
+  `QUEUER_SOCKET_PATH` values against the same database are not detected, so
+  manage the daemon through `systemctl --user`.
 
 
 ## Several bots on one machine
@@ -374,6 +434,7 @@ qur connect --remove-chat 123456789 [--bot ID]   # all bots that have it, or jus
 qur connect --remove-bot --bot ID   # drop one bot; --all drops everything
 qur connect --export [--bot ID]     # all bots (qurtg2:) or one (qurtg1:)
 qur connect --import STRING         # adds the string's bots, send-only unless --listen
+qur connect --import -              # same, string read from stdin (keeps token out of ps/history)
 ```
 
 `--bot` takes the numeric bot id or the @username shown by `--list`. `--import`

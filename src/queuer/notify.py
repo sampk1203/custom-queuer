@@ -158,7 +158,7 @@ def save(cfg: dict[str, Any], path: Path | None = None) -> None:
     if norm is None:
         raise ValueError("invalid notify config")
     path = path or default_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".notify-")
     try:
         with os.fdopen(fd, "w") as f:

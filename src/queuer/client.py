@@ -14,6 +14,9 @@ from typing import Any
 from queuer.daemon import _default_socket_path
 
 
+REQUEST_TIMEOUT_SECS = 60
+
+
 class DaemonNotRunning(Exception):
     """Raised when queuerd's socket doesn't exist or refuses connection."""
 
@@ -29,16 +32,34 @@ def send(cmd: str, **args: Any) -> Any:
     it responded with an application-level error.
     """
     socket_path = _default_socket_path()
-    if not socket_path.exists():
+    try:
+        present = socket_path.exists()
+    except OSError as e:
+        raise DaemonNotRunning(f"cannot access {socket_path}: {e.strerror}") from e
+    if not present:
         raise DaemonNotRunning(
             "queuerd is not running -- start it with: systemctl --user start queuerd"
         )
 
     req = {"cmd": cmd, "args": args}
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(REQUEST_TIMEOUT_SECS)
     try:
         sock.connect(str(socket_path))
+    except PermissionError as e:
+        sock.close()
+        raise DaemonNotRunning(
+            f"permission denied on {socket_path}: it must belong to you with mode 0600 "
+            "(is queuerd running as another user?)"
+        ) from e
+    except ConnectionRefusedError as e:
+        sock.close()
+        raise DaemonNotRunning(
+            f"{socket_path} exists but nothing answers (stale socket?) -- "
+            "try: systemctl --user restart queuerd"
+        ) from e
     except OSError as e:
+        sock.close()
         raise DaemonNotRunning(f"could not connect to queuerd: {e}") from e
 
     try:
@@ -50,6 +71,8 @@ def send(cmd: str, **args: Any) -> Any:
             if not chunk:
                 break
             chunks.append(chunk)
+    except socket.timeout as e:
+        raise DaemonNotRunning(f"queuerd did not answer within {REQUEST_TIMEOUT_SECS}s") from e
     finally:
         sock.close()
 
