@@ -6,4 +6,5 @@ __pycache__/
 .pytest_cache/
 QUEUER_FEATURES.md
 QUEUER_ISSUES.md
+.venv-*
 CHANGELOG.md
