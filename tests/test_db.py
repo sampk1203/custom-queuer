@@ -805,3 +805,28 @@ def test_cancel_queued_rejects_missing_running_and_finished(conn):
     db.mark_finished(conn, a, status="done", exit_code=0)
     with pytest.raises(ValueError):
         db.cancel_queued(conn, a)
+
+
+# ---------------------------------------------------------------------------
+# round 3: recent_requeue (Telegram double-tap guard)
+# ---------------------------------------------------------------------------
+
+def test_recent_requeue_sees_a_fresh_manual_requeue_only(conn):
+    a = _mk(conn, "a")
+    db.mark_finished(conn, a, status="failed", exit_code=1)
+    assert db.recent_requeue(conn, a, 30) is None
+    manual = db.requeue(conn, a, log_path="/tmp/x.log")
+    assert db.recent_requeue(conn, a, 30) == manual
+    conn.execute("UPDATE jobs SET enqueued_at = ? WHERE id = ?", ("2000-01-01T00:00:00+00:00", manual))
+    conn.commit()
+    assert db.recent_requeue(conn, a, 30) is None  # old enough: a new press is a new request
+
+
+def test_recent_requeue_ignores_auto_retries_and_other_jobs(conn):
+    a, b = _mk(conn, "a"), _mk(conn, "b")
+    db.mark_finished(conn, a, status="failed", exit_code=1)
+    db.mark_finished(conn, b, status="failed", exit_code=1)
+    db.requeue(conn, a, log_path="/tmp/x.log", auto=True)
+    assert db.recent_requeue(conn, a, 30) is None
+    db.requeue(conn, b, log_path="/tmp/y.log")
+    assert db.recent_requeue(conn, a, 30) is None

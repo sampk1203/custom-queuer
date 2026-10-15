@@ -1,7 +1,7 @@
 [project]
 name = "queuer"
 version = "0.1.0"
-description = "Add your description here"
+description = "Personal job queue: qur CLI + queuerd daemon with Telegram notifications"
 readme = "README.md"
 authors = [{ name = "Sameer Kulkarni", email = "sampk1203@gmail.com" }]
 requires-python = ">=3.12"
@@ -25,3 +25,33 @@ dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
 ]
+
+# ---------------------------------------------------------------------------
+# Static checks (run in CI: .github/workflows/ci.yml, job "lint")
+# ---------------------------------------------------------------------------
+
+[tool.mypy]
+files = ["src"]
+python_version = "3.12"
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true
+
+[tool.ruff]
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+# pyflakes, pycodestyle, bugbear, isort. E501 (line length) is left to taste: the CLI
+# help strings are long on purpose.
+select = ["E", "F", "W", "B", "I"]
+ignore = ["E501"]
+
+[tool.ruff.lint.flake8-bugbear]
+# typer's idiom is `x: str = typer.Option(...)` in the signature.
+extend-immutable-calls = ["typer.Argument", "typer.Option"]
+
+[tool.bandit]
+# B101 (assert): the daemon uses `assert self.conn is not None` only to narrow types.
+skips = ["B101"]
+exclude_dirs = ["tests", ".venv"]

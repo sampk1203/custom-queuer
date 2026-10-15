@@ -49,3 +49,26 @@ def test_silent_daemon_times_out(sock_path, monkeypatch):
             client.send("status")
     finally:
         s.close()
+
+
+def test_garbled_reply_is_a_clean_error(sock_path):
+    import threading
+
+    srv = socket.socket(socket.AF_UNIX)
+    srv.bind(str(sock_path))
+    srv.listen(1)
+
+    def serve():
+        c, _ = srv.accept()
+        c.recv(65536)
+        c.sendall(b"not json\n")
+        c.close()
+
+    t = threading.Thread(target=serve)
+    t.start()
+    try:
+        with pytest.raises(client.DaemonNotRunning, match="garbled"):
+            client.send("status")
+    finally:
+        t.join()
+        srv.close()

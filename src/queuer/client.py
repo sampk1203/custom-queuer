@@ -13,7 +13,6 @@ from typing import Any
 
 from queuer.daemon import _default_socket_path
 
-
 REQUEST_TIMEOUT_SECS = 60
 
 
@@ -79,7 +78,12 @@ def send(cmd: str, **args: Any) -> Any:
     if not chunks:
         raise DaemonNotRunning("queuerd closed the connection without responding")
 
-    resp = json.loads(b"".join(chunks).decode())
-    if not resp.get("ok"):
+    try:
+        resp = json.loads(b"".join(chunks).decode())
+    except ValueError:
+        raise DaemonNotRunning("queuerd sent a garbled reply") from None
+    if not isinstance(resp, dict) or not resp.get("ok"):
+        if not isinstance(resp, dict):
+            raise DaemonError("unexpected reply from queuerd")
         raise DaemonError(resp.get("error", "unknown error"))
     return resp.get("data")

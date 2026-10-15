@@ -1,0 +1,60 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 4 * * 1"  # weekly: new dependency advisories appear without a push
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    # 3.15 is brand new: let it report without blocking the other versions.
+    continue-on-error: ${{ matrix.python-version == '3.15' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # pyproject.toml says requires-python >= 3.12, so 3.8-3.11 cannot install
+        # this project. Lower that bound first if you want to test them.
+        python-version: ["3.12", "3.13", "3.14", "3.15"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install the locked environment
+        run: uv sync --locked --python ${{ matrix.python-version }}
+      - name: Tests
+        run: uv run --python ${{ matrix.python-version }} pytest -v
+
+  lint:
+    name: lint (mypy, ruff, bandit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - name: Install the locked environment
+        run: uv sync --locked
+      # The tools run from uv's cache with `--with`/`uvx`, so uv.lock is not touched.
+      - name: mypy (types)
+        run: uv run --with "mypy>=1.13" mypy
+      - name: ruff (lint)
+        run: uvx ruff check src
+      - name: bandit (security lint)
+        run: uvx --from "bandit[toml]" bandit -c pyproject.toml -r src
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Export locked runtime dependencies
+        run: uv export --frozen --no-dev --no-hashes --no-emit-project -o requirements.txt
+      - name: Audit them for known vulnerabilities
+        run: uvx pip-audit -r requirements.txt --no-deps --disable-pip

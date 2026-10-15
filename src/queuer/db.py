@@ -250,6 +250,8 @@ def enqueue(
         ),
     )
     new_id = cur.lastrowid
+    if new_id is None:  # an INSERT always sets it; this narrows the type and fails loudly
+        raise RuntimeError("INSERT into jobs returned no rowid")
 
     existing = [i for i in _queued_ids_ordered(conn, channel, is_priority) if i != new_id]
 
@@ -518,6 +520,20 @@ def requeue(conn: sqlite3.Connection, job_id: int, *, log_path: str, auto: bool 
     )
 
 
+def recent_requeue(conn: sqlite3.Connection, job_id: int, within_secs: float) -> int | None:
+    """Id of the newest manual requeue of `job_id` made within the last
+    `within_secs` seconds, else None. Lets the Telegram button treat a double
+    tap as one request. Auto-retries do not count."""
+    row = conn.execute(
+        "SELECT id, enqueued_at FROM jobs WHERE parent_id = ? AND origin = 'requeue' ORDER BY id DESC LIMIT 1",
+        (job_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    age = (datetime.now(timezone.utc) - datetime.fromisoformat(row["enqueued_at"])).total_seconds()
+    return row["id"] if age <= within_secs else None
+
+
 # ---------------------------------------------------------------------------
 # Daemon pause state (per channel)
 # ---------------------------------------------------------------------------
@@ -537,5 +553,21 @@ def set_paused(conn: sqlite3.Connection, paused: bool, channel: int = DEFAULT_CH
         ON CONFLICT(key) DO UPDATE SET value = excluded.value
         """,
         (f"paused:{channel}", "true" if paused else "false"),
+    )
+    conn.commit()
+
+
+def get_state(conn: sqlite3.Connection, key: str) -> str | None:
+    row = conn.execute("SELECT value FROM daemon_state WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row is not None else None
+
+
+def set_state(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO daemon_state (key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """,
+        (key, value),
     )
     conn.commit()

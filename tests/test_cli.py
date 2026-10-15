@@ -1,5 +1,6 @@
 import shlex
 import shutil
+from pathlib import Path
 
 import pytest
 
@@ -1027,3 +1028,121 @@ def test_import_on_argv_warns(tg):
     s = notify.export_string(_one())
     res = runner.invoke(app, ["connect", "--import", s])
     assert res.exit_code == 0 and "visible in `ps`" in res.output
+
+
+# ---------------------------------------------------------------------------
+# audit round: logs print verbatim, clean-logs never deletes on a missing DB
+# ---------------------------------------------------------------------------
+
+def test_logs_prints_brackets_verbatim(tmp_path, monkeypatch):
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "3.log").write_text("epoch [1/10] [red]x[/red] [/foo]\n")
+    monkeypatch.setenv("QUEUER_LOG_DIR", str(log_dir))
+    res = CliRunner().invoke(app, ["logs", "3"])
+    assert res.exit_code == 0, res.output
+    assert res.output == "epoch [1/10] [red]x[/red] [/foo]\n"
+
+
+def test_clean_logs_refuses_when_db_missing(tmp_path, monkeypatch):
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "1.log").write_text("precious")
+    monkeypatch.setenv("QUEUER_LOG_DIR", str(log_dir))
+    monkeypatch.setenv("QUEUER_DB_PATH", str(tmp_path / "state" / "queuer.db"))
+    res = CliRunner().invoke(app, ["clean-logs", "--days", "0"])
+    assert res.exit_code != 0
+    assert (log_dir / "1.log").read_text() == "precious"
+    assert not (tmp_path / "state" / "queuer.db").exists()  # and it did not create a DB
+
+
+def test_clean_logs_keeps_recent_orphans_and_deletes_old_ones(tmp_path, monkeypatch):
+    import os, time
+    from queuer import db
+
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    dbp = tmp_path / "state" / "queuer.db"
+    conn = db.connect(dbp)
+    db.init_db(conn)
+    conn.close()
+    new, old = log_dir / "5.log", log_dir / "6.log"
+    new.write_text("n")
+    old.write_text("o")
+    past = time.time() - 40 * 86400
+    os.utime(old, (past, past))
+    monkeypatch.setenv("QUEUER_LOG_DIR", str(log_dir))
+    monkeypatch.setenv("QUEUER_DB_PATH", str(dbp))
+    res = CliRunner().invoke(app, ["clean-logs", "--days", "30"])
+    assert res.exit_code == 0, res.output
+    assert new.exists() and not old.exists()
+
+
+# ---------------------------------------------------------------------------
+# round 3: qur logs streams and has -n; --before/--after help is honest
+# ---------------------------------------------------------------------------
+
+def _log(tmp_path, monkeypatch, text: str, job_id: int = 3):
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir(exist_ok=True)
+    (log_dir / f"{job_id}.log").write_bytes(text.encode())
+    monkeypatch.setenv("QUEUER_LOG_DIR", str(log_dir))
+
+
+def test_logs_never_reads_the_whole_file_into_memory(tmp_path, monkeypatch):
+    _log(tmp_path, monkeypatch, "one\ntwo\n")
+
+    def boom(*a, **k):
+        raise AssertionError("read_text loads the whole log")
+
+    monkeypatch.setattr(Path, "read_text", boom)
+    res = CliRunner().invoke(app, ["logs", "3"])
+    assert res.exit_code == 0, res.output
+    assert res.output == "one\ntwo\n"
+
+
+def test_logs_streams_a_log_bigger_than_one_chunk_intact(tmp_path, monkeypatch):
+    body = "".join(f"line {i} [{i}/9]\n" for i in range(20000))  # ~300 KB, several 64 KB chunks
+    _log(tmp_path, monkeypatch, body)
+    res = CliRunner().invoke(app, ["logs", "3"])
+    assert res.exit_code == 0 and res.output == body
+
+
+@pytest.mark.parametrize("text,n,expected", [
+    ("a\nb\nc\n", 2, "b\nc\n"),
+    ("a\nb\nc", 2, "b\nc"),            # last line has no newline
+    ("a\nb\nc\n", 1, "c\n"),
+    ("a\nb\nc\n", 99, "a\nb\nc\n"),   # fewer lines than asked: all of them
+    ("only", 3, "only"),
+    ("a\n\n", 1, "\n"),                 # the last line is empty
+])
+def test_logs_lines_prints_the_last_n_lines(tmp_path, monkeypatch, text, n, expected):
+    _log(tmp_path, monkeypatch, text)
+    res = CliRunner().invoke(app, ["logs", "3", "-n", str(n)])
+    assert res.exit_code == 0, res.output
+    assert res.output == expected
+
+
+def test_logs_lines_across_many_read_blocks(tmp_path, monkeypatch):
+    lines = [f"row {i}\n" for i in range(5000)]  # far more than one 8 KB block
+    _log(tmp_path, monkeypatch, "".join(lines))
+    res = CliRunner().invoke(app, ["logs", "3", "--lines", "5"])
+    assert res.output == "".join(lines[-5:])
+    res = CliRunner().invoke(app, ["logs", "3", "--lines", "3000"])
+    assert res.output == "".join(lines[-3000:])
+
+
+def test_logs_lines_keeps_brackets_and_rejects_zero(tmp_path, monkeypatch):
+    _log(tmp_path, monkeypatch, "x\n[red]y[/red] [/foo]\n")
+    res = CliRunner().invoke(app, ["logs", "3", "-n", "1"])
+    assert res.output == "[red]y[/red] [/foo]\n"
+    assert CliRunner().invoke(app, ["logs", "3", "-n", "0"]).exit_code != 0
+
+
+def test_before_after_help_says_position_only():
+    import typer.main
+    add = typer.main.get_command(app).commands["add"]
+    helps = {p.name: (p.help or "").lower() for p in add.params}
+    for name in ("before", "after"):
+        assert "position only" in helps[name] and "does not" in helps[name]
+    assert "keeps its memory" in helps["now"]

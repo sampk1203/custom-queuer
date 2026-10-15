@@ -149,7 +149,7 @@ def test_api_errors_never_contain_the_token(monkeypatch):
     def boom(req, timeout=0):
         raise urllib.error.URLError(f"cannot reach {req.full_url}")
 
-    monkeypatch.setattr(notify.urllib.request, "urlopen", boom)
+    monkeypatch.setattr(notify, "_open", boom)
     with pytest.raises(notify.NotifyError) as ei:
         notify._api(TOKEN, "getMe")
     assert TOKEN not in str(ei.value)
@@ -657,3 +657,126 @@ def test_commands_have_no_quote_soup_and_match_the_cli_display():
         for text in (notify.format_job(job, CFG), notify.format_details(job, CFG), notify._short_cmd(job)):
             assert "'\"'\"'" not in text and "&#x27;\"&#x27;" not in text
     assert notify._display_join(argvs[0]) == "python -c \"print('a'); print('b')\""
+
+
+# ---------------------------------------------------------------------------
+# config permissions (the file holds bot tokens)
+# ---------------------------------------------------------------------------
+
+def _cfg_file(tmp_path, mode):
+    d = tmp_path / "cfgdir"
+    d.mkdir(mode=0o700)
+    p = d / "notify.json"
+    p.write_text("{}")
+    os.chmod(p, mode)
+    return p
+
+
+def test_check_permissions_ok_and_missing(tmp_path):
+    assert notify.check_permissions(_cfg_file(tmp_path, 0o600)) is None
+    assert notify.check_permissions(tmp_path / "nope.json") is None
+
+
+def test_check_permissions_reports_loose_file_without_changing_it(tmp_path):
+    p = _cfg_file(tmp_path, 0o644)
+    assert "644" in notify.check_permissions(p)
+    assert stat.S_IMODE(p.stat().st_mode) == 0o644
+
+
+def test_check_permissions_fix_tightens_file_and_folder(tmp_path):
+    p = _cfg_file(tmp_path, 0o664)
+    os.chmod(p.parent, 0o755)
+    msg = notify.check_permissions(p, fix=True)
+    assert "tightened" in msg
+    assert stat.S_IMODE(p.stat().st_mode) == 0o600
+    assert stat.S_IMODE(p.parent.stat().st_mode) == 0o700
+
+
+def test_check_permissions_flags_symlink(tmp_path):
+    real = _cfg_file(tmp_path, 0o600)
+    link = tmp_path / "link.json"
+    link.symlink_to(real)
+    assert "symlink" in notify.check_permissions(link, fix=True)
+
+
+def test_pairing_marker_dir_is_private(tmp_path):
+    p = tmp_path / "new" / "notify.json"
+    with notify.pairing_lock(p):
+        assert stat.S_IMODE(p.parent.stat().st_mode) == 0o700
+
+
+# ---------------------------------------------------------------------------
+# round 3: no environment proxy for the bot token (S11), getUpdates wait
+# ---------------------------------------------------------------------------
+
+class _Resp:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        return b'{"ok": true, "result": {"username": "bot"}}'
+
+
+def test_default_opener_has_an_empty_proxy_table():
+    import urllib.request
+    proxies = [h for h in notify._NO_PROXY_OPENER.handlers if isinstance(h, urllib.request.ProxyHandler)]
+    assert len(proxies) == 1 and proxies[0].proxies == {}
+
+
+def test_api_ignores_environment_proxies_by_default(monkeypatch):
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:3128")
+    monkeypatch.setenv("ALL_PROXY", "http://proxy.invalid:3128")
+    monkeypatch.delenv("QUEUER_USE_PROXY", raising=False)
+    seen = []
+
+    class Opener:
+        def open(self, req, timeout=None):
+            seen.append(req.full_url)
+            return _Resp()
+
+    monkeypatch.setattr(notify, "_NO_PROXY_OPENER", Opener())
+    monkeypatch.setattr(notify.urllib.request, "urlopen", lambda *a, **k: pytest.fail("the proxy-honouring path was used"))
+    assert notify._api(TOKEN, "getMe") == {"username": "bot"}
+    assert len(seen) == 1
+
+
+@pytest.mark.parametrize("value", ["", "0"])
+def test_proxy_stays_off_for_empty_or_zero(monkeypatch, value):
+    monkeypatch.setenv("QUEUER_USE_PROXY", value)
+    seen = []
+
+    class Opener:
+        def open(self, req, timeout=None):
+            seen.append(1)
+            return _Resp()
+
+    monkeypatch.setattr(notify, "_NO_PROXY_OPENER", Opener())
+    monkeypatch.setattr(notify.urllib.request, "urlopen", lambda *a, **k: pytest.fail("proxy path used"))
+    notify._api(TOKEN, "getMe")
+    assert seen == [1]
+
+
+def test_proxy_is_used_only_when_asked_for(monkeypatch):
+    monkeypatch.setenv("QUEUER_USE_PROXY", "1")
+    seen = []
+
+    class Opener:
+        def open(self, req, timeout=None):
+            pytest.fail("the no-proxy opener was used")
+
+    monkeypatch.setattr(notify, "_NO_PROXY_OPENER", Opener())
+    monkeypatch.setattr(notify.urllib.request, "urlopen", lambda req, timeout=None: seen.append(timeout) or _Resp())
+    assert notify._api(TOKEN, "getMe", timeout=7) == {"username": "bot"}
+    assert seen == [7]
+
+
+def test_get_updates_wait_defaults_to_a_long_poll_and_can_be_zero(monkeypatch):
+    seen = []
+    monkeypatch.setattr(notify, "_api", lambda token, method, params=None, timeout=0: seen.append((params, timeout)) or [])
+    notify.get_updates(CFG, 5)
+    notify.get_updates(CFG, None, 0)
+    assert seen[0][0]["timeout"] == notify.POLL_SECS and seen[0][0]["offset"] == 5
+    assert seen[1][0]["timeout"] == 0 and "offset" not in seen[1][0] and seen[1][1] == 10

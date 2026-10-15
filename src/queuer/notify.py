@@ -45,6 +45,7 @@ import re
 import secrets
 import shlex
 import socket
+import stat
 import tempfile
 import time
 import urllib.error
@@ -171,6 +172,39 @@ def save(cfg: dict[str, Any], path: Path | None = None) -> None:
         except OSError:
             pass
         raise
+
+
+def check_permissions(path: Path | None = None, fix: bool = False) -> str | None:
+    """Problem with the config file's (or its folder's) permissions, as a
+    sentence, or None if it is fine or missing. The file holds bot tokens: it
+    must be a regular file owned by us with no group/other access. With `fix`,
+    a loose mode on something we own is tightened (0600 file, 0700 folder);
+    a symlink or a file owned by someone else is only reported."""
+    path = path or default_path()
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    if stat.S_ISLNK(st.st_mode):
+        return f"{path} is a symlink; the bot token could be read from elsewhere"
+    if st.st_uid != os.getuid():
+        return f"{path} is owned by another user"
+    problems = []
+    if st.st_mode & 0o077:
+        problems.append(f"{path} is mode {st.st_mode & 0o777:o} (other users can read the bot token)")
+        if fix:
+            os.chmod(path, 0o600)
+            problems = [f"{path} was mode {st.st_mode & 0o777:o}; tightened to 600"]
+    try:
+        dst = os.lstat(path.parent)
+        if stat.S_ISDIR(dst.st_mode) and dst.st_uid == os.getuid() and dst.st_mode & 0o077:
+            problems.append(f"{path.parent} is mode {dst.st_mode & 0o777:o}")
+            if fix:
+                os.chmod(path.parent, 0o700)
+                problems[-1] += "; tightened to 700"
+    except OSError:
+        pass
+    return "; ".join(problems) or None
 
 
 def remove(path: Path | None = None) -> bool:
@@ -323,6 +357,39 @@ def parse_export_string(s: str) -> tuple[str, list[int]]:
 # ---------------------------------------------------------------------------
 
 
+# urllib reads HTTPS_PROXY / ALL_PROXY / ... from the environment. The bot token is
+# part of the request URL, so by default it must never be handed to a proxy.
+class _NoProxyHandler(urllib.request.ProxyHandler):
+    """A ProxyHandler with an empty proxy table that stays registered on the opener.
+
+    OpenerDirector.add_handler silently drops a handler that defines no
+    `<protocol>_open/_request/_response` method, and ProxyHandler({}) defines none (it
+    creates `<scheme>_open` methods only for the proxies it is given). A plain
+    ProxyHandler({}) is therefore discarded, leaving the opener to behave correctly only
+    by accident. The no-op request pre-processors below make it a real, inspectable
+    member of the handler chain; they do not alter the request."""
+
+    def __init__(self) -> None:
+        super().__init__({})
+
+    def http_request(self, req: urllib.request.Request) -> urllib.request.Request:
+        return req
+
+    https_request = http_request
+
+
+_NO_PROXY_OPENER = urllib.request.build_opener(_NoProxyHandler())
+
+
+def _open(req: urllib.request.Request, timeout: float) -> Any:
+    """Open `req` with NO environment proxy, unless QUEUER_USE_PROXY is set (to
+    anything but empty or 0) -- for a network that only reaches Telegram through one."""
+    if os.environ.get("QUEUER_USE_PROXY", "") not in ("", "0"):
+        # nosec B310: `req` is always the https://api.telegram.org URL built in _api()
+        return urllib.request.urlopen(req, timeout=timeout)  # nosec B310
+    return _NO_PROXY_OPENER.open(req, timeout=timeout)
+
+
 def _api(token: str, method: str, params: dict[str, Any] | None = None, timeout: float = SEND_TIMEOUT_SECS) -> Any:
     """Call a Bot API method, return its `result`. Raises NotifyError.
 
@@ -335,7 +402,7 @@ def _api(token: str, method: str, params: dict[str, Any] | None = None, timeout:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _open(req, timeout) as resp:
             body = json.loads(resp.read())
     except urllib.error.HTTPError as e:
         try:
@@ -457,7 +524,7 @@ def pairing_lock(path: Path | None = None) -> Iterator[None]:
     """Hold while `pair` runs. Only one getUpdates consumer per bot token is
     allowed, so a daemon that is polling for button presses must step aside."""
     marker = _pairing_marker(path)
-    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     marker.touch()
     try:
         yield
@@ -546,13 +613,14 @@ def parse_callback(data: Any) -> tuple[str, str, int] | None:
     return parts[0], parts[1], int(parts[2])
 
 
-def get_updates(cfg: dict[str, Any], offset: int | None) -> list[dict[str, Any]]:
-    """One long-poll for button presses (inline buttons and menu keys).
-    Raises NotifyError (409 = another process is polling this bot)."""
-    params: dict[str, Any] = {"timeout": POLL_SECS, "allowed_updates": ["callback_query", "message"]}
+def get_updates(cfg: dict[str, Any], offset: int | None, wait: int = POLL_SECS) -> list[dict[str, Any]]:
+    """One long-poll (`wait` seconds; 0 = return at once) for button presses
+    (inline buttons and menu keys). Raises NotifyError (409 = another process
+    is polling this bot)."""
+    params: dict[str, Any] = {"timeout": wait, "allowed_updates": ["callback_query", "message"]}
     if offset is not None:
         params["offset"] = offset
-    return _api(cfg["token"], "getUpdates", params, timeout=POLL_SECS + 10) or []
+    return _api(cfg["token"], "getUpdates", params, timeout=wait + 10) or []
 
 
 def answer_callback(cfg: dict[str, Any], callback_id: str, text: str) -> None:

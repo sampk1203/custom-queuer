@@ -82,10 +82,18 @@ async def daemon(tmp_path):
 
     yield d
 
-    for proc in list(d._current_proc.values()):
+    procs = list(d._current_proc.values())
+    for proc in procs:
         try:
             os.killpg(proc.pid, signal.SIGKILL)
         except ProcessLookupError:
+            pass
+    # Reap the killed children while the loop is still open, so their transports are
+    # closed here rather than garbage-collected after the loop is gone.
+    for proc in procs:
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except (asyncio.TimeoutError, ProcessLookupError):
             pass
 
     task.cancel()
@@ -1982,7 +1990,11 @@ async def _raw(socket_path, payload: bytes) -> bytes:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("payload", [b"\xff\xfe\n", b"x" * 200_000 + b"\n", b"not json\n"])
+@pytest.mark.parametrize(
+    "payload",
+    [b"\xff\xfe\n", b"x" * 200_000 + b"\n", b"not json\n"],
+    ids=["invalid-utf8", "oversized-line", "not-json"],
+)
 async def test_bad_request_gets_error_reply_not_a_crash(daemon, payload, capsys):
     data = await _raw(daemon.socket_path, payload)
     resp = json.loads(data)
@@ -2203,8 +2215,10 @@ async def test_add_rejects_bad_field_types_and_daemon_survives(daemon, bad):
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(not os.path.exists("/dev/full"), reason="needs /dev/full")
-async def test_unwritable_log_does_not_kill_job_or_daemon(daemon, capsys):
-    (daemon.log_dir / "1.log").symlink_to("/dev/full")  # every write fails with ENOSPC
+async def test_unwritable_log_does_not_kill_job_or_daemon(daemon, capsys, monkeypatch):
+    real_open = os.open
+    # make the log's fd point at /dev/full: every write fails with ENOSPC
+    monkeypatch.setattr(os, "open", lambda p, *a, **k: real_open("/dev/full", os.O_WRONLY) if str(p).endswith("1.log") else real_open(p, *a, **k))
     resp = await send(daemon.socket_path, "add", argv=["echo", "x"], cwd=CWD)
     job = await wait_for_status(daemon.socket_path, resp["data"]["id"], {"done", "failed"})
     assert job["status"] == "done" and job["exit_code"] == 0
@@ -2229,3 +2243,267 @@ def test_peer_check_reads_uid_as_unsigned(daemon):
     assert daemon._peer_is_me(Writer()) is True
     daemon._uid = 1000
     assert daemon._peer_is_me(Writer()) is False
+
+
+
+# ---- audit round: a bad request must never stall a channel or kill the daemon ----
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("extra", [
+    {"virtual_env": 5}, {"python_path": ["a"]}, {"path": 7}, {"raw_argv": [1, 2]},
+    {"virtual_env": "a\0b"}, {"cwd": "/nonexistent-dir-xyz"}, {"argv": ["echo", "a\0b"]},
+])
+async def test_add_rejects_bad_fields_and_channel_keeps_working(daemon, extra):
+    args = {"argv": ["echo", "hi"], "cwd": CWD, "channel": 7, **extra}
+    resp = await send(daemon.socket_path, "add", **args)
+    assert resp["ok"] is False
+    ok = await send(daemon.socket_path, "add", argv=["echo", "fine"], cwd=CWD, channel=7)
+    job = await wait_for_status(daemon.socket_path, ok["data"]["id"], {"done", "failed"})
+    assert job["status"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_runner_crash_fails_the_job_and_worker_survives(daemon, monkeypatch, capsys):
+    real = daemon._run_job
+    calls = {"n": 0}
+
+    async def boom(channel, job):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise TypeError("simulated")
+        await real(channel, job)
+
+    monkeypatch.setattr(daemon, "_run_job", boom)
+    a = await send(daemon.socket_path, "add", argv=["echo", "a"], cwd=CWD, channel=5)
+    j1 = await wait_for_status(daemon.socket_path, a["data"]["id"], {"done", "failed"})
+    assert j1["status"] == "failed" and "internal error" in j1["note"]
+    b = await send(daemon.socket_path, "add", argv=["echo", "b"], cwd=CWD, channel=5)
+    j2 = await wait_for_status(daemon.socket_path, b["data"]["id"], {"done", "failed"})
+    assert j2["status"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_dead_worker_is_respawned_on_next_add(daemon):
+    daemon._ensure_channel_worker(6)
+    task = daemon._worker_tasks[6]
+    task.cancel()
+    await asyncio.sleep(0.05)
+    r = await send(daemon.socket_path, "add", argv=["echo", "x"], cwd=CWD, channel=6)
+    job = await wait_for_status(daemon.socket_path, r["data"]["id"], {"done", "failed"})
+    assert job["status"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_timeout_does_not_count_time_frozen_by_now(daemon):
+    slow = await send(daemon.socket_path, "add", argv=["sleep", "1.5"], cwd=CWD, channel=9, timeout_secs=2)
+    await asyncio.sleep(0.4)
+    await send(daemon.socket_path, "add", argv=["sleep", "2.5"], cwd=CWD, channel=9, now=True)
+    job = await wait_for_status(daemon.socket_path, slow["data"]["id"], {"done", "failed"}, timeout=15)
+    # ran ~1.5s in total (+2.5s frozen): wall clock would have killed it at 2s
+    assert job["status"] == "done"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cmd,args", [
+    ("cancel", {"id": "x"}), ("cancel", {"channel": "x"}), ("show", {"id": "1"}), ("rm", {"id": None}),
+    ("requeue", {"id": True}), ("pause", {"channel": "x"}), ("resume", {"channel": -1}), ("clear", {"channel": "x"}),
+])
+async def test_handlers_reject_wrong_types_cleanly(daemon, cmd, args):
+    resp = await send(daemon.socket_path, cmd, **args)
+    assert resp["ok"] is False
+    assert "internal error" not in resp["error"]
+
+
+@pytest.mark.asyncio
+async def test_non_object_args_and_private_names_are_rejected(daemon):
+    r, w = await asyncio.open_unix_connection(str(daemon.socket_path))
+    w.write(b'{"cmd": "add", "args": [1]}\n'); await w.drain()
+    assert json.loads(await r.readline())["ok"] is False
+    w.close()
+    r, w = await asyncio.open_unix_connection(str(daemon.socket_path))
+    w.write(b'{"cmd": "_x"}\n'); await w.drain()
+    assert json.loads(await r.readline())["ok"] is False
+    w.close()
+
+
+@pytest.mark.asyncio
+async def test_silent_client_is_dropped(daemon, monkeypatch):
+    from queuer import daemon as daemon_mod
+    monkeypatch.setattr(daemon_mod, "CLIENT_READ_TIMEOUT_SECS", 0.3)
+    r, w = await asyncio.open_unix_connection(str(daemon.socket_path))
+    assert await asyncio.wait_for(r.read(), timeout=3) == b""  # server closed it
+    w.close()
+    assert (await send(daemon.socket_path, "status"))["ok"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not os.path.exists("/dev/full"), reason="needs a symlink-capable fs")
+async def test_log_symlink_is_not_followed(daemon, tmp_path, capsys):
+    victim = tmp_path / "victim.txt"
+    victim.write_text("keep")
+    (daemon.log_dir / "1.log").symlink_to(victim)
+    r = await send(daemon.socket_path, "add", argv=["echo", "x"], cwd=CWD)
+    job = await wait_for_status(daemon.socket_path, r["data"]["id"], {"done", "failed"})
+    assert job["status"] == "done"
+    assert victim.read_text() == "keep"
+
+
+def test_telegram_offset_is_persisted(daemon):
+    from queuer import db as dbm
+    dbm.set_state(daemon.conn, "tg_offset:123456789", "42")
+    assert dbm.get_state(daemon.conn, "tg_offset:123456789") == "42"
+    assert dbm.get_state(daemon.conn, "nope") is None
+
+
+# ---------------------------------------------------------------------------
+# round 3: idle wake-ups (B11), stale presses and double taps (B6), client cap (S7)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_idle_worker_is_woken_by_add_and_resume_not_by_polling(tmp_path, monkeypatch):
+    from queuer import daemon as daemon_mod
+    monkeypatch.setattr(daemon_mod, "IDLE_POLL_SECS", 3600)  # a poll could never explain a pickup
+    d = Daemon(db_path=tmp_path / "queuer.db", socket_path=tmp_path / "queuer.sock", log_dir=tmp_path / "logs")
+    task = asyncio.create_task(d.serve())
+    try:
+        for _ in range(100):
+            if d.socket_path.exists():
+                break
+            await asyncio.sleep(0.02)
+        await asyncio.sleep(0.2)  # the worker is now idle in its long wait
+
+        first = (await send(d.socket_path, "add", argv=["echo", "hi"], cwd=CWD))["data"]["id"]
+        assert (await wait_for_status(d.socket_path, first, {"done", "failed"}))["status"] == "done"
+
+        await send(d.socket_path, "pause")
+        second = (await send(d.socket_path, "add", argv=["echo", "hi"], cwd=CWD))["data"]["id"]
+        await asyncio.sleep(0.2)
+        assert (await send(d.socket_path, "show", id=second))["data"]["status"] == "queued"
+        await send(d.socket_path, "resume")
+        assert (await wait_for_status(d.socket_path, second, {"done", "failed"}))["status"] == "done"
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+def test_idle_poll_is_a_slow_safety_net():
+    from queuer import daemon as daemon_mod
+    assert daemon_mod.IDLE_POLL_SECS >= 10
+
+
+class RecordingBot(FakeBot):
+    """FakeBot that also remembers the params of every getUpdates call."""
+
+    def __init__(self, batches=()):
+        super().__init__(batches)
+        self.poll_params: list[dict] = []
+
+    def api(self, token, method, params=None, timeout=0):
+        if method == "getUpdates":
+            self.poll_params.append(params)
+        return super().api(token, method, params, timeout)
+
+
+def _from_chat(press: dict, user_id: int = 111) -> dict:
+    press["callback_query"]["from"] = {"id": user_id}
+    return press
+
+
+def _requeue_children(daemon, job_id: int) -> int:
+    row = daemon.conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE parent_id = ? AND origin = 'requeue'", (job_id,)
+    ).fetchone()
+    return row[0]
+
+
+@pytest.mark.asyncio
+async def test_presses_that_piled_up_while_offline_are_dropped_not_run(daemon, monkeypatch):
+    job_id = await _finished_job(daemon)
+    db_module.set_state(daemon.conn, f"tg_alive:{notify.bot_id(TG_TOKEN)}", str(int(time.time()) - 3600))
+    stale = _from_chat(_press(5, job_id))
+    fresh = _press(6, job_id)
+    # batch 1 = what waited while we were off, batch 2 = backlog gone, batch 3 = a real press
+    bot = RecordingBot([[stale], [], [fresh]])
+    monkeypatch.setattr(notify, "_api", bot.api)
+    _tg_cfg(daemon)
+    await wait_calls(bot, "editMessageReplyMarkup", 1)
+
+    assert [p["timeout"] for p in bot.poll_params[:3]] == [0, 0, notify.POLL_SECS]  # drained without waiting, then normal
+    assert _requeue_children(daemon, job_id) == 1  # only the fresh press ran
+    texts = [a["text"] for a in bot.of("answerCallbackQuery")]
+    assert any("offline" in t for t in texts)  # the stale press was told to press again
+    assert any(t.startswith("requeued as job") for t in texts)
+
+
+@pytest.mark.asyncio
+async def test_short_outage_keeps_presses(daemon, monkeypatch):
+    job_id = await _finished_job(daemon)
+    db_module.set_state(daemon.conn, f"tg_alive:{notify.bot_id(TG_TOKEN)}", str(int(time.time()) - 10))
+    bot = RecordingBot([[_press(5, job_id)]])
+    monkeypatch.setattr(notify, "_api", bot.api)
+    _tg_cfg(daemon)
+    await wait_calls(bot, "editMessageReplyMarkup", 1)
+    assert bot.poll_params[0]["timeout"] == notify.POLL_SECS
+    assert _requeue_children(daemon, job_id) == 1
+
+
+@pytest.mark.asyncio
+async def test_first_start_polls_normally_and_records_being_alive(daemon, monkeypatch):
+    bot = RecordingBot()
+    monkeypatch.setattr(notify, "_api", bot.api)
+    _tg_cfg(daemon)
+    for _ in range(100):
+        if bot.polls >= 1:
+            break
+        await asyncio.sleep(0.05)
+    assert bot.poll_params[0]["timeout"] == notify.POLL_SECS  # no stamp yet: nothing is dropped
+    key = f"tg_alive:{notify.bot_id(TG_TOKEN)}"
+    await _wait(lambda: db_module.get_state(daemon.conn, key) is not None)
+    assert abs(int(db_module.get_state(daemon.conn, key)) - time.time()) < 30
+
+
+@pytest.mark.asyncio
+async def test_double_tap_requeues_once(daemon, monkeypatch):
+    job_id = await _finished_job(daemon)
+    # two taps = two callback ids on the same old keyboard
+    bot = FakeBot([[_press(1, job_id), _press(2, job_id)]])
+    monkeypatch.setattr(notify, "_api", bot.api)
+    _tg_cfg(daemon)
+    await wait_calls(bot, "answerCallbackQuery", 2)
+    texts = [a["text"] for a in bot.of("answerCallbackQuery")]
+    assert texts[0].startswith("requeued as job")
+    assert texts[1].startswith("already requeued as job")
+    assert _requeue_children(daemon, job_id) == 1
+    assert len(bot.of("editMessageReplyMarkup")) == 1
+
+
+@pytest.mark.asyncio
+async def test_requeue_guard_is_only_a_short_window_and_never_blocks_the_cli(daemon, monkeypatch):
+    from queuer import daemon as daemon_mod
+    monkeypatch.setattr(daemon_mod, "REQUEUE_GUARD_SECS", 0)  # window closed
+    job_id = await _finished_job(daemon)
+    bot = FakeBot([[_press(1, job_id)], [_press(2, job_id)]])
+    monkeypatch.setattr(notify, "_api", bot.api)
+    _tg_cfg(daemon)
+    await wait_calls(bot, "answerCallbackQuery", 2)
+    assert _requeue_children(daemon, job_id) == 2
+
+    # `qur requeue` has no guard at all
+    r1 = await send(daemon.socket_path, "requeue", id=job_id)
+    r2 = await send(daemon.socket_path, "requeue", id=job_id)
+    assert r1["ok"] and r2["ok"] and r1["data"]["id"] != r2["data"]["id"]
+
+
+@pytest.mark.asyncio
+async def test_too_many_connections_get_a_clean_error_and_the_count_recovers(daemon, monkeypatch):
+    from queuer import daemon as daemon_mod
+    monkeypatch.setattr(daemon_mod, "MAX_CLIENTS", 0)
+    resp = await send(daemon.socket_path, "status")
+    assert resp["ok"] is False and "too many connections" in resp["error"]
+    monkeypatch.setattr(daemon_mod, "MAX_CLIENTS", 32)
+    assert (await send(daemon.socket_path, "status"))["ok"]
+    await asyncio.sleep(0.1)
+    assert daemon._clients == 0  # every finished connection gave its slot back

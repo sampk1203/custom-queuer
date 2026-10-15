@@ -8,15 +8,16 @@ import shlex
 import shutil
 import socket
 import stat
-import subprocess
+import subprocess  # nosec B404 - only used for the fixed `ssh --` call below
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, NoReturn, Optional
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 from queuer import client, db, notify
@@ -180,7 +181,7 @@ def _call(cmd: str, **kwargs: Any) -> Any:
         return client.send(cmd, **kwargs)
     except (client.DaemonNotRunning, client.DaemonError) as e:
         typer.echo(f"Error: {e}", err=True)
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from None
 
 
 def _display_quote(word: str) -> str:
@@ -274,7 +275,7 @@ def _fmt_elapsed(ts: str | None) -> str:
 def _help_all(ctx: typer.Context, value: bool) -> None:
     if not value or ctx.resilient_parsing:
         return
-    group = typer.main.get_command(app)
+    group = typer.main.get_group(app)
     prog = ctx.find_root().info_name or "qur"
     for name in group.commands:
         console.rule(f"[bold]{prog} {name}[/bold]")
@@ -306,8 +307,17 @@ def add(
         DEFAULT_CHANNEL, "--channel", help="Channel to queue on. Jobs on one channel run one at a "
         "time; different channels run in parallel."
     ),
-    before: Optional[int] = typer.Option(None, "--before", help="Insert before this queued job ID (same channel)"),
-    after: Optional[int] = typer.Option(None, "--after", help="Insert after this queued job ID (same channel)"),
+    before: Optional[int] = typer.Option(
+        None, "--before",
+        help="Queue position only: insert before this still-queued job ID (same channel). "
+        "It does NOT make this job wait for that one to finish or succeed.",
+    ),
+    after: Optional[int] = typer.Option(
+        None, "--after",
+        help="Queue position only: insert right after this still-queued job ID (same channel). "
+        "It does NOT make this job wait for that one to finish or succeed; "
+        "if that job already started, the add is rejected.",
+    ),
     timeout: Optional[int] = typer.Option(
         None, "--timeout", help="Kill the job if it runs longer than this many seconds (counts as a failure)"
     ),
@@ -320,6 +330,7 @@ def add(
         False, "--now",
         help="Jump the channel's queue: freeze (SIGSTOP) the running job and run this first. "
         "More --now jobs run FIFO behind it, then the frozen job resumes (SIGCONT). "
+        "While frozen it stays alive and keeps its memory, so two jobs of one channel can exist at once. "
         "Cannot be combined with --before/--after.",
     ),
 ) -> None:
@@ -618,7 +629,7 @@ def show(
             failed = True
         except client.DaemonNotRunning as e:
             typer.echo(f"Error: {e}", err=True)
-            raise typer.Exit(code=1)
+            raise typer.Exit(code=1) from None
 
     if as_json:
         if jobs:
@@ -765,7 +776,7 @@ def resume(
 # connect (Telegram notifications)
 # ---------------------------------------------------------------------------
 
-def _fail(msg: str) -> None:
+def _fail(msg: str) -> NoReturn:
     typer.echo(f"Error: {msg}", err=True)
     raise typer.Exit(code=1)
 
@@ -788,7 +799,7 @@ def _fetch_export_over_ssh(target: str) -> str:
     remote = 'PATH="$HOME/.local/bin:$PATH" qur connect --export'
     typer.echo(f"Asking {target} over ssh...", err=True)
     try:
-        res = subprocess.run(["ssh", "--", target, remote], stdout=subprocess.PIPE, text=True, timeout=120)
+        res = subprocess.run(["ssh", "--", target, remote], stdout=subprocess.PIPE, text=True, timeout=120)  # nosec B603 B607 - fixed argv, `--` guards target
     except FileNotFoundError:
         _fail("ssh is not installed on this machine")
     except subprocess.TimeoutExpired:
@@ -949,11 +960,11 @@ def connect(
 
     # --id / --listen alone: change this machine's setup, no pairing
     if import_ is None and not add_bot and existing is not None and (id_ is not None or listen is not None):
-        cfg = {"qur_id": id_ or existing["qur_id"], "bots": [dict(b) for b in existing["bots"]]}
+        cfg: dict[str, Any] = {"qur_id": id_ or existing["qur_id"], "bots": [dict(b) for b in existing["bots"]]}
         if listen is not None:
-            targets = {b["token"] for b in _bots_for(existing, bot)}
+            listen_tokens = {b["token"] for b in _bots_for(existing, bot)}
             for b in cfg["bots"]:
-                if b["token"] in targets:
+                if b["token"] in listen_tokens:
                     b["listen"] = listen
         notify.save(cfg)
         console.print(_connected_line(notify.load() or cfg, "Updated."))
@@ -975,6 +986,9 @@ def connect(
         table.add_section()
         table.add_row("config", str(notify.default_path()))
         console.print(table)
+        problem = notify.check_permissions(fix=False)
+        if problem:
+            console.print("[yellow]Warning:[/yellow] " + escape(f"{problem}. Fix: chmod 600 {notify.default_path()}"))
         console.print("[dim]Other machines are not listed: each qur only knows itself. Run this on each.[/dim]")
         return
 
@@ -1010,7 +1024,7 @@ def connect(
             return
         if bot is not None:
             gone = _bots_for(existing, bot)
-            rest = existing
+            rest: dict[str, Any] | None = existing
             for b in gone:
                 rest = notify.without_bot(rest, b["token"]) if rest else None
             if rest is not None:
@@ -1048,10 +1062,10 @@ def connect(
                 names[token] = notify.check_token(token)
             except notify.NotifyError as e:
                 _fail(f"bot token rejected by Telegram: {e}")
-        cfg = existing
+        merged: dict[str, Any] | None = existing
         imported: list[str] = []
         for token, chat_ids in items:
-            old = next((b for b in cfg["bots"] if b["token"] == token), None) if cfg else None
+            old = next((b for b in merged["bots"] if b["token"] == token), None) if merged else None
             if old is not None:
                 # already connected: keep its settings, add any chats we lack
                 entry = {**old, "chat_ids": old["chat_ids"] + [c for c in chat_ids if c not in old["chat_ids"]]}
@@ -1063,14 +1077,15 @@ def connect(
                 entry = {"token": token, "chat_ids": chat_ids, "listen": bool(listen)}
             if names.get(token):
                 entry["username"] = names[token]
-            cfg = notify.with_bot(cfg, entry, id_)
+            merged = notify.with_bot(merged, entry, id_)
             imported.append(token)
-        assert cfg is not None
-        notify.save(cfg)
-        for bcfg in notify.bot_cfgs(cfg):
+        if merged is None:  # items is never empty, so with_bot ran at least once
+            _fail("nothing to import")
+        notify.save(merged)
+        for bcfg in notify.bot_cfgs(merged):
             if bcfg["token"] in imported:
                 _warn_hello(bcfg)
-        console.print(_connected_line(cfg, "Connected."))
+        console.print(_connected_line(merged, "Connected."))
         return
 
     # pair a phone/account with a bot
@@ -1130,28 +1145,74 @@ def connect(
 # logs
 # ---------------------------------------------------------------------------
 
+def _tail_offset(f: Any, n: int) -> int:
+    """Byte offset where the last `n` lines of the open binary file `f` begin
+    (0 if it has fewer). Reads backwards in blocks, never the whole file."""
+    end = f.seek(0, os.SEEK_END)
+    if end == 0:
+        return 0
+    f.seek(end - 1)
+    need = n + 1 if f.read(1) == b"\n" else n  # newlines to pass; the last line's own ending is not a boundary
+    pos = end
+    while pos > 0:
+        step = min(8192, pos)
+        pos -= step
+        f.seek(pos)
+        block = f.read(step)
+        idx = len(block)
+        while True:
+            idx = block.rfind(b"\n", 0, idx)
+            if idx == -1:
+                break
+            need -= 1
+            if need == 0:
+                return pos + idx + 1
+    return 0
+
+
 @app.command()
 def logs(
     job_id: int = typer.Argument(..., help="Job ID"),
     tail: bool = typer.Option(False, "--tail", help="Follow the log as it grows (Ctrl-C to stop)"),
+    lines: Optional[int] = typer.Option(
+        None, "--lines", "-n", min=1,
+        help="Print only the last N lines (with --tail: show them first, then follow)",
+    ),
 ) -> None:
     """Print a job's log (stdout and stderr combined).
 
     Reads the log file straight from disk, so it works even if the daemon isn't
-    running. Each retry of a job is a separate job with its own log.
+    running. Each retry of a job is a separate job with its own log. A big log is
+    streamed, never loaded whole.
 
     \b
     Examples:
       qur logs 12
+      qur logs 12 -n 50
       qur logs 12 --tail
+      qur logs 12 -n 20 --tail
     """
     log_path = _default_log_dir() / f"{job_id}.log"
     if not log_path.exists():
         typer.echo(f"Error: no log found for job {job_id} at {log_path}", err=True)
         raise typer.Exit(code=1)
 
+    # raw output, no Rich: it would eat [brackets]
+    if lines is not None:
+        with open(log_path, "rb") as fb:
+            fb.seek(_tail_offset(fb, lines))
+            data = fb.read()
+        sys.stdout.write(data.decode(errors="replace").replace("\r\n", "\n").replace("\r", "\n"))
+        sys.stdout.flush()
+    elif not tail:
+        with open(log_path, "r", errors="replace") as f:  # text mode: \r\n and \r read as \n
+            while True:
+                chunk = f.read(65536)
+                if not chunk:
+                    break
+                sys.stdout.write(chunk)
+        sys.stdout.flush()
     if not tail:
-        console.print(log_path.read_text(errors="replace"), end="")
         return
 
     with open(log_path, "r", errors="replace") as f:
@@ -1160,7 +1221,8 @@ def logs(
             while True:
                 line = f.readline()
                 if line:
-                    console.print(line, end="")
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
                 else:
                     time.sleep(0.5)
         except KeyboardInterrupt:
@@ -1189,7 +1251,12 @@ def clean_logs(
         console.print("[dim](no log directory)[/dim]")
         return
 
-    conn = db.connect(_default_db_path())
+    db_file = _default_db_path()
+    if not db_file.is_file():
+        # db.connect() would create an empty database, and every log would then look
+        # orphaned. Never delete anything on that basis.
+        _fail(f"no job database at {db_file}; refusing to clean logs (is QUEUER_DB_PATH the same as the daemon's?)")
+    conn = db.connect(db_file)
     cutoff = time.time() - days * 86400
     to_delete: list[Path] = []
 
@@ -1201,7 +1268,12 @@ def clean_logs(
 
         job = db.get_job(conn, job_id)
         if job is None:
-            to_delete.append(log_file)  # orphaned -- no matching row
+            # orphaned (its row was pruned): only when it is also old, by file time
+            try:
+                if log_file.stat().st_mtime < cutoff:
+                    to_delete.append(log_file)
+            except OSError:
+                pass
             continue
         if job["status"] not in ("done", "failed", "cancelled"):
             continue  # queued/running/stopped -- never touch

@@ -26,6 +26,7 @@ import sqlite3
 import stat
 import struct
 import sys
+import time
 import traceback
 from pathlib import Path
 from typing import Any
@@ -37,7 +38,13 @@ MAX_LOG_BYTES = 50 * 1024 * 1024  # 50MB per-job log cap
 DEFAULT_GRACE_SECS = 5
 LISTEN_IDLE_SECS = 5  # recheck config when Telegram listening is off
 LISTEN_GAP_SECS = 0.1  # pause between polls
+CLIENT_READ_TIMEOUT_SECS = 10  # a client must send its request line within this
 LISTEN_RETRY_SECS = 30  # back off after a failed poll (offline, 409, ...)
+IDLE_POLL_SECS = 30  # idle worker safety-net recheck; every real change wakes the worker at once
+MAX_CLIENTS = 32  # socket connections served at the same time; more get "too many connections"
+TG_STALE_SECS = 300  # offline longer than this -> button presses that piled up meanwhile are dropped
+TG_ALIVE_SAVE_SECS = 60  # how often "the bot was polled fine just now" is written to the DB
+REQUEUE_GUARD_SECS = 30  # a second Telegram Requeue of the same job within this is a double tap
 
 
 def _default_db_path() -> Path:
@@ -56,7 +63,7 @@ def _default_socket_path() -> Path:
 def _fallback_socket_dir() -> Path:
     """Per-user dir used when XDG_RUNTIME_DIR is unset (cron, sudo, ...). Never
     a bare /tmp: another user could pre-create the socket path there."""
-    return Path("/tmp") / f"queuer-{os.getuid()}"
+    return Path("/tmp") / f"queuer-{os.getuid()}"  # nosec B108 - uid-scoped, ownership/mode/symlink checked by the caller
 
 
 def _ensure_private_dir(path: Path) -> None:
@@ -138,6 +145,10 @@ class Daemon:
         # in-flight notification sends (kept so they aren't garbage-collected)
         self._notify_tasks: set[asyncio.Task] = set()
         self._tg_offsets: dict[str, int] = {}  # bot token -> next getUpdates offset
+        self._tg_alive: dict[str, float] = {}  # bot token -> time of its last good poll
+        self._tg_alive_saved: dict[str, float] = {}  # bot token -> when that was last written to the DB
+        self._clients = 0  # socket connections being served right now
+        self._seen_callbacks: list[str] = []
 
         # `--now` priority lane: at most one job can be frozen per channel
         # at a time (a frozen normal job, held here with its own proc
@@ -174,7 +185,8 @@ class Daemon:
 
     def _ensure_channel_worker(self, channel: int) -> None:
         """Lazily spawn a channel's worker loop if it isn't running yet."""
-        if channel in self._worker_tasks:
+        task = self._worker_tasks.get(channel)
+        if task is not None and not task.done():
             return
         self._wake[channel] = asyncio.Event()
         self._worker_tasks[channel] = asyncio.create_task(self.worker_loop(channel))
@@ -189,12 +201,12 @@ class Daemon:
             if not db.get_paused(self.conn, channel):
                 queue = db.get_queue(self.conn, channel)
                 if queue:
-                    await self._run_job(channel, queue[0])
+                    await self._run_job_safely(channel, queue[0])
                     continue
-            # idle: wait for something to wake us (new job, resume, etc.),
-            # but also poll periodically as a safety net
+            # idle: wait for something to wake us (new job, resume, retry, ...),
+            # with a slow periodic recheck as a safety net
             try:
-                await asyncio.wait_for(wake.wait(), timeout=1.0)
+                await asyncio.wait_for(wake.wait(), timeout=IDLE_POLL_SECS)
             except asyncio.TimeoutError:
                 pass
 
@@ -220,7 +232,7 @@ class Daemon:
             queue = db.get_queue(self.conn, channel, is_priority=True)
             if not queue:
                 break
-            await self._run_job(channel, queue[0])
+            await self._run_job_safely(channel, queue[0])
         if channel in self._frozen:
             await self._resume_frozen(channel)
 
@@ -263,6 +275,27 @@ class Daemon:
         self._current_proc[channel] = proc
         self._current_job_id[channel] = job_id
 
+    async def _run_job_safely(self, channel: int, job: dict[str, Any]) -> None:
+        """Run one job; whatever goes wrong, the job is marked failed and the
+        channel's worker keeps going (one bad job must never stall a channel or
+        take the daemon down)."""
+        assert self.conn is not None
+        try:
+            await self._run_job(channel, job)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[queuerd] job {job['id']} crashed the runner: {type(e).__name__}: {e}", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+            try:
+                current = db.get_job(self.conn, job["id"])
+                if current is not None and current["status"] in ("queued", "running", "stopped"):
+                    db.mark_finished(self.conn, job["id"], status="failed", note=f"internal error: {type(e).__name__}: {e}")
+                self._release(channel, job["id"])
+                self._after_finish(job["id"])
+            except Exception as e2:  # last resort: never let the worker die
+                print(f"[queuerd] could not record failure of job {job['id']}: {e2}", file=sys.stderr)
+
     async def _run_job(self, channel: int, job: dict[str, Any]) -> None:
         assert self.conn is not None
         job_id = job["id"]
@@ -283,7 +316,7 @@ class Daemon:
                 stderr=asyncio.subprocess.STDOUT,
                 start_new_session=True,  # own process group -> group-kill later
             )
-        except (OSError, FileNotFoundError) as e:
+        except (OSError, ValueError, TypeError) as e:
             db.mark_finished(self.conn, job_id, status="failed", note=f"failed to start: {e}")
             self._after_finish(job_id)
             return
@@ -297,7 +330,7 @@ class Daemon:
 
         try:
             if timeout:
-                exit_code = await asyncio.wait_for(proc.wait(), timeout=timeout)
+                exit_code = await self._wait_running_time(proc, channel, job_id, timeout)
             else:
                 exit_code = await proc.wait()
         except asyncio.TimeoutError:
@@ -320,6 +353,28 @@ class Daemon:
         db.mark_finished(self.conn, job_id, status=status, exit_code=exit_code)
         self._release(channel, job_id)
         self._after_finish(job_id)
+
+    async def _wait_running_time(self, proc: asyncio.subprocess.Process, channel: int, job_id: int, timeout: float) -> int:
+        """Wait for `proc`, enforcing `timeout` seconds of RUN time: time spent
+        frozen (SIGSTOP by a `--now` job) does not count. Raises
+        asyncio.TimeoutError like wait_for would."""
+        waiter = asyncio.ensure_future(proc.wait())
+        ran = 0.0
+        tick = 0.2
+        try:
+            while True:
+                done, _ = await asyncio.wait({waiter}, timeout=tick)
+                if done:
+                    return waiter.result()
+                frozen = self._frozen.get(channel)
+                if frozen is not None and frozen[0] == job_id:
+                    continue
+                ran += tick
+                if ran >= timeout:
+                    raise asyncio.TimeoutError
+        finally:
+            if not waiter.done():
+                waiter.cancel()
 
     def _release(self, channel: int, job_id: int) -> None:
         """Clear a channel's current-job slot, but only if it still points at
@@ -390,8 +445,16 @@ class Daemon:
         seconds). Steps aside while `qur connect` pairs. No error may
         escape."""
         pollers: dict[str, asyncio.Task] = {}
+        warned: str | None = None
         try:
             while True:
+                try:
+                    problem = notify.check_permissions(self.notify_path, fix=True)
+                except OSError as e:
+                    problem = f"cannot check {self.notify_path}: {e}"
+                if problem and problem != warned:
+                    print(f"[queuerd] warning: {problem}", file=sys.stderr)
+                warned = problem
                 cfg = notify.load(self.notify_path)
                 wanted: set[str] = set()
                 if cfg is not None and not notify.pairing_active(self.notify_path):
@@ -414,13 +477,26 @@ class Daemon:
         # kept across restarts of this poller (e.g. a pairing pause) so a
         # press that was already handled is never handed to us again
         offset: int | None = self._tg_offsets.get(token)
+        if offset is None and self.conn is not None:
+            # survives daemon restarts, so a press that was already handled is never replayed
+            saved = db.get_state(self.conn, f"tg_offset:{notify.bot_id(token)}")
+            if saved is not None and saved.isdecimal():
+                offset = self._tg_offsets[token] = int(saved)
+        # Telegram stamps no time on a button press, so a press that piled up while
+        # this daemon was off cannot be told from a fresh one. After a long outage
+        # (or a long pairing pause) everything waiting is therefore dropped, not run.
+        last_alive = self._tg_last_alive(token)
+        draining = last_alive is not None and time.time() - last_alive > TG_STALE_SECS
         last_err: str | None = None
         while True:
             cfg = self._listening_bot(token)
             if cfg is None:
                 return
             try:
-                updates = await asyncio.to_thread(notify.get_updates, cfg, offset)
+                if draining:
+                    updates = await asyncio.to_thread(notify.get_updates, cfg, offset, 0)  # no waiting
+                else:
+                    updates = await asyncio.to_thread(notify.get_updates, cfg, offset)
                 last_err = None
             except Exception as e:
                 err = f"{type(e).__name__}: {e}"
@@ -429,13 +505,48 @@ class Daemon:
                     last_err = err
                 await asyncio.sleep(LISTEN_RETRY_SECS)
                 continue
+            self._tg_mark_alive(token)
             for update in updates:
                 offset = self._tg_offsets[token] = update["update_id"] + 1
+                if self.conn is not None:
+                    db.set_state(self.conn, f"tg_offset:{notify.bot_id(token)}", str(offset))
                 try:
-                    await self._handle_update(cfg, update)
+                    if draining:
+                        await self._drop_stale_update(cfg, update)
+                    else:
+                        await self._handle_update(cfg, update)
                 except Exception as e:
                     print(f"[queuerd] telegram update failed: {type(e).__name__}: {e}", file=sys.stderr)
+            if draining and not updates:
+                draining = False  # backlog gone: from now on presses are fresh
             await asyncio.sleep(LISTEN_GAP_SECS)  # never hot-loop on instant empty replies
+
+    def _tg_last_alive(self, token: str) -> float | None:
+        """When this bot was last polled fine (memory first, then the DB), or None
+        if never -- e.g. the first start after an upgrade."""
+        seen = self._tg_alive.get(token)
+        if seen is not None:
+            return seen
+        if self.conn is not None:
+            saved = db.get_state(self.conn, f"tg_alive:{notify.bot_id(token)}")
+            if saved is not None and saved.isdecimal():
+                return float(saved)
+        return None
+
+    def _tg_mark_alive(self, token: str) -> None:
+        now = time.time()
+        self._tg_alive[token] = now
+        if self.conn is not None and now - self._tg_alive_saved.get(token, 0.0) >= TG_ALIVE_SAVE_SECS:
+            db.set_state(self.conn, f"tg_alive:{notify.bot_id(token)}", str(int(now)))
+            self._tg_alive_saved[token] = now
+
+    async def _drop_stale_update(self, cfg: dict[str, Any], update: dict[str, Any]) -> None:
+        """A press or message that waited while the daemon was off: never acted on.
+        A paired chat's button press gets a toast (best effort; Telegram may
+        already have expired it) so the user knows to press again."""
+        cq = update.get("callback_query")
+        if cq and (cq.get("from") or {}).get("id") in cfg["chat_ids"]:
+            await asyncio.to_thread(notify.answer_callback, cfg, cq["id"], "queuer was offline - press again")
 
     async def _handle_update(self, cfg: dict[str, Any], update: dict[str, Any]) -> None:
         """A button press that arrived on the bot `cfg` (its flat view): an
@@ -451,7 +562,15 @@ class Daemon:
         msg = cq.get("message") or {}
         chat_id = (msg.get("chat") or {}).get("id")
         parsed = notify.parse_callback(cq.get("data"))
-        if parsed is None or chat_id not in cfg["chat_ids"]:
+        if parsed is None:
+            return
+        if chat_id is None:  # Telegram hides messages that are too old: still stop the button spinner
+            if (cq.get("from") or {}).get("id") in cfg["chat_ids"]:
+                await asyncio.to_thread(notify.answer_callback, cfg, cq["id"], "message too old - use the Status/List keys")
+            return
+        if chat_id not in cfg["chat_ids"]:
+            return
+        if self._seen_callback(cfg, cq.get("id")):  # a double tap or a replayed update
             return
         action, qur_id, job_id = parsed
         reply = lambda text: asyncio.to_thread(notify.answer_callback, cfg, cq["id"], text)  # noqa: E731
@@ -496,6 +615,11 @@ class Daemon:
                 await asyncio.to_thread(notify.send, to_chat, notify.format_log(job, tail, cfg), None, "HTML")
             return
 
+        assert self.conn is not None
+        dup = db.recent_requeue(self.conn, job_id, REQUEUE_GUARD_SECS)
+        if dup is not None:  # two quick taps reach us as two presses of the same old keyboard
+            await reply(f"already requeued as job {dup}")
+            return
         try:
             new_id = await self._requeue_job(job_id)
         except ValueError as e:
@@ -509,6 +633,19 @@ class Daemon:
         await asyncio.to_thread(notify.edit_markup, cfg, chat_id, msg["message_id"], spent)
         text = f"🔁 job {job_id} requeued as job {new_id}\n{notify._who(cfg)}"
         await asyncio.to_thread(notify.send, to_chat, text)
+
+    def _seen_callback(self, cfg: dict[str, Any], cb_id: Any) -> bool:
+        """True if this bot already handled this callback_query id (bounded memory;
+        ids are only unique per bot)."""
+        if cb_id is None:
+            return False
+        key = f"{notify.bot_id(cfg['token'])}:{cb_id}"
+        if key in self._seen_callbacks:
+            return True
+        self._seen_callbacks.append(key)
+        if len(self._seen_callbacks) > 200:
+            del self._seen_callbacks[:100]
+        return False
 
     async def _handle_menu(self, cfg: dict[str, Any], msg: dict[str, Any]) -> None:
         """Persistent Status / List keys (or /status, /list; /menu and /start
@@ -565,7 +702,7 @@ class Daemon:
         truncated = False
         f = None
         try:
-            f = os.fdopen(os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb")
+            f = os.fdopen(os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600), "wb")
         except OSError as e:
             print(f"[queuerd] cannot open log {log_path}: {e}", file=sys.stderr)
         try:
@@ -621,8 +758,14 @@ class Daemon:
 
     async def handle_request(self, req: dict[str, Any]) -> dict[str, Any]:
         assert self.conn is not None
+        if not isinstance(req, dict):
+            return {"ok": False, "error": "invalid request"}
         cmd = req.get("cmd")
         args = req.get("args", {})
+        if not isinstance(args, dict):
+            return {"ok": False, "error": "arguments must be an object"}
+        if not isinstance(cmd, str) or cmd.startswith("_"):
+            return {"ok": False, "error": f"unknown command: {cmd}"}
         handler = getattr(self, f"_cmd_{cmd}", None)
         if handler is None:
             return {"ok": False, "error": f"unknown command: {cmd}"}
@@ -661,6 +804,18 @@ class Daemon:
         if now and (args.get("before") is not None or args.get("after") is not None):
             raise ValueError("--now cannot be combined with --before/--after")
 
+        for key in ("path", "virtual_env", "python_path"):
+            if args.get(key) is not None and not isinstance(args[key], str):
+                raise ValueError(f"{key} must be a string")
+        if raw_argv is not argv and not (isinstance(raw_argv, list) and all(isinstance(a, str) for a in raw_argv)):
+            raise ValueError("raw_argv must be a list of strings")
+        if any("\0" in a for a in argv) or any("\0" in a for a in raw_argv) or "\0" in cwd:
+            raise ValueError("arguments must not contain NUL bytes")
+        if any("\0" in (args.get(k) or "") for k in ("path", "virtual_env", "python_path")):
+            raise ValueError("environment values must not contain NUL bytes")
+        if not os.path.isdir(cwd):
+            raise ValueError(f"working directory does not exist: {cwd}")
+
         client_path = args.get("path") or None
         resolved = resolve_command(argv, cwd, path_env=client_path)
         exe = resolved[0]
@@ -675,7 +830,7 @@ class Daemon:
         python_path = args.get("python_path")
         if python_path:
             env_extra["PYTHONPATH"] = python_path
-        env_extra = env_extra or None
+        env_for_row: dict[str, str] | None = env_extra or None
 
         # log_path needs the row's own id, which we don't have until after
         # insert -- write a placeholder, then patch it in immediately
@@ -692,7 +847,7 @@ class Daemon:
             before=args.get("before"),
             after=args.get("after"),
             is_priority=now,
-            env_extra=env_extra,
+            env_extra=env_for_row,
             max_retries=max_retries,
         )
         log_path = str(self.log_dir / f"{job_id}.log")
@@ -731,8 +886,23 @@ class Daemon:
             }
         return {"channels": channels}
 
+    @staticmethod
+    def _int_arg(args: Any, key: str, *, required: bool = True, positive: bool = False) -> int | None:
+        """A JSON int (not bool) from a request, or ValueError with a clear message."""
+        if not isinstance(args, dict):
+            raise ValueError("arguments must be an object")
+        value = args.get(key)
+        if value is None:
+            if required:
+                raise ValueError(f"{key} is required")
+            return None
+        if type(value) is not int or (positive and value < 1):
+            raise ValueError(f"{key} must be a{' positive' if positive else 'n'} integer")
+        return value
+
     async def _cmd_show(self, args: dict[str, Any]) -> dict[str, Any]:
         assert self.conn is not None
+        self._int_arg(args, "id")
         job = db.get_job(self.conn, args["id"])
         if job is None:
             raise ValueError(f"job {args['id']} does not exist")
@@ -740,12 +910,13 @@ class Daemon:
 
     async def _cmd_clear(self, args: dict[str, Any]) -> dict[str, Any]:
         assert self.conn is not None
-        channel = args.get("channel")
+        channel = self._int_arg(args, "channel", required=False, positive=True)
         cleared = db.clear_backlog(self.conn, channel=channel)
         return {"cleared": cleared, "channel": channel}
 
     async def _cmd_rm(self, args: dict[str, Any]) -> dict[str, Any]:
         assert self.conn is not None
+        self._int_arg(args, "id")
         db.remove_from_queue(self.conn, args["id"])
         return {"removed": args["id"]}
 
@@ -755,8 +926,8 @@ class Daemon:
         by `--now`, or still queued (kept in history as `cancelled`). If
         `channel` is also given it must match the job's channel."""
         assert self.conn is not None
-        job_id = args.get("id")
-        channel = args.get("channel")
+        job_id = self._int_arg(args, "id", required=False)
+        channel = self._int_arg(args, "channel", required=False, positive=True)
 
         if job_id is None:
             channel = channel or db.DEFAULT_CHANNEL
@@ -806,6 +977,7 @@ class Daemon:
         await self._kill_process_group(proc)
 
     async def _cmd_requeue(self, args: dict[str, Any]) -> dict[str, Any]:
+        self._int_arg(args, "id")
         return {"id": await self._requeue_job(args["id"])}
 
     async def _requeue_job(self, job_id: int) -> int:
@@ -822,13 +994,13 @@ class Daemon:
 
     async def _cmd_pause(self, args: dict[str, Any]) -> dict[str, Any]:
         assert self.conn is not None
-        channel = args.get("channel") or db.DEFAULT_CHANNEL
+        channel = self._int_arg(args, "channel", required=False, positive=True) or db.DEFAULT_CHANNEL
         db.set_paused(self.conn, True, channel)
         return {"paused": True, "channel": channel}
 
     async def _cmd_resume(self, args: dict[str, Any]) -> dict[str, Any]:
         assert self.conn is not None
-        channel = args.get("channel") or db.DEFAULT_CHANNEL
+        channel = self._int_arg(args, "channel", required=False, positive=True) or db.DEFAULT_CHANNEL
         db.set_paused(self.conn, False, channel)
         self._wake_worker(channel)
         return {"paused": False, "channel": channel}
@@ -849,13 +1021,34 @@ class Daemon:
         return uid == self._uid
 
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        if self._clients >= MAX_CLIENTS:
+            # a flood of same-user connections must not eat every file descriptor
+            try:
+                await asyncio.wait_for(reader.readline(), timeout=1)  # read first, or the close resets the reply away
+                writer.write(b'{"ok": false, "error": "too many connections, try again"}\n')
+                await writer.drain()
+            except (asyncio.TimeoutError, OSError, ValueError):
+                pass
+            writer.close()
+            return
+        self._clients += 1
+        try:
+            await self._serve_client(reader, writer)
+        finally:
+            self._clients -= 1
+
+    async def _serve_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         if not self._peer_is_me(writer):
             print("[queuerd] refused a connection from another user", file=sys.stderr)
             writer.close()
             return
         req: Any = None
         try:
-            line = await reader.readline()
+            try:
+                line = await asyncio.wait_for(reader.readline(), timeout=CLIENT_READ_TIMEOUT_SECS)
+            except asyncio.TimeoutError:
+                writer.close()
+                return
             if not line:
                 writer.close()
                 await writer.wait_closed()

@@ -85,7 +85,7 @@ def resolve_command(argv: list[str], cwd: str, path_env: str | None = None) -> l
 
 
 def _resolve_token(token: str, cwd: str, *, is_argv0: bool, path_env: str | None = None) -> str:
-    if token == "":
+    if token == "":  # nosec B105 - an empty path token, not a password
         # Path(cwd) / "" == Path(cwd), which always exists -- without this
         # guard an empty argument would get silently rewritten to the cwd's
         # own absolute path by the "bare existing file" branch below.

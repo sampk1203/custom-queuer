@@ -118,6 +118,8 @@ if [ "$ACTION" = "uninstall" ]; then
     echo "==> Removing the virtualenv"
     rm -rf "$PROJECT_DIR/.venv"
 
+    echo "NOTE: the Telegram bot token still works. If you are done with the bot, send /revoke to"
+    echo "      @BotFather. Job logs (kept above if you said no) can hold secrets."
     echo "==> Uninstalled. Open a new terminal so the removed commands and completion disappear."
     echo "    To reinstall: ./install.sh"
     exit 0
@@ -135,14 +137,36 @@ echo "==> Project dir: $PROJECT_DIR"
 # ---------------------------------------------------------------------------
 
 if ! command -v uv > /dev/null 2>&1; then
-    echo "==> uv not found -- installing it"
-    # download first, run second: a cut-off download is never executed
-    UV_INSTALLER="$(mktemp)"
-    trap 'rm -f "$UV_INSTALLER"' EXIT
-    curl --proto '=https' --tlsv1.2 -LsSf https://astral.sh/uv/install.sh -o "$UV_INSTALLER"
-    sh "$UV_INSTALLER"
-    # the official installer puts uv in ~/.local/bin; make it visible to the
-    # rest of this script without requiring a new shell
+    # Pinned release + SHA-256 (taken from the release's own .sha256 files): a
+    # tampered or cut-off download is rejected, nothing from the net is run
+    # unchecked. To bump: change UV_VERSION and both hashes together.
+    UV_VERSION="0.12.24"
+    case "$(uname -s)-$(uname -m)" in
+        Linux-x86_64)  UV_ARCH=x86_64;  UV_SHA256="b4dfaef47d491a7296981f8374a4595f55dbf84e8937c8ecd2983574d8bb3da6" ;;
+        Linux-aarch64) UV_ARCH=aarch64; UV_SHA256="5231be65f496304623895dacdbf1de8504fec90303684bdf05805aa34414dd21" ;;
+        *)
+            echo "ERROR: uv not found and no pinned download for $(uname -sm)." >&2
+            echo "Install uv yourself (https://docs.astral.sh/uv/) and re-run this script." >&2
+            exit 1
+            ;;
+    esac
+    echo "==> uv not found -- installing pinned uv $UV_VERSION ($UV_ARCH)"
+    UV_TARBALL="uv-${UV_ARCH}-unknown-linux-gnu.tar.gz"
+    UV_TMP="$(mktemp -d)"
+    trap 'rm -rf "$UV_TMP"' EXIT
+    curl --proto '=https' --tlsv1.2 -LsSf \
+        "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/${UV_TARBALL}" -o "$UV_TMP/$UV_TARBALL"
+    if ! echo "${UV_SHA256}  $UV_TMP/$UV_TARBALL" | sha256sum -c - > /dev/null 2>&1; then
+        echo "ERROR: the uv download does not match its pinned SHA-256. Not installing it." >&2
+        exit 1
+    fi
+    mkdir -p "$UV_TMP/x" "$HOME/.local/bin"
+    tar -xzf "$UV_TMP/$UV_TARBALL" -C "$UV_TMP/x"
+    for bin in uv uvx; do
+        found="$(find "$UV_TMP/x" -type f -name "$bin" | head -n 1)"
+        if [ -n "$found" ]; then install -m 0755 "$found" "$HOME/.local/bin/$bin"; fi
+    done
+    # make uv visible to the rest of this script without requiring a new shell
     export PATH="$HOME/.local/bin:$PATH"
 
     if ! command -v uv > /dev/null 2>&1; then
@@ -235,9 +259,48 @@ fi
 # 5. Write / update the systemd unit
 # ---------------------------------------------------------------------------
 
-echo "==> Writing systemd --user unit to $SERVICE_FILE"
-mkdir -p "$SERVICE_DIR"
-cat > "$SERVICE_FILE" << EOF
+# Hardening (S8). These settings sandbox the daemon -- and are INHERITED BY EVERY JOB
+# it runs, so only options that cannot break normal compute jobs are used. Deliberately
+# NOT set: ProtectHome / ProtectSystem=strict (jobs write to $HOME and their cwd) and
+# PrivateTmp (the daemon's /tmp/queuer-<uid> socket fallback must stay visible).
+#
+#   QUEUER_HARDEN=full   (default) everything below
+#   QUEUER_HARDEN=basic  without ProtectKernel*, which need user namespaces
+#   QUEUER_HARDEN=none   the old, unsandboxed unit
+#
+# If systemd refuses to start the service at the requested level (typically a kernel
+# or systemd that cannot do user-mode namespaces), the installer steps down one level
+# at a time and says so; it never leaves you without a running daemon.
+HARDEN="${QUEUER_HARDEN:-full}"
+case "$HARDEN" in
+    full|basic|none) ;;
+    *) echo "QUEUER_HARDEN must be full, basic or none (got '$HARDEN')" >&2; exit 2 ;;
+esac
+
+hardening_lines() {  # hardening_lines LEVEL -> the [Service] lines for that level
+    [ "$1" = none ] && return 0
+    cat << 'EOT'
+# --- hardening (S8); inherited by jobs ---
+# New files (job output, logs) are private to you even under a 022 umask.
+UMask=0077
+# setuid/sudo inside a job will not gain privileges. Jobs that need sudo: QUEUER_HARDEN=none.
+NoNewPrivileges=yes
+LockPersonality=yes
+# AF_NETLINK is kept on purpose: getifaddrs() (MPI, NCCL, psutil, `ip`) needs it.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+EOT
+    if [ "$1" = full ]; then
+        cat << 'EOT'
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+EOT
+    fi
+}
+
+write_unit() {  # write_unit LEVEL
+    echo "==> Writing systemd --user unit to $SERVICE_FILE (hardening: $1)"
+    mkdir -p "$SERVICE_DIR"
+    cat > "$SERVICE_FILE" << EOF
 [Unit]
 Description=queuer background job queue daemon
 After=default.target
@@ -247,18 +310,44 @@ Type=simple
 ExecStart=$PROJECT_DIR/.venv/bin/queuerd
 Restart=on-failure
 RestartSec=2
+# Jobs get SIGTERM then SIGKILL from the daemon on stop; do not hang a logout on them.
+TimeoutStopSec=30
+$(hardening_lines "$1")
 
 [Install]
 WantedBy=default.target
 EOF
+}
+
+start_service() {  # start at $HARDEN, stepping down until systemd accepts the unit
+    local level
+    for level in full basic none; do
+        case "$HARDEN:$level" in
+            basic:full|none:full|none:basic) continue ;;  # stricter than asked for
+        esac
+        write_unit "$level"
+        systemctl --user daemon-reload
+        systemctl --user enable queuerd
+        systemctl --user restart queuerd || true
+        sleep 2
+        if systemctl --user is-active --quiet queuerd; then
+            echo "==> queuerd is running (hardening: $level)"
+            [ "$level" = "$HARDEN" ] || echo "    (asked for '$HARDEN'; this system refused it, so '$level' is in use)"
+            return 0
+        fi
+        echo "!!  queuerd did not start with hardening '$level'; last log lines:" >&2
+        journalctl --user -u queuerd -n 8 --no-pager >&2 || true
+    done
+    echo "queuerd failed to start even without hardening; see: journalctl --user -u queuerd" >&2
+    return 1
+}
 
 # ---------------------------------------------------------------------------
 # 6. Enable + start, enable linger
 # ---------------------------------------------------------------------------
 
-echo "==> Reloading systemd and enabling queuerd"
-systemctl --user daemon-reload
-systemctl --user enable --now queuerd
+echo "==> Enabling and starting queuerd"
+start_service
 
 echo "==> Enabling linger for $USER (so queuerd survives logout)"
 loginctl enable-linger "$USER"

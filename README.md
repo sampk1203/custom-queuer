@@ -27,10 +27,13 @@ any existing `queuerd` process (systemd-managed or stray), rewrites the
 systemd unit with the correct path, enables + starts it, and enables
 linger so it survives logout. It also makes any state left by an older version
 owner-only (db, logs, config; see [Security and permissions](#security-and-permissions)).
-If uv is missing it downloads uv's installer from astral.sh over HTTPS to a temp
-file and runs it only once the download finished (no `curl | sh`); there is no
-checksum check, so if you want one, install uv from your package manager first and
-the script skips the download.
+If uv is missing it downloads a pinned uv release (version and SHA-256 are written
+in `install.sh`, Linux x86_64 or aarch64) from GitHub over HTTPS, refuses it if the
+hash does not match, and only then installs it to `~/.local/bin`. Nothing from the
+net is run unchecked. On another platform, or if you prefer your package manager,
+install uv first and the script skips the download. To move to a newer uv, change
+`UV_VERSION` and both hashes together (the release page publishes a `.sha256` file
+per archive).
 
 `qur` is a short alias for `queuer` — same command, less typing.
 
@@ -96,6 +99,12 @@ The command is captured two ways:
   **not** followed (deliberately — this matters for venvs: resolving
   `.venv/bin/python3` to its symlink target would silently break venv
   activation for the job).
+
+`--before ID` / `--after ID` choose the job's **position** in the queue and nothing
+more: the new job does not wait for that job to finish or succeed, and the ID must
+still be queued on the same channel (once it started, the add is rejected).
+`--now` freezes the running job (SIGSTOP) while the priority job runs; a frozen job
+stays alive and keeps its memory, so briefly one channel can have two live jobs.
 
 `--retries N` requeues the job automatically (at the end of its channel's
 queue) if it fails — non-zero exit, timeout, or failed start — up to N
@@ -204,7 +213,11 @@ secrets.
 **Requeue button.** Pressing it re-runs the finished job exactly like
 `qur requeue ID` (same command, cwd, timeout, retries; end of its channel's
 queue) and replies `🔁 job 12 requeued as job 13`; the Requeue button is then
-removed from that message (Details stays). Only chats you paired can use either
+removed from that message (Details stays). A second Requeue press of the same job
+within 30 s (a double tap) is answered `already requeued as job N` and does nothing.
+Telegram puts no time on a button press, so after the daemon was off for more than
+5 minutes, presses that piled up meanwhile are dropped (the pressing chat gets an
+`offline - press again` toast if Telegram still accepts it), never run late. Only chats you paired can use either
 button, and these are the only actions the bot accepts. Both need the daemon to listen
 to Telegram, which Telegram allows for one machine per bot: the machine that owns
 the bot (`listen` on by default) handles them, and bots added with `--import` are
@@ -293,11 +306,13 @@ token on all machines, send `/revoke` to @BotFather.
 - A failed send (offline, Telegram down) is logged to the daemon's journal and
   dropped. It never delays or fails a job. Messages are not queued for later.
 
-### `logs ID [--tail]`
+### `logs ID [-n N] [--tail]`
 
 Reads the job's log file straight off disk — this doesn't go through
-the daemon at all, so it works even if `queuerd` isn't running.
-`--tail` follows the file as it grows (Ctrl-C to stop). Each job's log
+the daemon at all, so it works even if `queuerd` isn't running. A big log is
+streamed in chunks, never loaded whole. `-n N` / `--lines N` prints only the last
+N lines. `--tail` follows the file as it grows (Ctrl-C to stop); `-n 20 --tail`
+shows the last 20 lines first, then follows. Each job's log
 is capped at 50MB; once hit, further output is dropped and a single
 `[queuer] log truncated at 50MB` marker is appended.
 
@@ -324,6 +339,13 @@ a message for it). Note this only updates the job's
 record — if the job's own subprocess is still alive (it runs in its own
 process group, independent of the daemon's), it keeps running
 unsupervised until it finishes or you kill it manually (`pgrep`/`kill`).
+
+With `install.sh` the daemon is a systemd user service with lingering enabled, so it
+starts at boot (no login needed) and is restarted if it crashes. After a reboot it
+works through what was queued: the one interrupted job is marked failed and you
+are told, then the next queued job of each channel starts. Nothing can send
+a message while the daemon itself is down; if you need to hear about that, watch it
+from outside (e.g. a ping from another machine).
 
 Queued jobs and the last-10 backlog persist in SQLite at
 `~/.local/state/queuer/queuer.db` and survive daemon restarts and
@@ -371,11 +393,29 @@ boundary. What is enforced:
   send no reply). `add` rejects wrongly typed fields (timeout, channel, argv, cwd,
   before/after) with an error instead of failing later inside the worker. A job log that
   cannot be opened or written (disk full) is logged to the journal and the job's output is
-  dropped; the job and the daemon keep going.
+  dropped; the job and the daemon keep going. The log file is opened without following
+  symlinks.
+- **One bad job never stalls a channel.** `add` also rejects non-string `path`,
+  `virtual_env`, `python_path` and `raw_argv`, NUL bytes, and a working directory that
+  does not exist. If anything still goes wrong while starting or running a job, that job
+  is marked `failed` ("internal error: ...") and the channel's worker carries on; a
+  worker that has died is respawned by the next `add`. Handlers (`cancel`, `rm`, `show`,
+  `requeue`, `pause`, `resume`, `clear`) reject wrongly typed ids and channels with a
+  clear error. A client that connects and sends nothing is dropped after 10 s.
+- **Timeouts and `--now`.** `--timeout` counts run time only; time a job spends frozen
+  by a `--now` job does not count.
 - **Bot token.** Never appears in logs or error text. `qur connect --import -` takes the
   setup string on stdin; on the command line it is visible in `ps` and shell history
   (a warning is printed). The setup string and `notify.json` contain the token, so
-  keep them private; `/revoke` to @BotFather invalidates it.
+  keep them private; `/revoke` to @BotFather invalidates it. The daemon checks
+  `notify.json` and its folder (regular file, yours, no group/other access): a loose
+  mode is tightened to 600/700 and logged, a symlink or someone else's file is logged as
+  a warning. `qur connect --list` prints the same warning. Anything running as **you**
+  can still read the file (like `~/.ssh` keys).
+- **Telegram buttons.** The update offset is saved in the database, so a press that was
+  already handled is not replayed after a restart, and a repeated press of the same
+  button (double tap) is handled once. A press on a message Telegram no longer shows
+  gets an answer ("message too old") instead of a spinner.
 - **Telegram.** Only chats paired with a bot can press its buttons, and pairing needs your
   own random code. Finished-job messages include the command as typed (up to 1000
   characters; Details up to 1200 per command), and the **Logs** button sends output (see above). Don't put secrets in
@@ -384,6 +424,14 @@ boundary. What is enforced:
   with mode 0600 (is `queuerd` running as another user?). `stale socket` means the
   file exists but nothing answers: `systemctl --user restart queuerd`. The CLI gives up
   with `did not answer` if the daemon is silent for 60 s.
+
+- **Proxies.** The bot token is part of every Telegram URL, so queuerd ignores
+  `HTTPS_PROXY` / `ALL_PROXY` / `HTTP_PROXY` for Telegram and connects directly. If your
+  network only reaches Telegram through a proxy, start the daemon with
+  `QUEUER_USE_PROXY=1` in its environment (e.g. `systemctl --user edit queuerd`:
+  `[Service]` then `Environment=QUEUER_USE_PROXY=1`); the proxy then sees the token.
+- **Connections.** At most 32 socket connections are served at once; a client that
+  sends nothing is dropped after 10 s.
 
 Not covered: jobs are not sandboxed (see below), and a process running as **you** can
 always queue commands, which is by design.
@@ -395,6 +443,11 @@ uv sync
 uv run pytest -v          # storage layer + path-resolution unit tests
 ```
 
+`.github/workflows/ci.yml` runs the same tests, and a dependency audit
+(`pip-audit` on the locked dependencies), on every push and pull request, and
+once a week so new advisories show up without a push. It needs a GitHub repo to run;
+locally the commands above are the same thing.
+
 For a design/architecture writeup and the phase-by-phase build plan, see
 `queuer_plan.md` in the repo root.
 
@@ -405,6 +458,13 @@ For a design/architecture writeup and the phase-by-phase build plan, see
 - Notifications are Telegram-only, best-effort (a send that fails is dropped,
   not retried), and visible to Telegram. Pair one machine at a time (see
   `connect`).
+- `qur clean-logs` refuses to run when the job database is missing (it would otherwise
+  treat every log as orphaned), and deletes an orphaned log (its row was pruned) only when
+  the file is older than `--days`. `qur logs` prints job output verbatim (`[brackets]`
+  are not interpreted).
+- A job that starts a background child (`bash -c "sleep 8 & echo hi"`) stays `running`
+  until that child exits too: the daemon waits for the job's output pipe to close, and
+  the child holds it open. `qur cancel ID` ends the whole process group.
 - No sandboxing — jobs run with your own user permissions, same as
   running them directly in a shell.
 - A second `queuerd` refuses to start while one already answers on the socket

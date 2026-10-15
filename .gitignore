@@ -2,3 +2,8 @@
 __pycache__/
 *.pyc
 *.todo
+.venv/
+.pytest_cache/
+QUEUER_FEATURES.md
+QUEUER_ISSUES.md
+CHANGELOG.md
