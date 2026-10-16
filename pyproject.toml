@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Personal job queue: qur CLI + queuerd daemon with Telegram notifications"
 readme = "README.md"
 authors = [{ name = "Sameer Kulkarni", email = "sampk1203@gmail.com" }]
-requires-python = ">=3.12"
+requires-python = ">=3.10"
 dependencies = [
     "click>=8.5.0",
     "rich>=15.0.0",
