@@ -1116,3 +1116,125 @@ def test_enqueue_rejects_not_before_on_the_priority_lane(conn):
     with pytest.raises(ValueError):
         _mk(conn, "a", is_priority=True, not_before="2030-01-01T12:00:00+00:00")
     assert db.get_queue(conn, is_priority=True) == []
+
+
+# ---------------------------------------------------------------------------
+# F9/U3: history that scales + filters
+# ---------------------------------------------------------------------------
+
+def _fin(conn, job_id, status="done", keep=200):
+    db.mark_running(conn, job_id, pid=1, pgid=1)
+    db.mark_finished(conn, job_id, status=status, exit_code=0 if status == "done" else 1, keep_backlog=keep)
+
+
+def _set_finished(conn, job_id, when):
+    conn.execute("UPDATE jobs SET finished_at = ? WHERE id = ?", (when, job_id))
+    conn.commit()
+
+
+def test_daemon_default_keep_is_200_and_bare_default_is_unchanged(conn):
+    assert db.DEFAULT_KEEP == 200 and db.LIST_BACKLOG == 10
+    ids = [_mk(conn, f"j{i}") for i in range(30)]
+    for i in ids:
+        _fin(conn, i)  # keep=200
+    assert len(db.get_history(conn, limit=1000)) == 30
+    assert len(db.get_backlog(conn)) == 10  # the short list view stays at 10
+    assert len(db.get_backlog(conn, limit=100)) == 30
+
+
+def test_keep_limit_is_per_channel_and_prunes_the_oldest(conn):
+    a = [_mk(conn, f"a{i}", channel=1) for i in range(8)]
+    b = [_mk(conn, f"b{i}", channel=2) for i in range(2)]
+    for i in a + b:
+        _fin(conn, i, keep=5)
+    kept_a = {j["id"] for j in db.get_history(conn, channel=1, limit=100)}
+    assert kept_a == set(a[-5:])
+    assert {j["id"] for j in db.get_history(conn, channel=2, limit=100)} == set(b)
+
+
+def test_keep_applies_to_cancelled_and_skipped_queued_jobs_too(conn):
+    ids = [_mk(conn, f"c{i}") for i in range(6)]
+    for i in ids:
+        db.cancel_queued(conn, i, keep_backlog=3)
+    assert {j["id"] for j in db.get_history(conn, limit=100)} == set(ids[-3:])
+    a = _mk(conn, "a")
+    b = _mk(conn, "b", deps={a: "success"})
+    _fin(conn, a, status="failed", keep=3)
+    skipped, _ = db.skip_dependants(conn, a, keep_backlog=3)
+    assert skipped == [b]
+    assert len(db.get_history(conn, limit=100)) == 3
+
+
+def test_a_dependency_of_a_queued_job_is_kept_beyond_the_limit(conn):
+    a = _mk(conn, "a")
+    b = _mk(conn, "b", channel=2, deps={a: "success"})
+    _fin(conn, a, keep=3)
+    for i in range(8):
+        _fin(conn, _mk(conn, f"x{i}"), keep=3)
+    assert db.get_job(conn, a) is not None  # protected while b waits
+    assert len(db.get_history(conn, channel=1, limit=100)) == 4  # 3 + the protected one
+    _fin(conn, b, keep=3)
+    _fin(conn, _mk(conn, "y"), keep=3)
+    assert db.get_job(conn, a) is None and len(db.get_history(conn, channel=1, limit=100)) == 3
+
+
+def test_history_status_filter_and_validation(conn):
+    ids = {s: _mk(conn, s) for s in ("done", "failed", "interrupted")}
+    for s, i in ids.items():
+        _fin(conn, i, status=s)
+    queued = _mk(conn, "still-queued")
+    assert {j["id"] for j in db.get_history(conn)} == set(ids.values())  # queued jobs are not history
+    assert [j["status"] for j in db.get_history(conn, statuses=["failed"])] == ["failed"]
+    got = db.get_history(conn, statuses=["failed", "interrupted"])
+    assert {j["status"] for j in got} == {"failed", "interrupted"}
+    with pytest.raises(ValueError, match="unknown status"):
+        db.get_history(conn, statuses=["queued"])
+    with pytest.raises(ValueError, match="at least 1"):
+        db.get_history(conn, limit=0)
+    assert db.get_job(conn, queued)["status"] == "queued"
+
+
+def test_history_channel_limit_and_newest_first(conn):
+    ids = [_mk(conn, f"j{i}", channel=1 + i % 2) for i in range(6)]
+    for i in ids:
+        _fin(conn, i)
+    assert [j["id"] for j in db.get_history(conn)] == ids[::-1]
+    assert [j["id"] for j in db.get_history(conn, limit=2)] == ids[::-1][:2]
+    assert [j["id"] for j in db.get_history(conn, channel=2)] == [ids[5], ids[3], ids[1]]
+
+
+def test_history_since_uses_the_finish_time(conn):
+    old, new = _mk(conn, "old"), _mk(conn, "new")
+    _fin(conn, old)
+    _fin(conn, new)
+    _set_finished(conn, old, "2026-01-01T00:00:00+00:00")
+    _set_finished(conn, new, "2026-06-01T12:00:00+00:00")
+    assert [j["id"] for j in db.get_history(conn, since="2026-03-01T00:00:00+00:00")] == [new]
+    assert [j["id"] for j in db.get_history(conn, since="2026-06-01T12:00:00+00:00")] == [new]  # inclusive
+    assert {j["id"] for j in db.get_history(conn, since="2025-01-01T00:00:00+00:00")} == {old, new}
+    assert db.get_history(conn, since="2027-01-01T00:00:00+00:00") == []
+
+
+def test_history_grep_matches_the_raw_command_case_insensitively(conn):
+    a = _mk(conn, "a", raw_cmd=["python", "Train.py", "--lr", "0.1"], resolved_cmd=["/usr/bin/python", "/w/Train.py"])
+    b = _mk(conn, "b", raw_cmd=["bash", "-c", 'echo "hello world" && ./eval.sh'], resolved_cmd=["/bin/bash", "-c", "x"])
+    c = _mk(conn, "c", raw_cmd=["true"], resolved_cmd=["/usr/bin/true"])
+    for i in (a, b, c):
+        _fin(conn, i)
+    assert [j["id"] for j in db.get_history(conn, grep="train.py")] == [a]
+    assert [j["id"] for j in db.get_history(conn, grep="--lr 0.1")] == [a]  # words are joined by a space
+    assert [j["id"] for j in db.get_history(conn, grep='"hello world"')] == [b]  # not the JSON escaping
+    assert db.get_history(conn, grep="/w/Train.py") == []  # only the raw command, not the resolved one
+    assert db.get_history(conn, grep="nomatch") == []
+    assert len(db.get_history(conn, grep="")) == 3  # empty text = no filter
+
+
+def test_history_filters_combine(conn):
+    a = _mk(conn, "a", raw_cmd=["train", "1"], resolved_cmd=["/bin/train", "1"])
+    b = _mk(conn, "b", raw_cmd=["train", "2"], resolved_cmd=["/bin/train", "2"], channel=2)
+    c = _mk(conn, "c", raw_cmd=["eval"], resolved_cmd=["/bin/eval"])
+    _fin(conn, a, status="failed")
+    _fin(conn, b, status="failed")
+    _fin(conn, c, status="failed")
+    got = db.get_history(conn, statuses=["failed"], channel=1, grep="train")
+    assert [j["id"] for j in got] == [a]

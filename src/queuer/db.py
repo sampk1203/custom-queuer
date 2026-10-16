@@ -29,6 +29,9 @@ TERMINAL_STATUSES = ("done", "failed", "cancelled", "skipped", "interrupted")
 ACTIVE_STATUSES = ("queued", "running", "stopped")
 DEP_MODES = ("success", "any")  # `--depends-on` (must end done) / `--after-any` (any end)
 ON_FAIL_MODES = ("continue", "pause")
+DEFAULT_KEEP = 200  # finished jobs kept per channel by the daemon (QUEUER_KEEP changes it)
+LIST_BACKLOG = 10  # finished jobs `qur list` / the Telegram list show per channel
+MAX_HISTORY = 10000  # most rows one history query returns
 MAX_SWEEP = 1000  # most jobs one `add` creates (--each/--array) and most ids one dependency list holds
 
 _JOBS_DDL = """
@@ -479,18 +482,63 @@ def get_stopped(conn: sqlite3.Connection, channel: int = DEFAULT_CHANNEL) -> dic
 
 
 def get_backlog(
-    conn: sqlite3.Connection, channel: int = DEFAULT_CHANNEL, limit: int = 10
+    conn: sqlite3.Connection, channel: int = DEFAULT_CHANNEL, limit: int = LIST_BACKLOG
 ) -> list[dict[str, Any]]:
     rows = conn.execute(
         """
         SELECT * FROM jobs
         WHERE status IN ('done', 'failed', 'cancelled', 'skipped', 'interrupted') AND channel = ?
-        ORDER BY finished_at DESC
+        ORDER BY finished_at DESC, id DESC
         LIMIT ?
         """,
         (channel, limit),
     ).fetchall()
     return [_row_to_dict(r) for r in rows]
+
+
+def get_history(
+    conn: sqlite3.Connection,
+    *,
+    statuses: list[str] | None = None,
+    channel: int | None = None,
+    since: str | None = None,
+    grep: str | None = None,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """Finished jobs, newest first, filtered. `statuses` (terminal ones only; None = all),
+    `channel`, `since` (an ISO timestamp: finished at or after it), `grep` (case-insensitive
+    substring of the raw command, its words joined by spaces), at most `limit` rows."""
+    for status in statuses or []:
+        if status not in TERMINAL_STATUSES:
+            raise ValueError(f"unknown status {status!r}; use one of {', '.join(TERMINAL_STATUSES)}")
+    if limit < 1:
+        raise ValueError("limit must be at least 1")
+    wanted = list(statuses) if statuses else list(TERMINAL_STATUSES)
+    # only "?" placeholders are interpolated; every value below is bound as a parameter
+    sql = f"SELECT * FROM jobs WHERE status IN ({','.join('?' * len(wanted))})"  # nosec B608
+    params: list[Any] = list(wanted)
+    if channel is not None:
+        sql += " AND channel = ?"
+        params.append(channel)
+    if since is not None:
+        sql += " AND finished_at >= ?"
+        params.append(since)
+    sql += " ORDER BY finished_at DESC, id DESC"
+    needle = grep.lower() if grep else None
+    out: list[dict[str, Any]] = []
+    for row in conn.execute(sql, params):
+        job = _row_to_dict(row)
+        if needle is not None:
+            try:
+                words = json.loads(job["raw_cmd"])
+            except ValueError:
+                words = [job["raw_cmd"]]
+            if needle not in " ".join(str(w) for w in words).lower():
+                continue
+        out.append(job)
+        if len(out) >= limit:
+            break
+    return out
 
 
 def get_job(conn: sqlite3.Connection, job_id: int) -> dict[str, Any] | None:
@@ -577,7 +625,8 @@ def _drop_orphan_deps(conn: sqlite3.Connection) -> None:
 
 
 def _prune_backlog(conn: sqlite3.Connection, channel: int, keep: int = 10) -> None:
-    """Delete finished-job DB rows beyond the most recent `keep`, scoped to
+    """Delete finished-job DB rows beyond the most recent `keep` (the daemon passes
+    DEFAULT_KEEP or QUEUER_KEEP; the bare default is 10), scoped to
     one channel. Log files on disk are left untouched -- only the row is
     pruned. A finished job a still-queued job depends on is kept (it may push
     the history past `keep` until that job has run or been skipped)."""
@@ -587,7 +636,7 @@ def _prune_backlog(conn: sqlite3.Connection, channel: int, keep: int = 10) -> No
         WHERE status IN ('done', 'failed', 'cancelled', 'skipped', 'interrupted') AND channel = ?
           AND id NOT IN (SELECT d.dep_id FROM job_deps d JOIN jobs w ON w.id = d.job_id
                          WHERE w.status = 'queued')
-        ORDER BY finished_at DESC
+        ORDER BY finished_at DESC, id DESC
         """,
         (channel,),
     ).fetchall()
@@ -660,7 +709,7 @@ def remove_from_queue(conn: sqlite3.Connection, job_id: int) -> None:
     conn.commit()
 
 
-def _end_queued(conn: sqlite3.Connection, job_id: int, status: str, note: str) -> None:
+def _end_queued(conn: sqlite3.Connection, job_id: int, status: str, note: str, keep_backlog: int = 10) -> None:
     """Move a job that has not started straight to a terminal state (kept in
     history), closing the gap it leaves in the queue. Works on both lanes."""
     job = get_job(conn, job_id)
@@ -672,20 +721,20 @@ def _end_queued(conn: sqlite3.Connection, job_id: int, status: str, note: str) -
     remaining = [i for i in _queued_ids_ordered(conn, job["channel"], bool(job["is_priority"])) if i != job_id]
     _reindex_queue(conn, remaining)
     conn.commit()
-    mark_finished(conn, job_id, status=status, note=note)
+    mark_finished(conn, job_id, status=status, note=note, keep_backlog=keep_backlog)
 
 
-def cancel_queued(conn: sqlite3.Connection, job_id: int) -> None:
+def cancel_queued(conn: sqlite3.Connection, job_id: int, keep_backlog: int = 10) -> None:
     """Cancel a job that has not started: it stays in history as
     `cancelled` (unlike remove_from_queue, which deletes it). Works on both
     the normal and the priority lane."""
-    _end_queued(conn, job_id, "cancelled", "cancelled while queued")
+    _end_queued(conn, job_id, "cancelled", "cancelled while queued", keep_backlog)
 
 
-def skip_queued(conn: sqlite3.Connection, job_id: int, note: str) -> None:
+def skip_queued(conn: sqlite3.Connection, job_id: int, note: str, keep_backlog: int = 10) -> None:
     """A queued job that can no longer run (a dependency failed): it stays in
     history as `skipped` with `note` saying why."""
-    _end_queued(conn, job_id, "skipped", note)
+    _end_queued(conn, job_id, "skipped", note, keep_backlog)
 
 
 # ---------------------------------------------------------------------------
@@ -751,7 +800,9 @@ def dep_verdict(conn: sqlite3.Connection, job_id: int) -> tuple[str, int | None]
     return ("waiting", waiting) if waiting is not None else ("ready", None)
 
 
-def skip_dependants(conn: sqlite3.Connection, job_id: int) -> tuple[list[int], set[int]]:
+def skip_dependants(
+    conn: sqlite3.Connection, job_id: int, keep_backlog: int = 10
+) -> tuple[list[int], set[int]]:
     """`job_id` just reached a terminal state. Skip every still-queued job that
     needs it to have succeeded (`--depends-on`, and it did not end `done`), and
     cascade: a skipped job is itself a failed dependency of whatever needed it.
@@ -772,7 +823,7 @@ def skip_dependants(conn: sqlite3.Connection, job_id: int) -> tuple[list[int], s
                 continue
             channels.add(waiter["channel"])
             if r["mode"] == "success" and dep["status"] != "done":
-                skip_queued(conn, waiter["id"], f"dependency {dep_id} failed")
+                skip_queued(conn, waiter["id"], f"dependency {dep_id} failed", keep_backlog)
                 skipped.append(waiter["id"])
                 todo.append(waiter["id"])
     return skipped, channels

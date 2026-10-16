@@ -23,7 +23,7 @@ from rich.markup import escape
 from rich.table import Table
 from typer.core import TyperCommand
 
-from queuer import client, db, notify
+from queuer import client, db, jobenv, notify
 from queuer.daemon import _default_db_path, _default_log_dir
 from queuer.db import DEFAULT_CHANNEL
 from queuer.pathresolve import SHELL_INTERPRETERS
@@ -38,6 +38,7 @@ Quick start:
   qur add --retries 2 -- ./flaky.sh    auto-requeue up to 2 times if it fails
   qur list                             running / queued / recent jobs, all channels
   qur show 12 14                       full detail for jobs 12 and 14
+  qur wait 12                          block until job 12 ends (exit code mirrors it)
   qur logs 12 --tail                   follow job 12's output
   qur cancel                           kill the running job
   qur cancel 12                        cancel job 12 (running, frozen or queued)
@@ -252,6 +253,14 @@ def _fmt_duration(job: dict[str, Any]) -> str:
     return _fmt_secs((end - start).total_seconds())
 
 
+_STATUS_STYLES = {"done": "green", "failed": "red", "cancelled": "yellow", "interrupted": "magenta", "skipped": "dim"}
+
+
+def _fmt_status(status: str) -> str:
+    style = _STATUS_STYLES.get(status, "")
+    return f"[{style}]{status}[/{style}]" if style else status
+
+
 def _fmt_origin(job: dict[str, Any]) -> str:
     """Where a job came from: queued fresh, auto-retried by the daemon after a
     failure, or requeued by hand."""
@@ -287,7 +296,12 @@ def _parse_job_ids(values: list[str] | None, flag: str) -> list[int]:
     """Job ids from repeated `--depends-on` / `--after-any` values. Each value is a
     comma list of ids and `A-B` ranges ("12", "12,14", "31-33,40"); several flags
     combine. Returns the distinct ids, ascending. Exits with a clear error on junk."""
-    ids: set[int] = set()
+    return sorted(_collect_job_ids(values, flag))
+
+
+def _collect_job_ids(values: list[str] | None, flag: str) -> list[int]:
+    """Like `_parse_job_ids` but keeps the order given (first mention wins)."""
+    ids: dict[int, None] = {}
     for value in values or []:
         for part in value.split(","):
             part = part.strip()
@@ -300,10 +314,10 @@ def _parse_job_ids(values: list[str] | None, flag: str) -> list[int]:
                 _fail(f"{flag}: {part!r} is not a valid job id range (ids start at 1, low end first)")
             if last - first + 1 > db.MAX_SWEEP:
                 _fail(f"{flag}: {part!r} is more than {db.MAX_SWEEP} jobs")
-            ids.update(range(first, last + 1))
+            ids.update(dict.fromkeys(range(first, last + 1)))
             if len(ids) > db.MAX_SWEEP:
                 _fail(f"{flag}: more than {db.MAX_SWEEP} jobs listed")
-    return sorted(ids)
+    return list(ids)
 
 
 _DELAY_UNIT_SECS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
@@ -565,6 +579,16 @@ def add(
         "today if still ahead, else tomorrow) or 'YYYY-MM-DD HH:MM'. Same holding rule as --delay. "
         "Not with --delay or --now.",
     ),
+    env: Optional[list[str]] = typer.Option(
+        None, "--env", metavar="KEY[=VAL]",
+        help="Add an environment variable to the job; repeat for more. KEY alone copies the value from this "
+        "shell, KEY=VAL sets it. Jobs always get PATH, HOME, VIRTUAL_ENV, PYTHONPATH and PYTHONUNBUFFERED=1, "
+        "plus these when set in this shell: CUDA_VISIBLE_DEVICES, OMP_NUM_THREADS, MKL_NUM_THREADS, "
+        "OPENBLAS_NUM_THREADS, LD_LIBRARY_PATH, LANG, LC_*, TERM, TZ (change that list with the "
+        "QUEUER_ENV_PASSTHROUGH variable: comma-separated names, `*` allowed, empty = none). --env wins over "
+        "all of these; QUR_INDEX of a sweep wins over --env. Values are stored in the job and are visible "
+        "in `qur show`, except names containing KEY/TOKEN/SECRET/PASSWORD.",
+    ),
     timeout: Optional[int] = typer.Option(
         None, "--timeout", help="Kill the job if it runs longer than this many seconds (counts as a failure)"
     ),
@@ -598,6 +622,8 @@ def add(
       qur add --timeout 60 -- ./run.sh
       qur add --retries 3 -- python flaky_download.py
       qur add --on-fail pause -- ./step1.sh          # a failure pauses the channel
+      qur add --env CUDA_VISIBLE_DEVICES=1 --env OMP_NUM_THREADS=8 -- python train.py
+      qur add --env MY_SETTING -- ./run.sh            # copy MY_SETTING from this shell
       qur add --after 12 -- python eval.py
       qur add --before 12 -- python setup.py
       qur add --depends-on 12 -- python eval.py
@@ -656,6 +682,11 @@ def add(
     if now and start is not None:
         _fail("--now cannot be combined with --delay/--at")
     not_before = start.astimezone(timezone.utc).isoformat() if start is not None else None
+    try:
+        env_explicit = jobenv.parse_env_options(env, os.environ)
+    except ValueError as e:
+        _fail(str(e))
+    env_pass = {k: v for k, v in jobenv.collect_passthrough(os.environ).items() if k not in env_explicit}
 
     job_kwargs: dict[str, Any] = {"argv": job_argv, "raw_argv": cmd} if sweep is None else {"jobs": sweep}
     data = _call(
@@ -665,6 +696,8 @@ def add(
         path=os.environ.get("PATH", ""),
         virtual_env=os.environ.get("VIRTUAL_ENV"),
         python_path=os.environ.get("PYTHONPATH"),
+        env=env_explicit,
+        env_pass=env_pass,
         channel=channel,
         before=before,
         after=after,
@@ -690,6 +723,8 @@ def add(
         console.print(f"starts no earlier than {_fmt_time(not_before)}")
     if data.get("skipped"):
         console.print(f"[yellow]skipped right away:[/yellow] {escape(str(data['skipped']))}")
+    if env_explicit:
+        console.print(f"environment: {escape(', '.join(env_explicit))}")
     if on_fail == "pause":
         console.print("on failure: this channel will be paused (`qur resume` to continue)")
     if retries:
@@ -755,20 +790,21 @@ def _render_queue_and_backlog(channel_data: dict[str, Any], full: bool) -> None:
     else:
         console.print("[dim](idle -- nothing running or queued)[/dim]")
 
-    backlog_table = Table(title="Recent (last 10)", show_lines=False)
+    recent = channel_data["backlog"]
+    title = f"Recent (last {len(recent)})" if recent else "Recent"
+    if len(recent) >= db.LIST_BACKLOG:
+        title += " -- more with `qur history`"
+    backlog_table = Table(title=escape(title), show_lines=False)
     backlog_table.add_column("ID", justify="right")
     backlog_table.add_column("Status")
     backlog_table.add_column("Command")
     backlog_table.add_column("Origin")
     backlog_table.add_column("Duration", justify="right")
     backlog_table.add_column("Exit", justify="right")
-    for job in channel_data["backlog"]:
-        status_style = {
-            "done": "green", "failed": "red", "cancelled": "yellow", "interrupted": "magenta", "skipped": "dim",
-        }.get(job["status"], "")
+    for job in recent:
         backlog_table.add_row(
             str(job["id"]),
-            f"[{status_style}]{job['status']}[/{status_style}]" if status_style else job["status"],
+            _fmt_status(job["status"]),
             _cmd_str(job, full),
             _fmt_origin(job),
             _fmt_duration(job),
@@ -789,7 +825,8 @@ def list_jobs(
 
     Each channel shows its running job (marked *), then its queue, with when each
     job was queued and how long ago that was ("Elapsed" counts from queue time,
-    so it includes any wait). Below that: the last 10 finished jobs.
+    so it includes any wait). Below that: the last 10 finished jobs (older ones and
+    filters: `qur history`).
 
     The Origin column says where a job came from: "new" (queued by you),
     "retry of #N" (queued automatically by --retries after job N failed; shows
@@ -831,6 +868,108 @@ def list_jobs(
             console.print()
         console.print(f"[bold]channel {channel_id}[/bold]")
         _render_queue_and_backlog(channels[channel_id], full)
+
+
+# ---------------------------------------------------------------------------
+# history
+# ---------------------------------------------------------------------------
+
+def parse_since(text: str, now: datetime) -> datetime:
+    """`--since` value -> an absolute local time (timezone-aware), `now` being the current
+    local time. A duration ("2d", "6h", "1h30m": that long ago) or a date/time in the past
+    ("2026-10-01" = midnight local, "2026-10-01 14:30")."""
+    value = text.strip()
+    try:
+        return now - parse_delay(value)
+    except ValueError:
+        pass
+    full = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{1,2}):(\d{2}))?", value)
+    if full is None:
+        raise ValueError(f"{text!r} is not a duration (2d, 6h, 1h30m) or a date (YYYY-MM-DD, 'YYYY-MM-DD HH:MM')")
+    year, month, day = int(full.group(1)), int(full.group(2)), int(full.group(3))
+    hour, minute = int(full.group(4) or 0), int(full.group(5) or 0)
+    try:
+        when = datetime(year, month, day, hour, minute).astimezone()
+    except (ValueError, OverflowError):
+        raise ValueError(f"{text!r} is not a valid date and time") from None
+    return when
+
+
+@app.command()
+def history(
+    status: Optional[list[str]] = typer.Option(
+        None, "--status", metavar="STATUS",
+        help=f"Only jobs that ended like this ({', '.join(db.TERMINAL_STATUSES)}); repeat for several.",
+    ),
+    channel: Optional[int] = typer.Option(None, "--channel", min=1, help="Only this channel (default: all)"),
+    since: Optional[str] = typer.Option(
+        None, "--since", metavar="DURATION|DATE",
+        help="Only jobs that finished since then: a duration (2d, 6h, 1h30m) or a date "
+        "(YYYY-MM-DD, local midnight; or 'YYYY-MM-DD HH:MM').",
+    ),
+    grep: Optional[str] = typer.Option(
+        None, "--grep", metavar="TEXT", help="Only jobs whose command contains TEXT (case-insensitive)."
+    ),
+    limit: int = typer.Option(50, "--limit", "-n", min=1, max=db.MAX_HISTORY, help="Most rows to show (newest first)"),
+    full: bool = typer.Option(False, "--full", help="Show resolved absolute paths instead of what you typed"),
+    as_json: bool = typer.Option(False, "--json", help="Print the jobs as a JSON list instead of a table"),
+) -> None:
+    """Search finished jobs (done, failed, cancelled, skipped, interrupted), newest first.
+
+    The daemon keeps the last 200 finished jobs per channel (set QUEUER_KEEP in the
+    daemon's environment to change that); `qur list` shows only the last 10. Filters
+    combine (all must match). The command is matched against what you typed after `--`.
+
+    \b
+    Examples:
+      qur history
+      qur history --status failed --since 2d
+      qur history --status failed --status interrupted --channel 2
+      qur history --since 2026-10-01 --grep train.py --limit 200
+      qur history --json
+    """
+    for s in status or []:
+        if s not in db.TERMINAL_STATUSES:
+            _fail(f"--status: {s!r} is not one of {', '.join(db.TERMINAL_STATUSES)}")
+    since_ts: str | None = None
+    if since is not None:
+        try:
+            since_ts = parse_since(since, datetime.now().astimezone()).astimezone(timezone.utc).isoformat()
+        except (ValueError, OverflowError) as e:
+            _fail(f"--since: {e}")
+    data = _call(
+        "history", statuses=list(status) if status else None, channel=channel, since=since_ts, grep=grep, limit=limit,
+    )
+    jobs = data["jobs"]
+    if as_json:
+        console.print_json(json.dumps(jobs))
+        return
+    if not jobs:
+        console.print("[dim](no matching jobs)[/dim]")
+        return
+    table = Table(title=f"History ({len(jobs)})", show_lines=False)
+    table.add_column("ID", justify="right")
+    table.add_column("Ch", justify="right")
+    table.add_column("Status")
+    table.add_column("Command")
+    table.add_column("Origin")
+    table.add_column("Finished")
+    table.add_column("Duration", justify="right")
+    table.add_column("Exit", justify="right")
+    for job in jobs:
+        table.add_row(
+            str(job["id"]),
+            str(job["channel"]),
+            _fmt_status(job["status"]),
+            _cmd_str(job, full),
+            _fmt_origin(job),
+            _fmt_time(job["finished_at"]),
+            _fmt_duration(job),
+            str(job["exit_code"]) if job["exit_code"] is not None else "-",
+        )
+    console.print(table)
+    if len(jobs) >= limit:
+        console.print(f"[dim](limit {limit} reached; use --limit to see more)[/dim]")
 
 
 # ---------------------------------------------------------------------------
@@ -910,6 +1049,9 @@ def _render_job(job: dict[str, Any]) -> None:
         table.add_row("waiting on", _fmt_ids(job["waiting_on"]))
     if job.get("max_retries"):
         table.add_row("auto-retries", f"{job['attempt']} of {job['max_retries']} used")
+    env_lines = jobenv.describe(job.get("env_extra"))
+    if env_lines:
+        table.add_row("environment", escape("\n".join(env_lines)))
     table.add_row("pid", str(job["pid"]) if job["pid"] else "-")
     table.add_row("log", job["log_path"])
     if job["note"]:
@@ -919,25 +1061,31 @@ def _render_job(job: dict[str, Any]) -> None:
 
 @app.command()
 def show(
-    job_ids: list[int] = typer.Argument(..., help="One or more job IDs", metavar="JOB_ID..."),
+    job_ids: list[str] = typer.Argument(
+        ..., help="One or more job IDs; ranges (31-33) and comma lists (12,14) work too", metavar="JOB_ID...",
+    ),
     as_json: bool = typer.Option(False, "--json", help="Print raw JSON (one object, or a list for several IDs)"),
 ) -> None:
     """Show full detail for one or more jobs.
 
     Shows raw and resolved command, cwd, timestamps, duration, exit code, timeout,
-    dependencies (depends on / after any / waiting on), auto-retry count, pid, log
-    path, and any note. With several IDs, an unknown ID
-    prints an error but the others are still shown (exit code 1 at the end).
+    dependencies (depends on / after any / waiting on), auto-retry count, the extra
+    environment (names only for variables copied automatically; values hidden for
+    names containing KEY/TOKEN/SECRET/PASSWORD), pid, log path, and any note.
+    IDs can be ranges (31-33) or comma lists, as with --depends-on. With several IDs,
+    an unknown ID prints an error but the others are still shown (exit code 1 at the end).
 
     \b
     Examples:
       qur show 12
       qur show 12 14 15
+      qur show 31-33
       qur show 12 --json
     """
+    ids = _collect_job_ids(job_ids, "JOB_ID")
     jobs: list[dict[str, Any]] = []
     failed = False
-    for job_id in job_ids:
+    for job_id in ids:
         try:
             jobs.append(client.send("show", id=job_id))
         except client.DaemonError as e:
@@ -949,7 +1097,7 @@ def show(
 
     if as_json:
         if jobs:
-            console.print_json(json.dumps(jobs[0] if len(job_ids) == 1 else jobs))
+            console.print_json(json.dumps(jobs[0] if len(ids) == 1 else jobs))
     else:
         for i, job in enumerate(jobs):
             if i > 0:
@@ -958,6 +1106,230 @@ def show(
 
     if failed:
         raise typer.Exit(code=1)
+
+
+# ---------------------------------------------------------------------------
+# wait
+# ---------------------------------------------------------------------------
+
+WAIT_POLL_SECS = 1.5  # how often `qur wait` asks the daemon
+WAIT_EXIT_FAILED = 1
+WAIT_EXIT_NOT_DONE = 2  # cancelled / skipped / interrupted / removed
+WAIT_EXIT_NO_DAEMON = 3
+WAIT_EXIT_USAGE = 4  # bad arguments or an unknown job id
+WAIT_EXIT_TIMEOUT = 124  # like timeout(1)
+WAIT_EXIT_INTERRUPTED = 130  # Ctrl-C
+_RETRY_NOTE = re.compile(r"auto-retry \d+/\d+ queued as job (\d+)")
+
+
+def _wait_code(status: str) -> int:
+    """Exit code that mirrors a job's final status: 0 done, 1 failed, 2 anything else."""
+    if status == "done":
+        return 0
+    return WAIT_EXIT_FAILED if status == "failed" else WAIT_EXIT_NOT_DONE
+
+
+def _wait_worst(codes: list[int]) -> int:
+    """The worst of several job codes: a failure (1) beats cancelled/skipped/... (2) beats done (0)."""
+    if WAIT_EXIT_FAILED in codes:
+        return WAIT_EXIT_FAILED
+    return max(codes, default=0)
+
+
+def _wait_stop(msg: str, code: int) -> NoReturn:
+    typer.echo(f"Error: {msg}", err=True)
+    raise typer.Exit(code=code)
+
+
+def _wait_send(cmd: str, **kwargs: Any) -> Any:
+    """client.send, but an unreachable daemon ends `qur wait` with exit code 3."""
+    try:
+        return client.send(cmd, **kwargs)
+    except client.DaemonNotRunning as e:
+        _wait_stop(str(e), WAIT_EXIT_NO_DAEMON)
+
+
+def _print_json(obj: Any) -> None:
+    """Plain JSON on stdout (no colours, no Rich markup)."""
+    typer.echo(json.dumps(obj, indent=2))
+
+
+def _wait_record(orig: int, job: dict[str, Any] | None, watched: int) -> dict[str, Any]:
+    """The final state of one waited-for job. `watched` is the id of its last attempt
+    (differs from `orig` when `--retries` requeued it); `job` None = the row is gone."""
+    if job is None:
+        return {"id": orig, "status": "removed", "exit_code": None, "channel": None, "ran_as": watched,
+                "note": "the job no longer exists", "code": WAIT_EXIT_NOT_DONE, "finished": True}
+    return {"id": orig, "status": job["status"], "exit_code": job["exit_code"], "channel": job["channel"],
+            "ran_as": watched, "note": job["note"], "code": _wait_code(job["status"]), "finished": True}
+
+
+def _wait_poll_one(orig: int, watching: dict[int, int], seen: dict[int, str], first: bool) -> dict[str, Any] | None:
+    """Ask the daemon about one job. Returns its final record, or None while it is still
+    queued/running. A failed job that `--retries` requeued is followed to its retry (the
+    retry's id is in the note); raises LookupError for an unknown id on the first pass."""
+    while True:
+        watched = watching[orig]
+        try:
+            job = _wait_send("show", id=watched)
+        except client.DaemonError:
+            if first and watched == orig:
+                raise LookupError(orig) from None
+            return _wait_record(orig, None, watched)
+        seen[orig] = job["status"]
+        if job["status"] not in db.TERMINAL_STATUSES:
+            return None
+        if job["status"] == "failed" and job.get("attempt", 0) < job.get("max_retries", 0):
+            m = _RETRY_NOTE.search(job.get("note") or "")
+            if m and int(m.group(1)) != watched:
+                watching[orig] = int(m.group(1))
+                continue  # ask about the retry right away
+        return _wait_record(orig, job, watched)
+
+
+def _wait_sleep(deadline: float | None) -> bool:
+    """Sleep one poll interval (less if the deadline is closer). True = the deadline passed."""
+    if deadline is None:
+        time.sleep(WAIT_POLL_SECS)
+        return False
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return True
+    time.sleep(min(WAIT_POLL_SECS, remaining))
+    return False
+
+
+def _wait_for_jobs(ids: list[int], timeout: timedelta | None, announce: bool) -> tuple[list[dict[str, Any]], bool]:
+    """Block until every id in `ids` is terminal. Returns (one record per id, timed_out)."""
+    deadline = None if timeout is None else time.monotonic() + timeout.total_seconds()
+    watching = {i: i for i in ids}
+    seen: dict[int, str] = {}
+    done: dict[int, dict[str, Any]] = {}
+    first = True
+    while True:
+        missing: list[int] = []
+        for orig in ids:
+            if orig in done:
+                continue
+            try:
+                rec = _wait_poll_one(orig, watching, seen, first)
+            except LookupError:
+                missing.append(orig)
+                continue
+            if rec is not None:
+                done[orig] = rec
+                if announce:
+                    _announce_waited(rec)
+        if missing:
+            _wait_stop(f"job {_fmt_ids(missing)} does not exist" if len(missing) == 1
+                       else f"jobs {_fmt_ids(missing)} do not exist", WAIT_EXIT_USAGE)
+        first = False
+        if len(done) == len(ids):
+            return [done[i] for i in ids], False
+        if _wait_sleep(deadline):
+            pending = {"finished": False, "exit_code": None, "channel": None, "note": None, "code": None}
+            return [done.get(i) or {"id": i, "status": seen.get(i, "unknown"), "ran_as": watching[i], **pending}
+                    for i in ids], True
+
+
+def _announce_waited(rec: dict[str, Any]) -> None:
+    text = f"job {rec['id']}: {rec['status']}"
+    if rec["exit_code"] is not None:
+        text += f" (exit {rec['exit_code']})"
+    if rec["ran_as"] != rec["id"]:
+        text += f" -- last attempt was job {rec['ran_as']}"
+    console.print(escape(text))
+
+
+def _wait_for_channel(channel: int, timeout: timedelta | None, quiet: bool) -> bool:
+    """Block until `channel` has nothing running, frozen or queued. True = timed out.
+    A channel that has never had a job (or was cleared) counts as idle."""
+    deadline = None if timeout is None else time.monotonic() + timeout.total_seconds()
+    hinted = False
+    while True:
+        data = _wait_send("list")
+        chan = {int(k): v for k, v in data["channels"].items()}.get(channel)
+        if not chan or not (chan.get("running") or chan.get("frozen") or chan.get("queue") or chan.get("priority_queue")):
+            return False
+        if chan.get("paused") and not chan.get("running") and not chan.get("frozen") and not hinted and not quiet:
+            typer.echo(f"Note: channel {channel} is paused; it stays busy until `qur resume --channel {channel}`", err=True)
+            hinted = True
+        if _wait_sleep(deadline):
+            return True
+
+
+@app.command()
+def wait(
+    job_ids: Optional[list[str]] = typer.Argument(
+        None, help="Job IDs to wait for; ranges (31-33) and comma lists (12,14) work too", metavar="[JOB_ID...]",
+    ),
+    channel: Optional[int] = typer.Option(None, "--channel", min=1, help="Instead of jobs: wait until this channel is idle"),
+    timeout: Optional[str] = typer.Option(
+        None, "--timeout", metavar="DURATION", help="Give up after this long (30s, 10m, 2h, 1h30m); exit code 124",
+    ),
+    quiet: bool = typer.Option(False, "--quiet", "-q", help="Print nothing (the exit code says how it went)"),
+    as_json: bool = typer.Option(False, "--json", help="Print the final states as JSON"),
+) -> None:
+    """Block until jobs finish; the exit code says how they ended.
+
+    Waits for the given jobs to reach a final state (done, failed, cancelled, skipped,
+    interrupted), or with --channel until that channel has nothing running or queued.
+    A job that failed and was requeued by --retries is followed to its retry, so you hear
+    about the last attempt. Polls the daemon every 1.5 s.
+
+    \b
+    Exit codes:
+      0    done (--channel: the channel is idle)
+      1    failed (with several jobs: any failure)
+      2    cancelled / skipped / interrupted / removed
+      3    the daemon is not reachable
+      4    bad arguments, or a job id that does not exist
+      124  --timeout ran out
+      130  Ctrl-C
+    With several jobs, the worst code wins: 1, then 2, then 0.
+
+    \b
+    Examples:
+      qur wait 12
+      qur wait 31-33 --timeout 2h
+      qur add -- ./prep.sh && qur wait 40 && echo prepared
+      qur wait --channel 2 --quiet
+      qur wait 12 --json
+    """
+    ids = _collect_job_ids(job_ids, "JOB_ID") if job_ids else []
+    if ids and channel is not None:
+        _wait_stop("give job ids or --channel, not both", WAIT_EXIT_USAGE)
+    if not ids and channel is None:
+        _wait_stop("give at least one job id, or --channel N", WAIT_EXIT_USAGE)
+    limit: timedelta | None = None
+    if timeout is not None:
+        try:
+            limit = parse_delay(timeout)
+        except ValueError as e:
+            _wait_stop(f"--timeout: {e}", WAIT_EXIT_USAGE)
+
+    try:
+        if channel is not None:
+            timed_out = _wait_for_channel(channel, limit, quiet)
+            code = WAIT_EXIT_TIMEOUT if timed_out else 0
+            if as_json:
+                _print_json({"channel": channel, "idle": not timed_out, "timed_out": timed_out, "exit_code": code})
+            elif not quiet:
+                console.print(f"channel {channel}: " + ("still busy (timed out)" if timed_out else "idle"))
+        else:
+            records, timed_out = _wait_for_jobs(ids, limit, announce=not quiet and not as_json)
+            code = WAIT_EXIT_TIMEOUT if timed_out else _wait_worst([r["code"] for r in records])
+            if as_json:
+                _print_json({"exit_code": code, "timed_out": timed_out, "jobs": records})
+            elif timed_out and not quiet:
+                waiting = [r["id"] for r in records if not r["finished"]]
+                console.print(f"timed out; still waiting for {_fmt_ids(waiting)}")
+    except KeyboardInterrupt:
+        if not quiet:
+            typer.echo("Interrupted", err=True)
+        raise typer.Exit(code=WAIT_EXIT_INTERRUPTED) from None
+    if code:
+        raise typer.Exit(code=code)
 
 
 # ---------------------------------------------------------------------------
@@ -1007,7 +1379,7 @@ def clear(
 ) -> None:
     """Delete finished-job records (done/failed/cancelled/interrupted).
 
-    Clears the "Recent" section of `qur list`. Queued, running, and frozen jobs are
+    Clears the finished-job history (`qur list` "Recent" and `qur history`). Queued, running, and frozen jobs are
     never touched. Channels left with no jobs at all drop off the list (channel 1
     always stays). Log files stay on disk -- use `qur clean-logs` for those.
 
@@ -1556,7 +1928,7 @@ def clean_logs(
 
     Removes logs of finished jobs (done/failed/cancelled/interrupted) finished more than --days
     ago, plus orphaned logs whose job record no longer exists (e.g. pruned from
-    Recent). Never touches logs of queued, running, or frozen jobs. Reads the DB
+    the history). Never touches logs of queued, running, or frozen jobs. Reads the DB
     directly, so it works even if the daemon isn't running.
 
     \b

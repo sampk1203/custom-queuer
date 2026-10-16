@@ -3451,3 +3451,213 @@ def test_secs_until_handles_missing_past_future_and_garbage():
     assert 8 < Daemon._secs_until(_in(10)) <= 10
     naive_future = (datetime.now(timezone.utc) + timedelta(seconds=10)).replace(tzinfo=None).isoformat()
     assert 8 < Daemon._secs_until(naive_future) <= 10  # a stored naive value is read as UTC
+
+
+# ---------------------------------------------------------------------------
+# F1/B13: environment passthrough
+# ---------------------------------------------------------------------------
+
+async def _run_env_job(daemon, **add_args) -> tuple[dict, dict[str, str]]:
+    resp = await send(daemon.socket_path, "add", argv=["env"], cwd=CWD, **add_args)
+    assert resp["ok"], resp
+    job = await wait_for_status(daemon.socket_path, resp["data"]["id"], {"done", "failed"})
+    assert job["status"] == "done"
+    seen = dict(line.split("=", 1) for line in Path(job["log_path"]).read_text().splitlines() if "=" in line)
+    return job, seen
+
+
+@pytest.mark.asyncio
+async def test_job_gets_passthrough_explicit_env_and_unbuffered_default(daemon, monkeypatch):
+    monkeypatch.setenv("DAEMON_ONLY_SECRET", "must-not-reach-jobs")
+    job, seen = await _run_env_job(
+        daemon,
+        env_pass={"CUDA_VISIBLE_DEVICES": "1", "LANG": "C.UTF-8"},
+        env={"MY_SETTING": "hello", "OMP_NUM_THREADS": "4"},
+    )
+    assert seen["CUDA_VISIBLE_DEVICES"] == "1" and seen["LANG"] == "C.UTF-8"
+    assert seen["MY_SETTING"] == "hello" and seen["OMP_NUM_THREADS"] == "4"
+    assert seen["PYTHONUNBUFFERED"] == "1"
+    assert "DAEMON_ONLY_SECRET" not in seen
+    assert "QUR_ENV_PASSTHROUGH" not in seen  # the bookkeeping marker never reaches the job
+    stored = json.loads(job["env_extra"])
+    assert stored["QUR_ENV_PASSTHROUGH"] == "CUDA_VISIBLE_DEVICES,LANG"
+    assert "PYTHONUNBUFFERED" not in stored  # the default is applied at start, not stored
+
+
+@pytest.mark.asyncio
+async def test_explicit_env_overrides_passthrough_and_unbuffered(daemon):
+    job, seen = await _run_env_job(
+        daemon, env_pass={"OMP_NUM_THREADS": "8"}, env={"OMP_NUM_THREADS": "2", "PYTHONUNBUFFERED": "0"}
+    )
+    assert seen["OMP_NUM_THREADS"] == "2" and seen["PYTHONUNBUFFERED"] == "0"
+    assert "QUR_ENV_PASSTHROUGH" not in json.loads(job["env_extra"])  # nothing was left that was only passed through
+
+
+@pytest.mark.asyncio
+async def test_sweep_qur_index_wins_over_a_clashing_env(daemon):
+    jobs = [_spec(["sh", "-c", "echo idx=$QUR_INDEX x=$X"], index=i) for i in (7, 8)]
+    resp = await send(daemon.socket_path, "add", jobs=jobs, cwd=CWD, env={"QUR_INDEX": "99", "X": "1"})
+    assert resp["ok"], resp
+    for job_id, n in zip(resp["data"]["ids"], (7, 8)):
+        job = await wait_for_status(daemon.socket_path, job_id, {"done", "failed"})
+        assert Path(job["log_path"]).read_text() == f"idx={n} x=1\n"
+
+
+@pytest.mark.asyncio
+async def test_env_is_kept_by_requeue_and_retry(daemon):
+    resp = await send(
+        daemon.socket_path, "add", argv=["sh", "-c", "echo $MY_SETTING; exit 1"], cwd=CWD,
+        env={"MY_SETTING": "kept"}, env_pass={"LANG": "C"}, max_retries=1,
+    )
+    first = resp["data"]["id"]
+    await wait_for_status(daemon.socket_path, first, {"failed"})
+    retry = await wait_for_status(daemon.socket_path, first + 1, {"failed"})
+    assert Path(retry["log_path"]).read_text() == "kept\n"
+    assert json.loads(retry["env_extra"])["QUR_ENV_PASSTHROUGH"] == "LANG"
+    new_id = (await send(daemon.socket_path, "requeue", id=first))["data"]["id"]
+    again = await wait_for_status(daemon.socket_path, new_id, {"failed"})
+    assert Path(again["log_path"]).read_text() == "kept\n"
+    assert json.loads(again["env_extra"]) == json.loads(retry["env_extra"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", [
+    {"env": {"1A": "x"}}, {"env": {"A-B": "x"}}, {"env": {"A": "x\0y"}}, {"env": {"A": 1}}, {"env": ["A=1"]},
+    {"env_pass": {"A B": "x"}}, {"env_pass": {"A": "\0"}}, {"env": {"QUR_ENV_PASSTHROUGH": "x"}},
+])
+async def test_add_rejects_bad_env_and_creates_nothing(daemon, bad):
+    resp = await send(daemon.socket_path, "add", argv=["true"], cwd=CWD, **bad)
+    assert resp["ok"] is False
+    assert (await send(daemon.socket_path, "list"))["data"]["channels"] == {}
+
+
+@pytest.mark.asyncio
+async def test_add_without_env_stores_nothing_extra(daemon):
+    resp = await send(daemon.socket_path, "add", argv=["true"], cwd=CWD, env={}, env_pass={})
+    assert (await send(daemon.socket_path, "show", id=resp["data"]["id"]))["data"]["env_extra"] is None
+
+
+# ---------------------------------------------------------------------------
+# F9/U3: history that scales + filters
+# ---------------------------------------------------------------------------
+
+async def _run_quick(daemon, n: int, channel: int = 1, argv=None) -> list[int]:
+    ids = []
+    for _ in range(n):
+        resp = await send(daemon.socket_path, "add", argv=argv or ["true"], cwd=CWD, channel=channel)
+        await wait_for_status(daemon.socket_path, resp["data"]["id"], {"done", "failed"})
+        ids.append(resp["data"]["id"])
+    return ids
+
+
+def test_default_keep_reads_queuer_keep(monkeypatch, capsys):
+    from queuer.daemon import _default_keep
+
+    monkeypatch.delenv("QUEUER_KEEP", raising=False)
+    assert _default_keep() == 200
+    monkeypatch.setenv("QUEUER_KEEP", "50")
+    assert _default_keep() == 50
+    monkeypatch.setenv("QUEUER_KEEP", "  ")
+    assert _default_keep() == 200
+    assert capsys.readouterr().err == ""
+    for bad in ("0", "-3", "abc", "1.5"):
+        monkeypatch.setenv("QUEUER_KEEP", bad)
+        assert _default_keep() == 200
+        assert "QUEUER_KEEP" in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
+async def test_daemon_keeps_200_by_default_and_list_still_shows_10(daemon):
+    assert daemon.keep == 200
+    ids = await _run_quick(daemon, 12)
+    listing = (await send(daemon.socket_path, "list"))["data"]
+    assert [j["id"] for j in _ch(listing, 1)["backlog"]] == ids[::-1][:10]  # list stays short
+    hist = (await send(daemon.socket_path, "history", limit=100))["data"]["jobs"]
+    assert [j["id"] for j in hist] == ids[::-1]  # nothing was pruned at 10 any more
+
+
+@pytest.mark.asyncio
+async def test_daemon_prunes_to_its_keep_per_channel(daemon):
+    daemon.keep = 3
+    ch1 = await _run_quick(daemon, 5, channel=1)
+    ch2 = await _run_quick(daemon, 2, channel=2)
+    hist = (await send(daemon.socket_path, "history", limit=100))["data"]["jobs"]
+    assert {j["id"] for j in hist} == set(ch1[-3:]) | set(ch2)
+
+
+@pytest.mark.asyncio
+async def test_prune_never_drops_a_dependency_of_a_queued_job(daemon):
+    daemon.keep = 2
+    first = (await send(daemon.socket_path, "add", argv=["true"], cwd=CWD, channel=1))["data"]["id"]
+    await wait_for_status(daemon.socket_path, first, {"done"})
+    # a delayed dependant on another channel keeps `first` alive while the history rolls over
+    later = _in(3600)
+    dep = (await send(daemon.socket_path, "add", argv=["true"], cwd=CWD, channel=2,
+                      depends_on=[first], not_before=later))["data"]["id"]
+    await _run_quick(daemon, 4, channel=1)
+    assert (await send(daemon.socket_path, "show", id=first))["ok"]
+    assert (await send(daemon.socket_path, "cancel", id=dep))["ok"]
+    await _run_quick(daemon, 1, channel=1)
+    assert not (await send(daemon.socket_path, "show", id=first))["ok"]
+
+
+async def _history_fixture(daemon) -> dict[str, int]:
+    """done/failed/cancelled-while-queued/interrupted jobs on two channels, with known commands."""
+    out: dict[str, int] = {}
+    out["done1"] = (await _run_quick(daemon, 1, argv=["echo", "Alpha"]))[0]
+    out["fail1"] = (await _run_quick(daemon, 1, argv=["sh", "-c", "exit 3"]))[0]
+    out["done2"] = (await _run_quick(daemon, 1, channel=2, argv=["echo", "beta"]))[0]
+    blocker = (await send(daemon.socket_path, "add", argv=["sleep", "30"], cwd=CWD, channel=3))["data"]["id"]
+    queued = (await send(daemon.socket_path, "add", argv=["true"], cwd=CWD, channel=3))["data"]["id"]
+    await send(daemon.socket_path, "cancel", id=queued)
+    out["cancelled"] = queued
+    await send(daemon.socket_path, "cancel", id=blocker)
+    await wait_for_status(daemon.socket_path, blocker, {"cancelled"})
+    out["blocker"] = blocker
+    return out
+
+
+@pytest.mark.asyncio
+async def test_history_filters_through_the_socket(daemon):
+    ids = await _history_fixture(daemon)
+
+    async def hist(**kw):
+        resp = await send(daemon.socket_path, "history", **kw)
+        assert resp["ok"], resp
+        return [j["id"] for j in resp["data"]["jobs"]]
+
+    everything = await hist()
+    assert set(everything) == set(ids.values()) and len(everything) == 5
+    assert await hist(statuses=["failed"]) == [ids["fail1"]]
+    assert set(await hist(statuses=["failed", "cancelled"])) == {ids["fail1"], ids["cancelled"], ids["blocker"]}
+    assert set(await hist(channel=2)) == {ids["done2"]}
+    assert await hist(grep="alpha") == [ids["done1"]]  # case-insensitive, on the raw command
+    assert await hist(grep="exit 3") == [ids["fail1"]]
+    assert len(await hist(limit=2)) == 2
+    assert await hist(since=_in(60)) == []  # nothing finished in the future
+    assert len(await hist(since=_in(-3600))) == 5
+    assert await hist(statuses=["done"], channel=1, grep="alpha", since=_in(-3600)) == [ids["done1"]]
+    assert await hist(statuses=["done"], grep="beta", channel=1) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", [
+    {"statuses": ["queued"]}, {"statuses": "failed"}, {"statuses": [1]}, {"channel": 0}, {"channel": "1"},
+    {"limit": 0}, {"limit": -1}, {"limit": True}, {"limit": 10**6}, {"since": "yesterday"}, {"since": 5},
+    {"grep": 5},
+])
+async def test_history_rejects_bad_arguments(daemon, bad):
+    resp = await send(daemon.socket_path, "history", **bad)
+    assert resp["ok"] is False and resp["error"]
+
+
+@pytest.mark.asyncio
+async def test_history_since_accepts_naive_and_offset_timestamps(daemon):
+    (job_id,) = await _run_quick(daemon, 1)
+    finished = datetime.fromisoformat((await send(daemon.socket_path, "show", id=job_id))["data"]["finished_at"])
+    before = (finished - timedelta(seconds=5)).astimezone(timezone(timedelta(hours=5, minutes=30)))
+    for stamp in (before.isoformat(), before.astimezone(timezone.utc).replace(tzinfo=None).isoformat()):
+        resp = await send(daemon.socket_path, "history", since=stamp)
+        assert [j["id"] for j in resp["data"]["jobs"]] == [job_id]
+    after = (finished + timedelta(seconds=5)).isoformat()
+    assert (await send(daemon.socket_path, "history", since=after))["data"]["jobs"] == []

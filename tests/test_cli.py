@@ -1498,3 +1498,543 @@ def test_show_displays_not_before(monkeypatch):
     assert "still waiting" not in runner.invoke(app, ["show", "5"], env={"COLUMNS": "200"}).output
     monkeypatch.setattr(client, "send", lambda cmd, **kw: _job(5))
     assert "not before" not in runner.invoke(app, ["show", "5"], env={"COLUMNS": "200"}).output
+
+
+# ---------------------------------------------------------------------------
+# F1/B13: --env and environment passthrough
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def clean_env(monkeypatch):
+    """A caller environment with a known set of variables."""
+    import os
+
+    for name in list(os.environ):
+        if name.startswith(("LC_", "QUEUER_ENV")) or name in (
+            "CUDA_VISIBLE_DEVICES", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+            "LD_LIBRARY_PATH", "LANG", "TERM", "TZ",
+        ):
+            monkeypatch.delenv(name)
+    return monkeypatch
+
+
+def test_add_sends_explicit_env_and_copies_bare_keys(monkeypatch, clean_env):
+    clean_env.setenv("FROM_SHELL", "shellval")
+    calls = _capture_send(monkeypatch, {"id": 9, "channel": 1})
+    res = runner.invoke(app, ["add", "--env", "A=1", "--env", "FROM_SHELL", "--env", "B=x=y", "--", "true"])
+    assert res.exit_code == 0, res.output
+    assert calls[0][1]["env"] == {"A": "1", "FROM_SHELL": "shellval", "B": "x=y"}
+    assert "environment: A, FROM_SHELL, B" in res.output and "shellval" not in res.output
+
+
+@pytest.mark.parametrize("flag", ["1BAD=x", "A-B=x", "=x", "NOT_SET_ANYWHERE_XYZ"])
+def test_add_rejects_bad_env_without_calling_the_daemon(monkeypatch, clean_env, flag):
+    calls = _capture_send(monkeypatch, {"id": 9, "channel": 1})
+    res = runner.invoke(app, ["add", "--env", flag, "--", "true"])
+    assert res.exit_code == 1 and calls == []
+
+
+def test_add_sends_the_default_passthrough_only(monkeypatch, clean_env):
+    clean_env.setenv("CUDA_VISIBLE_DEVICES", "1")
+    clean_env.setenv("OMP_NUM_THREADS", "8")
+    clean_env.setenv("LC_ALL", "C.UTF-8")
+    clean_env.setenv("MY_API_TOKEN", "do-not-leak")
+    calls = _capture_send(monkeypatch, {"id": 9, "channel": 1})
+    assert runner.invoke(app, ["add", "--", "true"]).exit_code == 0
+    kw = calls[0][1]
+    assert kw["env"] == {}
+    assert kw["env_pass"] == {"CUDA_VISIBLE_DEVICES": "1", "OMP_NUM_THREADS": "8", "LC_ALL": "C.UTF-8"}
+
+
+def test_add_passthrough_list_can_be_overridden_or_emptied(monkeypatch, clean_env):
+    clean_env.setenv("CUDA_VISIBLE_DEVICES", "1")
+    clean_env.setenv("MPI_RANK", "2")
+    clean_env.setenv("QUEUER_ENV_PASSTHROUGH", "MPI_*")
+    calls = _capture_send(monkeypatch, {"id": 9, "channel": 1})
+    assert runner.invoke(app, ["add", "--", "true"]).exit_code == 0
+    assert calls[0][1]["env_pass"] == {"MPI_RANK": "2"}
+    clean_env.setenv("QUEUER_ENV_PASSTHROUGH", "")
+    assert runner.invoke(app, ["add", "--", "true"]).exit_code == 0
+    assert calls[1][1]["env_pass"] == {}
+
+
+def test_explicit_env_wins_over_passthrough_of_the_same_name(monkeypatch, clean_env):
+    clean_env.setenv("OMP_NUM_THREADS", "8")
+    calls = _capture_send(monkeypatch, {"id": 9, "channel": 1})
+    assert runner.invoke(app, ["add", "--env", "OMP_NUM_THREADS=2", "--", "true"]).exit_code == 0
+    kw = calls[0][1]
+    assert kw["env"] == {"OMP_NUM_THREADS": "2"} and "OMP_NUM_THREADS" not in kw["env_pass"]
+
+
+def test_add_env_flag_is_not_swallowed_by_each(monkeypatch, clean_env):
+    calls = _capture_send(monkeypatch, {"id": 9, "ids": [9, 10], "channel": 1})
+    res = runner.invoke(app, ["add", "--each", "a", "b", "--env", "X=1", "--", "echo", "{}"])
+    assert res.exit_code == 0, res.output
+    assert calls[0][1]["env"] == {"X": "1"} and len(calls[0][1]["jobs"]) == 2
+
+
+def test_show_displays_environment_masked(monkeypatch):
+    extra = {
+        "OMP_NUM_THREADS": "8", "MY_SETTING": "hello", "API_TOKEN": "topsecret", "PATH": "/x:/y",
+        "QUR_ENV_PASSTHROUGH": "OMP_NUM_THREADS",
+    }
+    monkeypatch.setattr(client, "send", lambda cmd, **kw: _job(5, env_extra=json.dumps(extra)))
+    out = runner.invoke(app, ["show", "5"], env={"COLUMNS": "200"}).output
+    assert "environment" in out and "MY_SETTING=hello" in out and "API_TOKEN=***" in out
+    assert "OMP_NUM_THREADS" in out and "OMP_NUM_THREADS=8" not in out
+    assert "topsecret" not in out and "/x:/y" not in out and "QUR_ENV_PASSTHROUGH" not in out
+    monkeypatch.setattr(client, "send", lambda cmd, **kw: _job(5))
+    assert "environment" not in runner.invoke(app, ["show", "5"], env={"COLUMNS": "200"}).output
+
+
+# ---------------------------------------------------------------------------
+# F9/U3: qur history, show ranges, list title
+# ---------------------------------------------------------------------------
+
+from queuer.cli import _collect_job_ids, parse_since  # noqa: E402
+
+
+def test_parse_since_accepts_durations_and_dates():
+    now = datetime(2026, 10, 16, 12, 0).astimezone()
+    assert parse_since("2d", now) == now - timedelta(days=2)
+    assert parse_since("1h30m", now) == now - timedelta(minutes=90)
+    assert parse_since(" 6H ", now) == now - timedelta(hours=6)
+    assert parse_since("2026-10-01", now) == datetime(2026, 10, 1).astimezone()
+    assert parse_since("2026-10-01 14:30", now) == datetime(2026, 10, 1, 14, 30).astimezone()
+    assert parse_since("2026-10-01T09:05", now) == datetime(2026, 10, 1, 9, 5).astimezone()
+
+
+@pytest.mark.parametrize("bad", ["", "5", "yesterday", "0d", "2026-13-01", "2026-02-30", "10-01", "2d3"])
+def test_parse_since_rejects_junk(bad):
+    now = datetime(2026, 10, 16, 12, 0).astimezone()
+    with pytest.raises(ValueError):
+        parse_since(bad, now)
+
+
+def test_collect_job_ids_keeps_order_and_expands_ranges():
+    assert _collect_job_ids(["14", "12"], "X") == [14, 12]
+    assert _collect_job_ids(["31-33", "40,12", "32"], "X") == [31, 32, 33, 40, 12]
+    assert _collect_job_ids(None, "X") == []
+
+
+def test_show_accepts_ranges_and_keeps_json_shape(fake_daemon):
+    res = runner.invoke(app, ["show", "1-3"])
+    assert res.exit_code == 0, res.output
+    assert all(f"Job #{i}" in res.output for i in (1, 2, 3))
+    assert [j["id"] for j in json.loads(runner.invoke(app, ["show", "2-3", "--json"]).output)] == [2, 3]
+    assert json.loads(runner.invoke(app, ["show", "2-2", "--json"]).output)["id"] == 2  # one id -> an object
+    res = runner.invoke(app, ["show", "3", "1"])
+    assert res.output.index("Job #3") < res.output.index("Job #1")  # order as typed
+
+
+def test_show_range_with_unknown_ids_reports_them_and_exits_1(fake_daemon):
+    res = runner.invoke(app, ["show", "2-5"])
+    assert res.exit_code == 1 and "Job #2" in res.output and "Job #3" in res.output
+    assert "4" in res.output and "5" in res.output
+
+
+def test_show_rejects_junk_ids(fake_daemon):
+    assert runner.invoke(app, ["show", "abc"]).exit_code == 1
+    assert runner.invoke(app, ["show", "5-2"]).exit_code == 1
+
+
+def _history_rows():
+    return [
+        _job(7, channel=2, status="failed", exit_code=1, finished_at="2026-10-15T10:00:00+00:00",
+             started_at="2026-10-15T09:00:00+00:00", raw_cmd=json.dumps(["python", "train.py"])),
+        _job(5, status="done", exit_code=0, finished_at="2026-10-14T10:00:00+00:00"),
+    ]
+
+
+def test_history_sends_filters_and_prints_a_table(monkeypatch):
+    calls = _capture_send(monkeypatch, {"jobs": _history_rows()})
+    res = runner.invoke(app, ["history", "--status", "failed", "--status", "interrupted", "--channel", "2",
+                              "--grep", "train", "--limit", "20"], env={"COLUMNS": "200"})
+    assert res.exit_code == 0, res.output
+    cmd, kw = calls[0]
+    assert cmd == "history"
+    assert kw == {"statuses": ["failed", "interrupted"], "channel": 2, "since": None, "grep": "train", "limit": 20}
+    assert "History (2)" in res.output and "python train.py" in res.output and "failed" in res.output
+
+
+def test_history_defaults_send_no_filters(monkeypatch):
+    calls = _capture_send(monkeypatch, {"jobs": []})
+    res = runner.invoke(app, ["history"])
+    assert res.exit_code == 0 and "no matching jobs" in res.output
+    assert calls[0][1] == {"statuses": None, "channel": None, "since": None, "grep": None, "limit": 50}
+
+
+def test_history_since_is_sent_as_an_absolute_utc_timestamp(monkeypatch):
+    calls = _capture_send(monkeypatch, {"jobs": []})
+    before = datetime.now(timezone.utc)
+    assert runner.invoke(app, ["history", "--since", "2d"]).exit_code == 0
+    sent = datetime.fromisoformat(calls[0][1]["since"])
+    assert sent.utcoffset() == timedelta(0)
+    assert timedelta(days=2) - timedelta(seconds=5) <= before - sent <= timedelta(days=2) + timedelta(seconds=5)
+    assert runner.invoke(app, ["history", "--since", "2026-10-01"]).exit_code == 0
+    assert datetime.fromisoformat(calls[1][1]["since"]) == datetime(2026, 10, 1).astimezone()
+
+
+@pytest.mark.parametrize("flags", [
+    ["--status", "queued"], ["--status", "bogus"], ["--since", "yesterday"], ["--limit", "0"],
+    ["--limit", "100000"], ["--channel", "0"],
+])
+def test_history_rejects_bad_options_without_calling_the_daemon(monkeypatch, flags):
+    calls = _capture_send(monkeypatch, {"jobs": []})
+    res = runner.invoke(app, ["history", *flags])
+    assert res.exit_code != 0 and calls == []
+
+
+def test_history_json_is_a_plain_list(monkeypatch):
+    _capture_send(monkeypatch, {"jobs": _history_rows()})
+    data = json.loads(runner.invoke(app, ["history", "--json"]).output)
+    assert [j["id"] for j in data] == [7, 5] and data[0]["status"] == "failed"
+    _capture_send(monkeypatch, {"jobs": []})
+    assert json.loads(runner.invoke(app, ["history", "--json"]).output) == []
+
+
+def test_history_notes_when_the_limit_was_reached(monkeypatch):
+    _capture_send(monkeypatch, {"jobs": _history_rows()})
+    assert "limit 2 reached" in runner.invoke(app, ["history", "--limit", "2"]).output
+    assert "limit" not in runner.invoke(app, ["history", "--limit", "3"]).output.replace("--limit", "")
+
+
+def test_history_full_shows_resolved_commands(monkeypatch):
+    _capture_send(monkeypatch, {"jobs": [_job(5, status="done", finished_at="2026-10-14T10:00:00+00:00")]})
+    wide = {"COLUMNS": "200"}
+    assert "/bin/echo" in runner.invoke(app, ["history", "--full"], env=wide).output
+    assert "/bin/echo" not in runner.invoke(app, ["history"], env=wide).output
+
+
+def test_list_title_reflects_the_real_number_of_recent_jobs(monkeypatch):
+    def listing(n):
+        chan = _chan()
+        chan["backlog"] = [_job(i, status="done", finished_at="2026-10-14T10:00:00+00:00") for i in range(1, n + 1)]
+        return {"channels": {"1": chan}}
+
+    monkeypatch.setattr(client, "send", lambda cmd, **kw: listing(3))
+    out = runner.invoke(app, ["list"], env={"COLUMNS": "200"}).output
+    assert "Recent (last 3)" in out and "qur history" not in out
+    monkeypatch.setattr(client, "send", lambda cmd, **kw: listing(10))
+    out = runner.invoke(app, ["list"], env={"COLUMNS": "200"}).output
+    assert "Recent (last 10)" in out and "qur history" in out
+    monkeypatch.setattr(client, "send", lambda cmd, **kw: listing(0))
+    out = runner.invoke(app, ["list"], env={"COLUMNS": "200"}).output
+    assert "Recent" in out and "last" not in out
+
+
+def test_clean_logs_works_with_a_long_history(tmp_path, monkeypatch):
+    """30 finished rows are kept (more than the old 10): old ones lose their log, fresh ones keep it,
+    and a log whose row is gone is an orphan only when it is also old."""
+    import os
+    import time
+
+    from queuer import db
+
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    dbp = tmp_path / "state" / "queuer.db"
+    conn = db.connect(dbp)
+    db.init_db(conn)
+    old_ids, new_ids = [], []
+    for n in range(30):
+        job_id = db.enqueue(conn, raw_cmd=["x"], resolved_cmd=["/bin/x"], cwd="/tmp", log_path=str(log_dir / f"{n}.log"))
+        db.mark_running(conn, job_id, pid=1, pgid=1)
+        db.mark_finished(conn, job_id, status="done", exit_code=0, keep_backlog=db.DEFAULT_KEEP)
+        if n < 20:
+            conn.execute("UPDATE jobs SET finished_at = '2020-01-01T00:00:00+00:00' WHERE id = ?", (job_id,))
+            old_ids.append(job_id)
+        else:
+            new_ids.append(job_id)
+    conn.commit()
+    assert len(db.get_history(conn, limit=100)) == 30
+    conn.close()
+    past = time.time() - 40 * 86400
+    for job_id in old_ids + new_ids:
+        f = log_dir / f"{job_id}.log"
+        f.write_text("x")
+        if job_id in old_ids:
+            os.utime(f, (past, past))
+    (log_dir / "9999.log").write_text("orphan, fresh")  # no row, but young: stays
+    monkeypatch.setenv("QUEUER_LOG_DIR", str(log_dir))
+    monkeypatch.setenv("QUEUER_DB_PATH", str(dbp))
+    res = CliRunner().invoke(app, ["clean-logs", "--days", "30"])
+    assert res.exit_code == 0, res.output
+    assert not any((log_dir / f"{i}.log").exists() for i in old_ids)
+    assert all((log_dir / f"{i}.log").exists() for i in new_ids)
+    assert (log_dir / "9999.log").exists()
+
+
+# ---------------------------------------------------------------------------
+# qur wait / --json on show and status (daemon calls stubbed out)
+# ---------------------------------------------------------------------------
+
+import types  # noqa: E402
+
+import queuer.cli as cli_mod  # noqa: E402
+
+
+def _ended(job_id, status="done", exit_code=0, **kw):
+    return _job(job_id, status=status, exit_code=exit_code, started_at="2026-01-01T00:00:00+00:00",
+                finished_at="2026-01-01T00:01:00+00:00", **kw)
+
+
+class _WaitEnv:
+    """Scripted daemon for `qur wait`: `jobs[id]` is a list of replies to successive `show`
+    calls (the last one repeats; None = the job does not exist (any more)); `lists` are
+    successive `list` replies. Time is fake: each sleep advances the clock."""
+
+    def __init__(self, monkeypatch, jobs=None, lists=None):
+        self.jobs = {k: list(v) for k, v in (jobs or {}).items()}
+        self.lists = list(lists or [])
+        self.sleeps = []
+        self.shows = []
+        self.now = 1000.0
+        self.down = False
+        monkeypatch.setattr(client, "send", self._send)
+        monkeypatch.setattr(cli_mod, "time", types.SimpleNamespace(sleep=self._sleep, monotonic=lambda: self.now))
+
+    def _sleep(self, secs):
+        self.sleeps.append(secs)
+        self.now += secs
+
+    def _send(self, cmd, **kw):
+        if self.down:
+            raise client.DaemonNotRunning("queuerd is not running")
+        if cmd == "show":
+            self.shows.append(kw["id"])
+            seq = self.jobs.get(kw["id"])
+            if seq is None:
+                raise client.DaemonError(f"job {kw['id']} does not exist")
+            item = seq.pop(0) if len(seq) > 1 else seq[0]
+            if item is None:
+                raise client.DaemonError(f"job {kw['id']} does not exist")
+            return item
+        if cmd == "list":
+            return self.lists.pop(0) if len(self.lists) > 1 else self.lists[0]
+        raise AssertionError(cmd)
+
+
+def _idle_chan(**kw):
+    return {**_chan(), **kw}
+
+
+def test_wait_done_exits_0_and_says_so(monkeypatch):
+    env = _WaitEnv(monkeypatch, {5: [_job(5, status="running"), _ended(5)]})
+    res = runner.invoke(app, ["wait", "5"])
+    assert res.exit_code == 0 and "job 5: done (exit 0)" in res.output
+    assert env.sleeps == [cli_mod.WAIT_POLL_SECS]  # one poll interval between the two replies
+
+
+@pytest.mark.parametrize("status,code", [
+    ("done", 0), ("failed", 1), ("cancelled", 2), ("skipped", 2), ("interrupted", 2),
+])
+def test_wait_exit_code_mirrors_the_final_status(monkeypatch, status, code):
+    _WaitEnv(monkeypatch, {7: [_ended(7, status=status, exit_code=None if status != "failed" else 3)]})
+    res = runner.invoke(app, ["wait", "7"])
+    assert res.exit_code == code and status in res.output
+
+
+def test_wait_several_jobs_exits_with_the_worst_code(monkeypatch):
+    jobs = {1: [_ended(1)], 2: [_ended(2, status="cancelled", exit_code=None)], 3: [_ended(3, status="failed", exit_code=1)]}
+    _WaitEnv(monkeypatch, jobs)
+    assert runner.invoke(app, ["wait", "1", "2"]).exit_code == 2
+    assert runner.invoke(app, ["wait", "1", "3"]).exit_code == 1
+    assert runner.invoke(app, ["wait", "1", "2", "3"]).exit_code == 1  # a failure beats cancelled
+    assert runner.invoke(app, ["wait", "1"]).exit_code == 0
+
+
+def test_wait_takes_ranges_and_waits_for_the_slowest(monkeypatch):
+    env = _WaitEnv(monkeypatch, {
+        31: [_ended(31)],
+        32: [_job(32, status="queued"), _job(32, status="running"), _ended(32)],
+        33: [_job(33, status="queued"), _job(33, status="queued"), _job(33, status="queued"), _ended(33)],
+    })
+    res = runner.invoke(app, ["wait", "31-33"])
+    assert res.exit_code == 0
+    assert len(env.sleeps) == 3
+    assert env.shows.count(31) == 1  # a finished job is not asked about again
+    assert [ln for ln in res.output.splitlines() if ln.startswith("job ")][0].startswith("job 31")
+
+
+def test_wait_unknown_id_fails_at_once_with_exit_4(monkeypatch):
+    env = _WaitEnv(monkeypatch, {1: [_job(1, status="running")]})
+    res = runner.invoke(app, ["wait", "1", "99"])
+    assert res.exit_code == 4 and "job 99 does not exist" in res.output
+    assert env.sleeps == []  # reported immediately, nothing was waited for
+
+
+def test_wait_job_removed_meanwhile_counts_as_not_done(monkeypatch):
+    _WaitEnv(monkeypatch, {4: [_job(4), None]})
+    res = runner.invoke(app, ["wait", "4"])
+    assert res.exit_code == 2 and "removed" in res.output
+
+
+def test_wait_daemon_down_exits_3(monkeypatch):
+    env = _WaitEnv(monkeypatch, {1: [_job(1)]})
+    env.down = True
+    res = runner.invoke(app, ["wait", "1"])
+    assert res.exit_code == 3 and "not running" in res.output
+    res = runner.invoke(app, ["wait", "--channel", "1"])
+    assert res.exit_code == 3
+
+
+def test_wait_daemon_dying_mid_wait_exits_3(monkeypatch):
+    env = _WaitEnv(monkeypatch, {1: [_job(1, status="running")]})
+    real = env._sleep
+
+    def sleep_then_die(secs):
+        real(secs)
+        env.down = True
+
+    monkeypatch.setattr(cli_mod.time, "sleep", sleep_then_die)
+    assert runner.invoke(app, ["wait", "1"]).exit_code == 3
+
+
+def test_wait_ctrl_c_exits_130(monkeypatch):
+    env = _WaitEnv(monkeypatch, {1: [_job(1, status="running")]})
+
+    def interrupt(secs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli_mod.time, "sleep", interrupt)
+    res = runner.invoke(app, ["wait", "1"])
+    assert res.exit_code == 130 and env.shows == [1]
+
+
+def test_wait_timeout_exits_124_and_names_what_is_left(monkeypatch):
+    env = _WaitEnv(monkeypatch, {1: [_ended(1)], 2: [_job(2, status="running")]})
+    res = runner.invoke(app, ["wait", "1", "2", "--timeout", "5s"])
+    assert res.exit_code == 124 and "still waiting for 2" in res.output
+    assert sum(env.sleeps) == pytest.approx(5.0)  # the last sleep is cut to the deadline
+    assert max(env.sleeps) <= cli_mod.WAIT_POLL_SECS
+
+
+def test_wait_finishing_before_the_timeout_is_not_a_timeout(monkeypatch):
+    _WaitEnv(monkeypatch, {1: [_job(1, status="running"), _ended(1)]})
+    assert runner.invoke(app, ["wait", "1", "--timeout", "1m"]).exit_code == 0
+
+
+@pytest.mark.parametrize("args", [
+    [], ["--timeout", "5m"], ["1", "--channel", "1"], ["1", "--timeout", "soon"], ["1", "--timeout", "5"],
+])
+def test_wait_bad_arguments_exit_4_without_calling_the_daemon(monkeypatch, args):
+    env = _WaitEnv(monkeypatch, {1: [_ended(1)]})
+    res = runner.invoke(app, ["wait", *args])
+    assert res.exit_code == 4 and env.shows == [] and "Error:" in res.output
+
+
+@pytest.mark.parametrize("ids", [["abc"], ["3-1"], ["0"]])
+def test_wait_rejects_junk_ids_like_show_does(monkeypatch, ids):
+    env = _WaitEnv(monkeypatch, {1: [_ended(1)]})
+    res = runner.invoke(app, ["wait", *ids])
+    assert res.exit_code == 1 and env.shows == []  # the shared id parser exits 1
+
+
+def test_wait_quiet_prints_nothing_but_keeps_the_exit_code(monkeypatch):
+    _WaitEnv(monkeypatch, {1: [_ended(1, status="failed", exit_code=2)]})
+    res = runner.invoke(app, ["wait", "1", "--quiet"])
+    assert res.exit_code == 1 and res.output == ""
+
+
+def test_wait_json_lists_final_states(monkeypatch):
+    _WaitEnv(monkeypatch, {1: [_ended(1)], 2: [_ended(2, status="failed", exit_code=4, note="boom")]})
+    res = runner.invoke(app, ["wait", "1-2", "--json"])
+    assert res.exit_code == 1
+    data = json.loads(res.stdout)
+    assert data["exit_code"] == 1 and data["timed_out"] is False
+    assert [j["id"] for j in data["jobs"]] == [1, 2]
+    assert set(data["jobs"][1]) == {"id", "status", "exit_code", "channel", "ran_as", "note", "code", "finished"}
+    assert data["jobs"][1]["status"] == "failed" and data["jobs"][1]["exit_code"] == 4 and data["jobs"][1]["note"] == "boom"
+    assert "job 1: done" not in res.stdout  # nothing but the JSON on stdout
+
+
+def test_wait_json_on_timeout_marks_unfinished_jobs(monkeypatch):
+    _WaitEnv(monkeypatch, {1: [_job(1, status="running")]})
+    res = runner.invoke(app, ["wait", "1", "--json", "--timeout", "2s"])
+    data = json.loads(res.stdout)
+    assert res.exit_code == 124 and data["timed_out"] is True and data["exit_code"] == 124
+    assert data["jobs"][0]["status"] == "running" and data["jobs"][0]["finished"] is False
+
+
+def test_wait_follows_an_auto_retry_to_the_last_attempt(monkeypatch):
+    failed = _ended(5, status="failed", exit_code=1, max_retries=2, attempt=0,
+                    note="auto-retry 1/2 queued as job 9")
+    env = _WaitEnv(monkeypatch, {5: [failed], 9: [_job(9, status="running"), _ended(9, origin="retry", parent_id=5)]})
+    res = runner.invoke(app, ["wait", "5", "--json"])
+    data = json.loads(res.stdout)
+    assert res.exit_code == 0 and data["jobs"][0]["status"] == "done" and data["jobs"][0]["ran_as"] == 9
+    assert data["jobs"][0]["id"] == 5 and 9 in env.shows
+
+
+def test_wait_reports_a_failure_when_the_retries_are_used_up(monkeypatch):
+    last = _ended(9, status="failed", exit_code=1, max_retries=1, attempt=1, note="final")
+    _WaitEnv(monkeypatch, {5: [_ended(5, status="failed", exit_code=1, max_retries=1, attempt=0,
+                                      note="auto-retry 1/1 queued as job 9")], 9: [last]})
+    res = runner.invoke(app, ["wait", "5"])
+    assert res.exit_code == 1 and "last attempt was job 9" in res.output
+
+
+def test_wait_channel_until_idle(monkeypatch):
+    busy = {"channels": {"2": _idle_chan(running=_job(1, channel=2, status="running"))}}
+    queued = {"channels": {"2": _idle_chan(queue=[_job(2, channel=2)])}}
+    idle = {"channels": {"2": _idle_chan()}}
+    env = _WaitEnv(monkeypatch, lists=[busy, queued, idle])
+    res = runner.invoke(app, ["wait", "--channel", "2"])
+    assert res.exit_code == 0 and "channel 2: idle" in res.output and len(env.sleeps) == 2
+
+
+def test_wait_channel_other_channels_do_not_matter_and_unknown_channel_is_idle(monkeypatch):
+    data = {"channels": {"1": _idle_chan(running=_job(1, status="running")), "2": _idle_chan()}}
+    env = _WaitEnv(monkeypatch, lists=[data])
+    assert runner.invoke(app, ["wait", "--channel", "2"]).exit_code == 0
+    assert runner.invoke(app, ["wait", "--channel", "7"]).exit_code == 0
+    assert env.sleeps == []
+
+
+def test_wait_channel_timeout_and_json(monkeypatch):
+    busy = {"channels": {"1": _idle_chan(running=_job(1, status="running"))}}
+    _WaitEnv(monkeypatch, lists=[busy])
+    res = runner.invoke(app, ["wait", "--channel", "1", "--timeout", "3s", "--json"])
+    assert res.exit_code == 124
+    assert json.loads(res.stdout) == {"channel": 1, "idle": False, "timed_out": True, "exit_code": 124}
+    idle = {"channels": {"1": _idle_chan()}}
+    _WaitEnv(monkeypatch, lists=[idle])
+    res = runner.invoke(app, ["wait", "--channel", "1", "--json"])
+    assert res.exit_code == 0 and json.loads(res.stdout)["idle"] is True
+
+
+def test_wait_channel_paused_with_queued_jobs_hints_once(monkeypatch):
+    paused = {"channels": {"1": _idle_chan(queue=[_job(1)], paused=True)}}
+    _WaitEnv(monkeypatch, lists=[paused])
+    res = runner.invoke(app, ["wait", "--channel", "1", "--timeout", "5s"])
+    assert res.exit_code == 124 and res.stderr.count("is paused") == 1
+    res = runner.invoke(app, ["wait", "--channel", "1", "--timeout", "5s", "--quiet"])
+    assert "is paused" not in res.stderr
+
+
+def test_wait_exit_code_helpers():
+    assert cli_mod._wait_worst([]) == 0
+    assert cli_mod._wait_worst([0, 2]) == 2 and cli_mod._wait_worst([2, 1, 0]) == 1
+
+
+def test_status_json_is_plain_parseable_json(monkeypatch):
+    data = {"channels": {"1": {"running": _job(1, status="running"), "frozen": None, "paused": False}}}
+    monkeypatch.setattr(client, "send", lambda cmd, **kw: data)
+    res = runner.invoke(app, ["status", "--json"])
+    assert res.exit_code == 0 and "\x1b" not in res.stdout
+    parsed = json.loads(res.stdout)
+    assert set(parsed["channels"]["1"]) == {"running", "frozen", "paused"}
+    assert parsed["channels"]["1"]["running"]["id"] == 1
+
+
+def test_status_json_with_no_channels(monkeypatch):
+    monkeypatch.setattr(client, "send", lambda cmd, **kw: {"channels": {}})
+    assert json.loads(runner.invoke(app, ["status", "--json"]).stdout) == {"channels": {}}
+
+
+def test_show_json_has_no_markup_even_for_bracketed_commands(monkeypatch):
+    job = _job(1, raw_cmd=json.dumps(["echo", "[red]x[/red]"]))
+    monkeypatch.setattr(client, "send", lambda cmd, **kw: job)
+    res = runner.invoke(app, ["show", "1", "--json"])
+    assert res.exit_code == 0 and json.loads(res.stdout)["raw_cmd"] == job["raw_cmd"]

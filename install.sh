@@ -268,17 +268,19 @@ fi
 # NOT set: ProtectHome / ProtectSystem=strict (jobs write to $HOME and their cwd) and
 # PrivateTmp (the daemon's /tmp/queuer-<uid> socket fallback must stay visible).
 #
-#   QUEUER_HARDEN=full   (default) everything below
-#   QUEUER_HARDEN=basic  without ProtectKernel*, which need user namespaces
+#   QUEUER_HARDEN=basic  (default) UMask, NoNewPrivileges, LockPersonality, RestrictAddressFamilies
 #   QUEUER_HARDEN=none   the old, unsandboxed unit
 #
-# If systemd refuses to start the service at the requested level (typically a kernel
-# or systemd that cannot do user-mode namespaces), the installer steps down one level
-# at a time and says so; it never leaves you without a running daemon.
-HARDEN="${QUEUER_HARDEN:-full}"
+# (A third level with ProtectKernelTunables/Modules was removed: an unprivileged user service
+# cannot drop capabilities on many systems -- status=218/CAPABILITIES -- and it added next to
+# nothing, your user cannot write /proc/sys or load kernel modules anyway.)
+#
+# If systemd refuses to start the service with `basic`, the installer falls back to `none` and
+# says so; it never leaves you without a running daemon.
+HARDEN="${QUEUER_HARDEN:-basic}"
 case "$HARDEN" in
-    full|basic|none) ;;
-    *) echo "QUEUER_HARDEN must be full, basic or none (got '$HARDEN')" >&2; exit 2 ;;
+    basic|none) ;;
+    *) echo "QUEUER_HARDEN must be basic or none (got '$HARDEN')" >&2; exit 2 ;;
 esac
 
 hardening_lines() {  # hardening_lines LEVEL -> the [Service] lines for that level
@@ -293,12 +295,6 @@ LockPersonality=yes
 # AF_NETLINK is kept on purpose: getifaddrs() (MPI, NCCL, psutil, `ip`) needs it.
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 EOT
-    if [ "$1" = full ]; then
-        cat << 'EOT'
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-EOT
-    fi
 }
 
 write_unit() {  # write_unit LEVEL
@@ -326,9 +322,9 @@ EOF
 
 start_service() {  # start at $HARDEN, stepping down until systemd accepts the unit
     local level
-    for level in full basic none; do
+    for level in basic none; do
         case "$HARDEN:$level" in
-            basic:full|none:full|none:basic) continue ;;  # stricter than asked for
+            none:basic) continue ;;  # stricter than asked for
         esac
         write_unit "$level"
         systemctl --user daemon-reload

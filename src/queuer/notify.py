@@ -54,6 +54,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
+from queuer import jobenv
+
 API_BASE = "https://api.telegram.org"
 SEND_TIMEOUT_SECS = 10
 POLL_SECS = 10
@@ -71,6 +73,8 @@ LIST_CMD_MIN_CHARS = 40
 TG_MAX_CHARS = 4096
 LOG_TAIL_LINES = 20  # lines the Logs button shows (fewer if they would not fit in one message)
 LOG_READ_BYTES = 16384  # how far back from the end of the log file to read
+LIST_MAX_BACKLOG = 10  # finished jobs with buttons in a list message (Telegram allows 100 buttons per message)
+LIST_TEXT_MAX_BACKLOG = 100  # finished jobs considered for the list text, however long the history is (_fit trims to 4096 chars)
 LIST_MAX_QUEUE_BUTTONS = 20  # Telegram allows 100 buttons per message
 MENU_STATUS = "📊 Status"
 MENU_LIST = "📋 List"
@@ -581,7 +585,7 @@ def list_markup(cfg: dict[str, Any], chan: dict[str, Any]) -> dict[str, Any] | N
     rows = [[btn(j, "sh", "ℹ️"), btn(j, "lg", "📄"), btn(j, "cn", "❌")] for j in (chan.get("frozen"), chan.get("running")) if j]
     queued = ((chan.get("priority_queue") or []) + chan["queue"])[:LIST_MAX_QUEUE_BUTTONS]
     rows += [[btn(j, "sh", "ℹ️"), btn(j, "cn", "❌")] for j in queued]
-    rows += [[btn(j, "sh", "ℹ️"), btn(j, "lg", "📄"), btn(j, "rl", "🔁")] for j in chan["backlog"]]
+    rows += [[btn(j, "sh", "ℹ️"), btn(j, "lg", "📄"), btn(j, "rl", "🔁")] for j in chan["backlog"][:LIST_MAX_BACKLOG]]
     return {"inline_keyboard": rows} if rows else None
 
 
@@ -832,6 +836,9 @@ def _format_details(job: dict[str, Any], cfg: dict[str, Any], cmd_cap: int) -> s
         lines.append(row("after any", _id_list(job["after_any"])))
     if job.get("waiting_on"):
         lines.append(row("waiting on", _id_list(job["waiting_on"])))
+    env_lines = jobenv.describe(job.get("env_extra"))
+    if env_lines:
+        lines.append(row("environment", _cap(", ".join(env_lines), field_cap), code=True))
     lines.append(row("pid", str(job["pid"]) if job.get("pid") else "-"))
     lines.append(row("log", _cap(job.get("log_path") or "-", field_cap), code=True))
     if job.get("note"):
@@ -915,7 +922,7 @@ def format_list(data: dict[str, Any], cfg: dict[str, Any], channel: int) -> str:
         if _in_future(job.get("not_before")):
             waiting += f" · starts {_local(job['not_before'])}"
         entries.append((job, "⏳", f" · queued {_since(job.get('enqueued_at'))}{waiting}"))
-    for job in chan["backlog"]:
+    for job in chan["backlog"][:LIST_TEXT_MAX_BACKLOG]:
         dur = _duration(job)
         exit_s = f" · exit {job['exit_code']}" if job.get("exit_code") is not None else ""
         entries.append((job, _ICONS.get(job["status"], "•"), (f" · {dur}" if dur else "") + exit_s))

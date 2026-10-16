@@ -847,3 +847,27 @@ def test_format_details_and_list_show_a_start_time():
     assert "starts " in notify.format_list(data, CFG, 1)
     data["channels"][1]["queue"] = [{**base, "not_before": past}]
     assert "starts " not in notify.format_list(data, CFG, 1)
+
+
+def test_format_details_lists_environment_masked_and_escaped():
+    extra = {
+        "OMP_NUM_THREADS": "8", "MY_SETTING": "<b>", "API_TOKEN": "topsecret",
+        "QUR_ENV_PASSTHROUGH": "OMP_NUM_THREADS",
+    }
+    t = notify.format_details(_job(env_extra=json.dumps(extra)), CFG)
+    assert "<b>environment</b>" in t
+    assert "OMP_NUM_THREADS" in t and "OMP_NUM_THREADS=8" not in t  # passthrough: name only
+    assert "MY_SETTING=&lt;b&gt;" in t and "API_TOKEN=***" in t
+    assert "topsecret" not in t and "QUR_ENV_PASSTHROUGH" not in t
+    assert "<b>environment</b>" not in notify.format_details(_job(), CFG)
+    assert "<b>environment</b>" not in notify.format_details(_job(env_extra=None), CFG)
+
+
+def test_telegram_list_stays_capped_however_long_the_history_is():
+    backlog = [_job(id=1000 - i, status="done", raw_cmd=json.dumps(["echo", f"job-{i}"])) for i in range(200)]
+    chan = {"running": None, "frozen": None, "paused": False, "priority_queue": [], "queue": [], "backlog": backlog}
+    text = notify.format_list({"channels": {1: chan}}, CFG, 1)
+    assert len(text) <= notify.TG_MAX_CHARS and "more lines" in text
+    assert text.count("job-") <= notify.LIST_TEXT_MAX_BACKLOG == 100 and "job-100<" not in text
+    markup = notify.list_markup(CFG, chan)["inline_keyboard"]
+    assert sum(len(r) for r in markup) == notify.LIST_MAX_BACKLOG * 3 <= 100

@@ -68,7 +68,9 @@ prints the help for every command at once.
 queuer add [--channel N] [--before ID | --after ID | --now] [--depends-on IDS] [--after-any IDS] [--each V... | --array A-B] [--on-fail pause|continue] [--delay DURATION | --at TIME] [--timeout SECONDS] [--retries N] -- <cmd...>
 queuer list [--channel N] [--full] [--json]
 queuer status [--json]
-queuer show ID [ID...] [--json]
+queuer show ID|RANGE [ID|RANGE...] [--json]
+queuer wait ID|RANGE [ID|RANGE...] | --channel N [--timeout DURATION] [--quiet] [--json]
+queuer history [--status S]... [--channel N] [--since DURATION|DATE] [--grep TEXT] [--limit N] [--full] [--json]
 queuer cancel [JOB_ID] [--channel N]
 queuer clear [--channel N]
 queuer rm ID
@@ -189,6 +191,31 @@ counts run time only, so the delay never eats into it. `--delay` and `--at` cann
 combined with each other or with `--now`; a requeued job (button or `--retries`) is not
 delayed again.
 
+**Environment.** A job does not get your whole shell environment (that would copy secrets
+into the job row and logs). It gets:
+
+- `PATH`, `HOME`, `VIRTUAL_ENV` and `PYTHONPATH` as before, and `PYTHONUNBUFFERED=1` so Python
+  output reaches the log and `qur logs` as it is printed (override it with `--env PYTHONUNBUFFERED=0`);
+- a **passthrough list**, copied from the shell that runs `qur add` when set there:
+  `CUDA_VISIBLE_DEVICES`, `OMP_NUM_THREADS`, `MKL_NUM_THREADS`, `OPENBLAS_NUM_THREADS`,
+  `LD_LIBRARY_PATH`, `LANG`, `LC_*`, `TERM`, `TZ`. Replace the list with the variable
+  `QUEUER_ENV_PASSTHROUGH` in your shell (comma-separated names, `*` allowed;
+  `QUEUER_ENV_PASSTHROUGH=` empty means pass nothing);
+- anything you give with `--env KEY=VAL` (sets it) or `--env KEY` (copies the value from your shell;
+  an error if it is not set). Repeatable; names must match `[A-Za-z_][A-Za-z0-9_]*`. `--env` beats the
+  passthrough list, and a sweep's `QUR_INDEX` beats `--env`.
+
+```bash
+qur add --env CUDA_VISIBLE_DEVICES=1 --env OMP_NUM_THREADS=8 -- python train.py
+qur add --env MY_SETTING -- ./run.sh
+```
+
+The values are stored in the job (so requeues and `--retries` repeat them) and `qur show` lists
+them: variables copied automatically by name only, `--env` ones as `NAME=value`, with the value shown as
+`***` when the name contains `KEY`, `TOKEN`, `SECRET` or `PASSWORD`. The Telegram Details shows the
+same list. Don't pass secrets with `--env` if you do not want them in the database; use a file the
+job reads.
+
 `--retries N` requeues the job automatically (at the end of its channel's
 queue) if it fails — non-zero exit, timeout, or failed start — up to N
 times. Each retry is a new job with its own ID and log; the failed job's
@@ -208,7 +235,8 @@ and marks it `failed` with `note: timed out`.
 
 Shows each channel in its own section: the running job first (marked
 with `*`), then the queue, with the time each job was queued and how long
-ago that was, then the last 10 finished jobs (done/failed/cancelled).
+ago that was, then the last 10 finished jobs (done/failed/cancelled/skipped/interrupted;
+the table title says how many are shown). The daemon keeps more (see `history`).
 
 - `--channel N` lists only that channel (default: all channels)
 - The `Origin` column says where a job came from: `new` (you queued it),
@@ -219,9 +247,72 @@ ago that was, then the last 10 finished jobs (done/failed/cancelled).
 
 ### `show ID [ID...]`
 
+IDs can also be ranges and comma lists, like `--depends-on`: `qur show 31-33`, `qur show 12,15 40`.
+They are shown in the order you give them.
+
 Full detail on one or more jobs — both command forms, cwd, every timestamp,
-duration, exit code, timeout, auto-retry count, pid, and log path. With
+duration, exit code, timeout, auto-retry count, extra environment (see "Environment" under
+`add`), pid, and log path. With
 `--json`, one ID prints an object; several print a list.
+
+### `wait ID|RANGE... | --channel N`
+
+Blocks until the jobs reach a final state (done, failed, cancelled, skipped, interrupted),
+or, with `--channel N`, until that channel has nothing running, frozen or queued. The **exit
+code mirrors the outcome**, so it works in scripts:
+
+| code | meaning |
+|------|---------|
+| 0 | done (`--channel`: idle) |
+| 1 | failed (with several jobs: any failure) |
+| 2 | cancelled, skipped, interrupted, or removed while waiting |
+| 3 | the daemon is not reachable |
+| 4 | bad arguments, or a job id that does not exist (reported at once) |
+| 124 | `--timeout` ran out |
+| 130 | Ctrl-C |
+
+With several ids the worst code wins (1, then 2, then 0). A job that failed and was requeued
+by `--retries` is followed to its retry, so you get the result of the last attempt. A paused
+channel stays busy, so `--channel` on it waits until `qur resume`. A channel that never had a job counts as idle.
+`--timeout 2h`, `--quiet` (no output), `--json` (`{"exit_code", "timed_out", "jobs": [{"id", "status",
+"exit_code", "channel", "ran_as", "note", "code", "finished"}]}`; with `--channel`:
+`{"channel", "idle", "timed_out", "exit_code"}`). It polls the daemon every 1.5 s.
+
+```
+qur add -- ./prep.sh            # "Queued as job 40"
+qur wait 40 && qur add -- ./use_prep.sh
+qur wait 31-33 --timeout 2h || echo "sweep did not finish cleanly"
+```
+
+`qur show` and `qur status` also take `--json` (like `list`): plain JSON on stdout, no colours.
+
+### `history`
+
+Searches the finished jobs the daemon still has (done, failed, cancelled, skipped,
+interrupted), newest first. The daemon keeps the last **200 finished jobs per channel**
+(the old fixed 10 is gone); set `QUEUER_KEEP=N` in the daemon's environment (for example with
+`systemctl --user edit queuerd`: `[Service]` / `Environment=QUEUER_KEEP=500`, then restart) to
+change that. A bad value is ignored with a warning in the journal. Pruning happens when a job
+finishes; a finished job that a still-queued job depends on is never pruned, and log files are
+never touched (`qur clean-logs` handles those). `qur list` and the Telegram list still show only
+the last 10.
+
+- `--status S` (repeatable): `done`, `failed`, `cancelled`, `skipped`, `interrupted`
+- `--channel N`
+- `--since DURATION|DATE`: finished since then. A duration (`2d`, `6h`, `1h30m`) or a date
+  (`2026-10-01` = local midnight, or `"2026-10-01 14:30"`)
+- `--grep TEXT`: the command you typed contains TEXT (case-insensitive; the words are joined by
+  spaces, so `--grep "--lr 0.1"` works). The resolved command is not searched
+- `--limit N` / `-n N`: most rows, default 50, at most 10000
+- `--full`: resolved commands; `--json`: a JSON list of the job records
+
+Filters combine (all must match). Exit code 0 even when nothing matches.
+
+```bash
+qur history --status failed --since 2d
+qur history --channel 2 --grep train.py --limit 200
+qur history --status failed --status interrupted --json
+```
 
 ### `cancel [JOB_ID]`
 
@@ -286,7 +377,7 @@ final outcome, marked `attempt 3/3`. Messages show the command as you typed it
 paths or raw error text — use `qur show ID` on that machine for those.
 
 **Details button.** Replies with everything `qur show ID` prints (raw and
-resolved command, cwd, timestamps, duration, exit code, timeout, origin, pid, log
+resolved command, cwd, timestamps, duration, exit code, timeout, origin, environment, pid, log
 path, note), laid out for Telegram: bold labels, monospace commands and paths.
 This is the one place paths leave the machine, and only to your paired chats, on
 request. `qur show` itself is unchanged.
@@ -443,7 +534,7 @@ the next queued job of each channel starts. Nothing can send
 a message while the daemon itself is down; if you need to hear about that, watch it
 from outside (e.g. a ping from another machine).
 
-Queued jobs and the last-10 backlog persist in SQLite at
+Queued jobs and the finished-job history (last 200 per channel, see `history`) persist in SQLite at
 `~/.local/state/queuer/queuer.db` and survive daemon restarts and
 reboots without any special handling.
 
@@ -458,7 +549,8 @@ reboots without any special handling.
 | systemd unit | `~/.config/systemd/user/queuerd.service` |
 
 The database, log, socket and notification paths can be overridden with `QUEUER_DB_PATH`,
-`QUEUER_LOG_DIR`, `QUEUER_SOCKET_PATH`, and `QUEUER_NOTIFY_PATH` env vars — mainly useful for
+`QUEUER_LOG_DIR`, `QUEUER_SOCKET_PATH`, and `QUEUER_NOTIFY_PATH` env vars (and `QUEUER_KEEP`, the
+number of finished jobs kept per channel, default 200) — mainly useful for
 running the daemon against a scratch location during manual testing,
 without touching real state.
 
@@ -474,6 +566,10 @@ boundary. What is enforced:
   `sudo`), the fallback is `/tmp/queuer-<uid>/queuer.sock`, never a bare `/tmp`. The folder
   is created 0700; an existing one is used only if it is a real folder (not a symlink)
   owned by you, and a loose mode is tightened. Otherwise the daemon refuses to start.
+- **Service hardening.** `install.sh` writes the unit with `UMask=0077`, `NoNewPrivileges`,
+  `LockPersonality` and `RestrictAddressFamilies` (level `basic`, the default; jobs inherit
+  these, so `sudo` inside a job fails: use `QUEUER_HARDEN=none` for that).
+  If systemd refuses the unit the installer falls back to `QUEUER_HARDEN=none` and says so.
 - **One daemon per socket.** A second `queuerd` exits with `queuerd is already running`
   before it opens the database, so it can't steal the socket or mark the first one's
   running job as failed. A stale socket file left by a crash does not block startup.

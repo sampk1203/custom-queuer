@@ -33,7 +33,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from queuer import db, notify
+from queuer import db, jobenv, notify
 from queuer.pathresolve import resolve_command
 
 MAX_LOG_BYTES = 50 * 1024 * 1024  # 50MB per-job log cap
@@ -62,6 +62,22 @@ _SIGNAL_EXITS = frozenset({-1, -2, -9, -15, 129, 130, 137, 143})
 def _default_db_path() -> Path:
     override = os.environ.get("QUEUER_DB_PATH")
     return Path(override) if override else db.DEFAULT_DB_PATH
+
+
+def _default_keep() -> int:
+    """Finished jobs kept per channel: `QUEUER_KEEP` (a positive integer) or db.DEFAULT_KEEP.
+    A bad value is ignored with a warning rather than stopping the daemon."""
+    raw = os.environ.get("QUEUER_KEEP")
+    if raw is None or not raw.strip():
+        return db.DEFAULT_KEEP
+    try:
+        keep = int(raw)
+    except ValueError:
+        keep = 0
+    if keep < 1:
+        print(f"[queuerd] ignoring QUEUER_KEEP={raw!r} (need a positive integer); keeping {db.DEFAULT_KEEP}", file=sys.stderr)
+        return db.DEFAULT_KEEP
+    return keep
 
 
 def _default_socket_path() -> Path:
@@ -134,7 +150,9 @@ class Daemon:
         socket_path: Path | None = None,
         log_dir: Path | None = None,
         notify_path: Path | None = None,
+        keep: int | None = None,
     ) -> None:
+        self.keep = keep if keep is not None else _default_keep()  # finished jobs kept per channel
         self.db_path = db_path or _default_db_path()
         self.socket_path = socket_path or _default_socket_path()
         self.log_dir = log_dir or _default_log_dir()
@@ -192,7 +210,7 @@ class Daemon:
         for channel in db.list_channels(self.conn):
             for stale in (db.get_running(self.conn, channel), db.get_stopped(self.conn, channel)):
                 if stale is not None:
-                    db.mark_finished(self.conn, stale["id"], status="interrupted", note=STOP_NOTE)
+                    db.mark_finished(self.conn, stale["id"], status="interrupted", note=STOP_NOTE, keep_backlog=self.keep)
                     self._settle_dependants(stale["id"])
                     self._notify_finished(stale["id"])
 
@@ -361,7 +379,10 @@ class Daemon:
             try:
                 current = db.get_job(self.conn, job["id"])
                 if current is not None and current["status"] in ("queued", "running", "stopped"):
-                    db.mark_finished(self.conn, job["id"], status="failed", note=f"internal error: {type(e).__name__}: {e}")
+                    db.mark_finished(
+                        self.conn, job["id"], status="failed", note=f"internal error: {type(e).__name__}: {e}",
+                        keep_backlog=self.keep,
+                    )
                 self._release(channel, job["id"])
                 self._after_finish(job["id"])
             except Exception as e2:  # last resort: never let the worker die
@@ -374,7 +395,7 @@ class Daemon:
         cwd = job["cwd"]
         env_extra = json.loads(job["env_extra"]) if job["env_extra"] else {}
         env = {"PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", "")}
-        env.update(env_extra)
+        env.update(jobenv.job_environment(env_extra))
         log_path = Path(job["log_path"])
         log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         if self._stopping.is_set():
@@ -390,7 +411,7 @@ class Daemon:
                 start_new_session=True,  # own process group -> group-kill later
             )
         except (OSError, ValueError, TypeError) as e:
-            db.mark_finished(self.conn, job_id, status="failed", note=f"failed to start: {e}")
+            db.mark_finished(self.conn, job_id, status="failed", note=f"failed to start: {e}", keep_backlog=self.keep)
             self._after_finish(job_id)
             return
 
@@ -413,7 +434,7 @@ class Daemon:
             await self._kill_process_group(proc)
             exit_code = await proc.wait()
             await log_task
-            db.mark_finished(self.conn, job_id, status="failed", exit_code=exit_code, note="timed out")
+            db.mark_finished(self.conn, job_id, status="failed", exit_code=exit_code, note="timed out", keep_backlog=self.keep)
             self._cancelled.discard(job_id)
             self._release(channel, job_id)
             self._after_finish(job_id)
@@ -430,7 +451,7 @@ class Daemon:
             note = STOP_NOTE
         else:
             status = "done" if exit_code == 0 else "failed"
-        db.mark_finished(self.conn, job_id, status=status, exit_code=exit_code, note=note)
+        db.mark_finished(self.conn, job_id, status=status, exit_code=exit_code, note=note, keep_backlog=self.keep)
         self._release(channel, job_id)
         self._after_finish(job_id)
 
@@ -511,7 +532,7 @@ class Daemon:
         the retry is a new job at the end of the queue, so waiting for it could
         deadlock a dependant that sits ahead of it."""
         assert self.conn is not None
-        skipped, channels = db.skip_dependants(self.conn, job_id)
+        skipped, channels = db.skip_dependants(self.conn, job_id, self.keep)
         for skipped_id in skipped:
             self._notify_finished(skipped_id)
         for channel in channels:
@@ -522,7 +543,7 @@ class Daemon:
         row is gone): record it as `skipped`, then skip whatever needed it."""
         assert self.conn is not None
         what = "removed" if verdict == "removed" else "failed"
-        db.skip_queued(self.conn, job_id, f"dependency {dep_id} {what}")
+        db.skip_queued(self.conn, job_id, f"dependency {dep_id} {what}", self.keep)
         self._notify_finished(job_id)
         self._settle_dependants(job_id)
 
@@ -1061,7 +1082,11 @@ class Daemon:
             if not (os.path.isfile(exe) and os.access(exe, os.X_OK)):
                 raise ValueError(f"executable not found or not executable: {exe}")
             prepared.append((raw_argv, resolved, spec["index"]))
-        env_extra: dict[str, str] = {}
+        # layers, later wins: passthrough copied by the client, PATH/VIRTUAL_ENV/PYTHONPATH,
+        # then the explicit --env (a sweep's QUR_INDEX is set per job below, over all of them)
+        env_pass = jobenv.check_env(args.get("env_pass") or {}, "env_pass")
+        env_explicit = jobenv.check_env(args.get("env") or {}, "env")
+        env_extra: dict[str, str] = dict(env_pass)
         if client_path:
             env_extra["PATH"] = client_path
         virtual_env = args.get("virtual_env")
@@ -1070,6 +1095,10 @@ class Daemon:
         python_path = args.get("python_path")
         if python_path:
             env_extra["PYTHONPATH"] = python_path
+        env_extra.update(env_explicit)
+        passed = sorted(k for k in env_pass if k not in env_explicit)
+        if passed:
+            env_extra[jobenv.PASSTHROUGH_KEY] = ",".join(passed)
 
         # log_path needs the row's own id, which we don't have until after
         # insert -- write a placeholder, then patch it in immediately
@@ -1167,6 +1196,41 @@ class Daemon:
             }
         return {"channels": channels}
 
+    async def _cmd_history(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Finished jobs, newest first. Optional args: `statuses` (list of terminal
+        statuses), `channel`, `since` (ISO timestamp), `grep` (substring of the raw
+        command), `limit` (default 50, at most db.MAX_HISTORY)."""
+        assert self.conn is not None
+        statuses = args.get("statuses")
+        if statuses is not None and (
+            not isinstance(statuses, list) or not all(isinstance(s, str) for s in statuses)
+        ):
+            raise ValueError("statuses must be a list of strings")
+        channel = self._int_arg(args, "channel", required=False, positive=True)
+        limit = self._int_arg(args, "limit", required=False, positive=True)
+        if limit is None:
+            limit = 50
+        if limit > db.MAX_HISTORY:
+            raise ValueError(f"limit must be at most {db.MAX_HISTORY}")
+        since = args.get("since")
+        if since is not None:
+            if not isinstance(since, str):
+                raise ValueError("since must be an ISO timestamp")
+            try:
+                parsed = datetime.fromisoformat(since)
+            except ValueError:
+                raise ValueError(f"since is not an ISO timestamp: {since!r}") from None
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            since = parsed.astimezone(timezone.utc).isoformat()
+        grep = args.get("grep")
+        if grep is not None and not isinstance(grep, str):
+            raise ValueError("grep must be a string")
+        jobs = db.get_history(
+            self.conn, statuses=statuses, channel=channel, since=since, grep=grep or None, limit=limit
+        )
+        return {"jobs": jobs}
+
     async def _cmd_status(self, args: dict[str, Any]) -> dict[str, Any]:
         assert self.conn is not None
         channels: dict[int, dict[str, Any]] = {}
@@ -1242,7 +1306,7 @@ class Daemon:
 
         status = job["status"]
         if status == "queued":
-            db.cancel_queued(self.conn, job_id)
+            db.cancel_queued(self.conn, job_id, self.keep)
             self._settle_dependants(job_id)
             self._wake_worker(channel)  # it may have been the waiting head that held the channel
             self._notify_finished(job_id)
