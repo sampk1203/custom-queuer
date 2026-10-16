@@ -12,6 +12,7 @@ import asyncio
 import json
 import os
 import signal
+import subprocess
 import time
 from pathlib import Path
 
@@ -3661,3 +3662,415 @@ async def test_history_since_accepts_naive_and_offset_timestamps(daemon):
         assert [j["id"] for j in resp["data"]["jobs"]] == [job_id]
     after = (finished + timedelta(seconds=5)).isoformat()
     assert (await send(daemon.socket_path, "history", since=after))["data"]["jobs"] == []
+
+
+# ---------------------------------------------------------------------------
+# B14: --retry-delay / --retry-backoff
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_retry_waits_for_the_retry_delay(daemon):
+    a = await _add(daemon, ["false"], max_retries=1, retry_delay_secs=1)
+    first = await wait_for_status(daemon.socket_path, a, {"failed"})
+    retry = (await send(daemon.socket_path, "show", id=a + 1))["data"]
+    assert retry["status"] == "queued" and retry["not_before"]  # waiting, not started
+    assert retry["retry_delay_secs"] == 1
+    done = await wait_for_status(daemon.socket_path, a + 1, {"failed"}, timeout=8)
+    gap = (datetime.fromisoformat(done["started_at"]) - datetime.fromisoformat(first["finished_at"])).total_seconds()
+    assert gap >= 0.9
+    assert (await send(daemon.socket_path, "show", id=a + 2))["ok"] is False  # budget used up
+
+
+@pytest.mark.asyncio
+async def test_retry_without_a_delay_still_starts_at_once(daemon):
+    a = await _add(daemon, ["false"], max_retries=1)
+    await wait_for_status(daemon.socket_path, a + 1, {"failed"}, timeout=3)
+    assert (await send(daemon.socket_path, "show", id=a + 1))["data"]["not_before"] is None
+
+
+@pytest.mark.asyncio
+async def test_retry_backoff_doubles_the_wait(daemon):
+    a = await _add(daemon, ["false"], max_retries=2, retry_delay_secs=1, retry_backoff=True)
+    await wait_for_status(daemon.socket_path, a + 1, {"failed"}, timeout=8)
+    second = (await send(daemon.socket_path, "show", id=a + 1))["data"]
+    third = (await send(daemon.socket_path, "show", id=a + 2))["data"]
+    assert third["status"] == "queued" and third["retry_backoff"] == 1
+    wait = (datetime.fromisoformat(third["not_before"]) - datetime.fromisoformat(second["finished_at"])).total_seconds()
+    assert 1.8 <= wait <= 2.3  # 1 s, then 2 s
+    await wait_for_status(daemon.socket_path, a + 2, {"failed"}, timeout=8)
+
+
+@pytest.mark.asyncio
+async def test_a_waiting_retry_holds_its_channel_strict_fifo(daemon):
+    a = await _add(daemon, ["false"], max_retries=1, retry_delay_secs=1)
+    await wait_for_status(daemon.socket_path, a, {"failed"})
+    c = await _add(daemon, ["echo", "c"])  # queued behind the waiting retry
+    await asyncio.sleep(0.4)
+    assert (await send(daemon.socket_path, "show", id=c))["data"]["status"] == "queued"
+    retry = await wait_for_status(daemon.socket_path, a + 1, {"failed"}, timeout=8)
+    jc = await wait_for_status(daemon.socket_path, c, {"done"})
+    assert retry["finished_at"] <= jc["started_at"]
+
+
+@pytest.mark.asyncio
+async def test_a_dependant_of_a_failed_job_is_skipped_at_once_despite_the_retry_delay(daemon):
+    a = await _add(daemon, ["false"], max_retries=1, retry_delay_secs=3600)
+    b = await _add(daemon, ["echo", "b"], channel=2, depends_on=[a])
+    job = await wait_for_status(daemon.socket_path, b, {"skipped"}, timeout=3)
+    assert f"dependency {a} failed" in job["note"]
+
+
+@pytest.mark.asyncio
+async def test_manual_requeue_is_not_delayed_and_keeps_the_retry_delay(daemon):
+    a = await _add(daemon, ["false"], max_retries=1, retry_delay_secs=3600, channel=3)
+    await wait_for_status(daemon.socket_path, a, {"failed"})
+    new_id = (await send(daemon.socket_path, "requeue", id=a))["data"]["id"]
+    new = (await send(daemon.socket_path, "show", id=new_id))["data"]
+    assert new["not_before"] is None and new["retry_delay_secs"] == 3600 and new["origin"] == "requeue"
+
+
+@pytest.mark.asyncio
+async def test_retry_delay_is_validated_by_the_daemon(daemon):
+    for kw in (
+        dict(max_retries=1, retry_delay_secs=0),
+        dict(max_retries=1, retry_delay_secs=-1),
+        dict(max_retries=1, retry_delay_secs="5m"),
+        dict(max_retries=1, retry_delay_secs=True),
+        dict(max_retries=1, retry_delay_secs=31 * 86400),
+        dict(max_retries=1, retry_backoff=True),  # backoff needs a delay
+        dict(max_retries=1, retry_delay_secs=5, retry_backoff="yes"),
+        dict(retry_delay_secs=5),  # a delay needs --retries
+    ):
+        r = await send(daemon.socket_path, "add", argv=["true"], cwd=CWD, **kw)
+        assert r["ok"] is False and "retr" in r["error"], kw
+    assert (await send(daemon.socket_path, "list"))["data"]["channels"] == {}  # nothing was queued
+
+
+# ---------------------------------------------------------------------------
+# F8: qur edit + edit lock
+# ---------------------------------------------------------------------------
+
+async def _edit(daemon, job_id, **kw) -> dict:
+    return await send(daemon.socket_path, "edit", id=job_id, **kw)
+
+
+def _log_text(daemon, job_id) -> str:
+    return (daemon.log_dir / f"{job_id}.log").read_text()
+
+
+@pytest.mark.asyncio
+async def test_edit_command_then_the_job_runs_the_new_one(daemon):
+    blocker = await _add(daemon, ["sleep", "0.5"])
+    b = await _add(daemon, ["echo", "old"])
+    r = await _edit(daemon, b, argv=["echo", "new"], raw_argv=["echo", "new"])
+    assert r["ok"] and r["data"]["changed"] == ["command"]
+    await wait_for_status(daemon.socket_path, blocker, {"done"})
+    await wait_for_status(daemon.socket_path, b, {"done"})
+    assert _log_text(daemon, b).strip() == "new"
+    shown = (await send(daemon.socket_path, "show", id=b))["data"]
+    assert json.loads(shown["raw_cmd"]) == ["echo", "new"] and json.loads(shown["resolved_cmd"])[1:] == ["new"]
+
+
+@pytest.mark.asyncio
+async def test_edit_each_simple_field(daemon, tmp_path):
+    a = await _add(daemon, ["sleep", "30"])
+    await wait_for_status(daemon.socket_path, a, {"running"})
+    b = await _add(daemon, ["echo", "b"], timeout_secs=5)
+    other = tmp_path / "work"
+    other.mkdir()
+    r = await _edit(
+        daemon, b, argv=["echo", "b"], cwd=str(other), timeout_secs=0, max_retries=2, on_fail="pause",
+        not_before=_in(3600), env={"FOO": "bar"},
+    )
+    assert r["ok"], r
+    assert set(r["data"]["changed"]) == {"command", "cwd", "timeout", "retries", "on-fail", "start time", "env"}
+    job = (await send(daemon.socket_path, "show", id=b))["data"]
+    assert job["cwd"] == str(other) and job["timeout_secs"] is None
+    assert job["max_retries"] == 2 and job["on_fail"] == "pause" and job["not_before"] is not None
+    assert json.loads(job["env_extra"])["FOO"] == "bar"
+    r = await _edit(daemon, b, not_before=None, timeout_secs=9)
+    assert r["ok"]
+    job = (await send(daemon.socket_path, "show", id=b))["data"]
+    assert job["not_before"] is None and job["timeout_secs"] == 9
+
+
+@pytest.mark.asyncio
+async def test_edit_env_keeps_sweep_index_and_drops_passthrough_marker_for_overridden_names(daemon):
+    a = await _add(daemon, ["sleep", "30"])
+    await wait_for_status(daemon.socket_path, a, {"running"})
+    r = await send(daemon.socket_path, "add", cwd=CWD, jobs=[{"argv": ["echo", "x"], "index": 3}],
+                   env_pass={"LANG": "C"})
+    b = r["data"]["id"]
+    assert (await _edit(daemon, b, env={"QUR_INDEX": "99", "LANG": "en"}))["ok"]
+    env = json.loads((await send(daemon.socket_path, "show", id=b))["data"]["env_extra"])
+    assert env["QUR_INDEX"] == "3" and env["LANG"] == "en"
+    assert "LANG" not in env.get("QUR_ENV_PASSTHROUGH", "")
+
+
+@pytest.mark.asyncio
+async def test_edit_validation_errors_and_nothing_partial(daemon, tmp_path):
+    a = await _add(daemon, ["sleep", "30"])
+    await wait_for_status(daemon.socket_path, a, {"running"})
+    b = await _add(daemon, ["echo", "b"], timeout_secs=5)
+    before = (await send(daemon.socket_path, "show", id=b))["data"]
+    cases = [
+        (dict(argv=["/no/such/exe"]), "executable"),
+        (dict(argv=["echo", "x"], cwd=str(tmp_path / "missing")), "working directory"),
+        (dict(argv=[]), "non-empty"),
+        (dict(argv=["echo", "a\0b"]), "NUL"),
+        (dict(cwd=str(tmp_path)), "argv"),  # a new cwd without the re-resolved command
+        (dict(timeout_secs=-1), "timeout"),
+        (dict(timeout_secs="5"), "timeout"),
+        (dict(max_retries=-1), "retries"),
+        (dict(on_fail="explode"), "on_fail"),
+        (dict(channel=0), "channel"),
+        (dict(not_before="tomorrow"), "not_before"),
+        (dict(not_before="2030-01-01T00:00:00"), "UTC offset"),
+        (dict(depends_on=[999]), "does not exist"),
+        (dict(depends_on=[b]), "itself"),
+        (dict(env={"1X": "v"}), "invalid environment"),
+        (dict(clear_deps=True, depends_on=[a]), "clear_deps"),
+        (dict(), "nothing to change"),
+        (dict(timeout_secs=5), "nothing to change"),  # same value
+    ]
+    for kw, word in cases:
+        r = await _edit(daemon, b, **kw)
+        assert r["ok"] is False and word in r["error"], (kw, r)
+    # a valid change plus an invalid one: neither is applied
+    r = await _edit(daemon, b, max_retries=3, timeout_secs=-5)
+    assert r["ok"] is False
+    assert (await send(daemon.socket_path, "show", id=b))["data"] == {**before, "editing": False}
+
+
+@pytest.mark.asyncio
+async def test_only_queued_jobs_can_be_edited(daemon):
+    a = await _add(daemon, ["sleep", "30"])
+    await wait_for_status(daemon.socket_path, a, {"running"})
+    r = await _edit(daemon, a, timeout_secs=3)
+    assert r["ok"] is False and "running, not queued" in r["error"]
+    d = await _add(daemon, ["true"], channel=2)
+    await wait_for_status(daemon.socket_path, d, {"done"})
+    r = await _edit(daemon, d, timeout_secs=3)
+    assert r["ok"] is False and "only queued jobs" in r["error"]
+    r = await _edit(daemon, 9999, timeout_secs=3)
+    assert r["ok"] is False and "does not exist" in r["error"]
+    assert (await send(daemon.socket_path, "edit_lock", id=a, pid=os.getpid()))["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_edit_lock_blocks_the_start_until_unlocked(daemon):
+    a = await _add(daemon, ["sleep", "0.3"])
+    b = await _add(daemon, ["echo", "b"])
+    r = await send(daemon.socket_path, "edit_lock", id=b, pid=os.getpid())
+    assert r["ok"] and r["data"]["id"] == b
+    await wait_for_status(daemon.socket_path, a, {"done"})
+    await asyncio.sleep(0.6)  # the channel is free and b is the head, but locked
+    shown = (await send(daemon.socket_path, "show", id=b))["data"]
+    assert shown["status"] == "queued" and shown["editing"] is True and shown["edit_pid"] == os.getpid()
+    listed = _ch((await send(daemon.socket_path, "list"))["data"], 1)["queue"][0]
+    assert listed["id"] == b and listed["editing"] is True
+    assert (await send(daemon.socket_path, "edit_unlock", id=b, pid=os.getpid()))["data"] == {"released": True}
+    await wait_for_status(daemon.socket_path, b, {"done"})
+
+
+@pytest.mark.asyncio
+async def test_edit_with_the_lock_applies_releases_and_the_edited_job_runs(daemon):
+    a = await _add(daemon, ["sleep", "0.3"])
+    b = await _add(daemon, ["echo", "old"])
+    assert (await send(daemon.socket_path, "edit_lock", id=b, pid=os.getpid()))["ok"]
+    await wait_for_status(daemon.socket_path, a, {"done"})
+    await asyncio.sleep(0.3)
+    assert (await send(daemon.socket_path, "show", id=b))["data"]["status"] == "queued"
+    r = await _edit(daemon, b, pid=os.getpid(), argv=["echo", "edited"])
+    assert r["ok"], r
+    await wait_for_status(daemon.socket_path, b, {"done"})
+    assert _log_text(daemon, b).strip() == "edited"
+    assert (await send(daemon.socket_path, "show", id=b))["data"]["editing"] is False
+
+
+@pytest.mark.asyncio
+async def test_strict_fifo_jobs_behind_a_locked_head_wait_too(daemon):
+    a = await _add(daemon, ["sleep", "0.3"])
+    b = await _add(daemon, ["echo", "b"])
+    c = await _add(daemon, ["echo", "c"])
+    assert (await send(daemon.socket_path, "edit_lock", id=b, pid=os.getpid()))["ok"]
+    await wait_for_status(daemon.socket_path, a, {"done"})
+    await asyncio.sleep(0.5)
+    for j in (b, c):
+        assert (await send(daemon.socket_path, "show", id=j))["data"]["status"] == "queued"
+    await send(daemon.socket_path, "edit_unlock", id=b, pid=os.getpid())
+    jb = await wait_for_status(daemon.socket_path, b, {"done"})
+    jc = await wait_for_status(daemon.socket_path, c, {"done"})
+    assert jb["finished_at"] <= jc["started_at"]
+
+
+@pytest.mark.asyncio
+async def test_a_locked_head_does_not_block_other_channels(daemon):
+    b = await _add(daemon, ["echo", "b"], not_before=_in(0.5))  # still waiting, so the lock can be taken first
+    assert (await send(daemon.socket_path, "edit_lock", id=b, pid=os.getpid()))["ok"]
+    other = await _add(daemon, ["echo", "o"], channel=2)
+    await wait_for_status(daemon.socket_path, other, {"done"})
+    await asyncio.sleep(1.0)  # b's time has passed; only the lock holds it
+    assert (await send(daemon.socket_path, "show", id=b))["data"]["status"] == "queued"
+
+
+@pytest.mark.asyncio
+async def test_lock_of_a_dead_editor_is_cleared_and_the_job_runs(daemon, monkeypatch):
+    monkeypatch.setattr("queuer.daemon.EDIT_LOCK_RECHECK_SECS", 0.1)
+    p = subprocess.Popen(["true"])
+    p.wait()
+    b = await _add(daemon, ["echo", "b"], not_before=_in(0.5))  # head: waits, so it can be locked first
+    assert (await send(daemon.socket_path, "edit_lock", id=b, pid=os.getpid()))["ok"]
+    daemon.conn.execute("UPDATE edit_locks SET holder_pid = ?", (p.pid,))  # the editor "crashed"
+    daemon.conn.commit()
+    await wait_for_status(daemon.socket_path, b, {"done"}, timeout=5)
+    assert daemon.conn.execute("SELECT COUNT(*) FROM edit_locks").fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_expired_lock_is_cleared_and_the_job_runs(daemon, monkeypatch):
+    monkeypatch.setattr("queuer.daemon.EDIT_LOCK_RECHECK_SECS", 0.1)
+    b = await _add(daemon, ["echo", "b"], not_before=_in(0.5))
+    assert (await send(daemon.socket_path, "edit_lock", id=b, pid=os.getpid()))["ok"]
+    daemon.conn.execute("UPDATE edit_locks SET expires_at = ?", (_in(-1),))
+    daemon.conn.commit()
+    await wait_for_status(daemon.socket_path, b, {"done"}, timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_edit_after_the_lock_went_stale_fails_cleanly(daemon):
+    a = await _add(daemon, ["sleep", "30"])
+    await wait_for_status(daemon.socket_path, a, {"running"})
+    b = await _add(daemon, ["echo", "b"])
+    assert (await send(daemon.socket_path, "edit_lock", id=b, pid=os.getpid()))["ok"]
+    daemon.conn.execute("UPDATE edit_locks SET expires_at = ?", (_in(-1),))
+    daemon.conn.commit()
+    r = await _edit(daemon, b, pid=os.getpid(), timeout_secs=3)
+    assert r["ok"] is False and "lock" in r["error"]
+    assert (await send(daemon.socket_path, "show", id=b))["data"]["timeout_secs"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_second_editor_is_refused_and_plain_edit_respects_the_lock(daemon):
+    a = await _add(daemon, ["sleep", "30"])
+    await wait_for_status(daemon.socket_path, a, {"running"})
+    b = await _add(daemon, ["echo", "b"])
+    assert (await send(daemon.socket_path, "edit_lock", id=b, pid=os.getpid()))["ok"]
+    r = await send(daemon.socket_path, "edit_lock", id=b, pid=1)
+    assert r["ok"] is False and "already being edited" in r["error"]
+    r = await _edit(daemon, b, timeout_secs=3)  # flag edit without the lock holder's pid
+    assert r["ok"] is False and "being edited" in r["error"]
+    assert (await send(daemon.socket_path, "edit_unlock", id=b, pid=1))["data"] == {"released": False}  # not theirs
+    assert (await _edit(daemon, b, pid=os.getpid(), timeout_secs=3))["ok"]
+
+
+@pytest.mark.asyncio
+async def test_lock_is_released_when_the_daemon_restarts(tmp_path):
+    db_path = tmp_path / "queuer.db"
+    conn = db_module.connect(db_path)
+    db_module.init_db(conn)
+    job_id = db_module.enqueue(conn, raw_cmd=["true"], resolved_cmd=["/bin/true"], cwd=CWD, log_path=str(tmp_path / "1.log"))
+    db_module.take_edit_lock(conn, job_id, os.getpid())
+    conn.close()
+    d = Daemon(db_path=db_path, socket_path=tmp_path / "queuer.sock", log_dir=tmp_path / "logs")
+    task = asyncio.create_task(d.serve())
+    try:
+        for _ in range(100):
+            if d.socket_path.exists():
+                break
+            await asyncio.sleep(0.02)
+        job = await wait_for_status(d.socket_path, job_id, {"done"}, timeout=5)  # not held back by the old lock
+        assert job["editing"] is False
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_rm_and_cancel_win_over_an_open_edit(daemon):
+    a = await _add(daemon, ["sleep", "30"])
+    await wait_for_status(daemon.socket_path, a, {"running"})
+    b = await _add(daemon, ["echo", "b"])
+    c = await _add(daemon, ["echo", "c"])
+    for j in (b, c):
+        assert (await send(daemon.socket_path, "edit_lock", id=j, pid=os.getpid()))["ok"]
+    assert (await send(daemon.socket_path, "rm", id=b))["ok"]
+    assert (await send(daemon.socket_path, "cancel", id=c))["ok"]
+    r = await _edit(daemon, b, pid=os.getpid(), timeout_secs=3)
+    assert r["ok"] is False and "does not exist" in r["error"]
+    r = await _edit(daemon, c, pid=os.getpid(), timeout_secs=3)
+    assert r["ok"] is False and "cancelled, not queued" in r["error"]
+
+
+@pytest.mark.asyncio
+async def test_edit_moves_a_job_to_the_end_of_another_channel_and_it_runs_there(daemon):
+    a = await _add(daemon, ["sleep", "30"])
+    await wait_for_status(daemon.socket_path, a, {"running"})
+    b = await _add(daemon, ["echo", "b"])
+    c = await _add(daemon, ["echo", "c"])
+    x = await _add(daemon, ["sleep", "0.3"], channel=2)
+    r = await _edit(daemon, b, channel=2)
+    assert r["ok"] and r["data"]["changed"] == ["channel"]
+    listing = (await send(daemon.socket_path, "list"))["data"]
+    assert [j["id"] for j in _ch(listing, 1)["queue"]] == [c]
+    jb = await wait_for_status(daemon.socket_path, b, {"done"})
+    assert jb["channel"] == 2
+    assert (await wait_for_status(daemon.socket_path, x, {"done"}))["finished_at"] <= jb["started_at"]  # went to the END
+    assert (await _edit(daemon, c, channel=1))["ok"] is False  # same channel: nothing to change
+
+
+@pytest.mark.asyncio
+async def test_edit_dependencies_replace_clear_and_are_checked(daemon):
+    a = await _add(daemon, ["sleep", "30"], channel=2)
+    d1 = await _add(daemon, ["sleep", "30"], channel=3)
+    await wait_for_status(daemon.socket_path, a, {"running"})
+    b = await _add(daemon, ["echo", "b"], depends_on=[a])
+    r = await _edit(daemon, b, after_any=[d1])  # replaces only the after-any kind
+    assert r["ok"]
+    job = (await send(daemon.socket_path, "show", id=b))["data"]
+    assert job["depends_on"] == [a] and job["after_any"] == [d1]
+    assert (await _edit(daemon, b, depends_on=[d1]))["ok"]
+    job = (await send(daemon.socket_path, "show", id=b))["data"]
+    assert job["depends_on"] == [d1] and job["after_any"] == []
+    assert (await _edit(daemon, b, clear_deps=True, not_before=_in(3600)))["ok"]  # the delay keeps b from starting
+    job = (await send(daemon.socket_path, "show", id=b))["data"]
+    assert job["depends_on"] == [] and job["after_any"] == []
+    behind = await _add(daemon, ["echo", "z"])
+    r = await _edit(daemon, b, depends_on=[behind])  # queued behind b on the same channel
+    assert r["ok"] is False and "behind this job" in r["error"]
+
+
+@pytest.mark.asyncio
+async def test_edit_to_depend_on_an_already_failed_job_skips_it(daemon):
+    f = await _add(daemon, ["false"], channel=2)
+    await wait_for_status(daemon.socket_path, f, {"failed"})
+    blocker = await _add(daemon, ["sleep", "30"])
+    await wait_for_status(daemon.socket_path, blocker, {"running"})
+    b = await _add(daemon, ["echo", "b"])
+    assert (await _edit(daemon, b, depends_on=[f]))["ok"]
+    job = await wait_for_status(daemon.socket_path, b, {"skipped"}, timeout=3)
+    assert f"dependency {f} failed" in job["note"]
+
+
+@pytest.mark.asyncio
+async def test_edit_retries_zero_drops_the_retry_delay(daemon):
+    a = await _add(daemon, ["sleep", "30"])
+    await wait_for_status(daemon.socket_path, a, {"running"})
+    b = await _add(daemon, ["echo", "b"], max_retries=2, retry_delay_secs=60)
+    assert (await _edit(daemon, b, max_retries=0))["ok"]
+    job = (await send(daemon.socket_path, "show", id=b))["data"]
+    assert job["max_retries"] == 0 and job["retry_delay_secs"] is None and job["retry_backoff"] == 0
+
+
+@pytest.mark.asyncio
+async def test_edit_not_before_delays_the_job(daemon):
+    a = await _add(daemon, ["sleep", "0.2"])
+    b = await _add(daemon, ["echo", "b"])
+    assert (await _edit(daemon, b, not_before=_in(1.0)))["ok"]
+    await wait_for_status(daemon.socket_path, a, {"done"})
+    await asyncio.sleep(0.4)
+    assert (await send(daemon.socket_path, "show", id=b))["data"]["status"] == "queued"
+    await wait_for_status(daemon.socket_path, b, {"done"}, timeout=4)

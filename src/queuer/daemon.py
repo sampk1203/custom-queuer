@@ -52,6 +52,7 @@ REQUEUE_GUARD_SECS = 30  # a second Telegram Requeue of the same job within this
 # "interrupted" Telegram messages going out (<= SHUTDOWN_NOTIFY_SECS) stays well under it.
 SHUTDOWN_WAIT_SECS = 8
 SHUTDOWN_NOTIFY_SECS = 8
+EDIT_LOCK_RECHECK_SECS = 5  # a worker whose head job is locked for editing rechecks this often (a dead editor frees it)
 STOP_RACE_SECS = 1.0  # systemd signals jobs and daemon together: how long a signal-death waits for our own SIGTERM
 STOP_NOTE = "daemon stopped"  # note of a job the daemon's stop (or a crash/reboot) cut short
 # exit codes of a job that died to SIGHUP/SIGINT/SIGKILL/SIGTERM: negative = killed by the signal
@@ -171,6 +172,8 @@ class Daemon:
         # channel: a frozen (--now) job and the priority job that froze it
         # share a channel, and cancelling one must not label the other.
         self._cancelled: set[int] = set()
+        # ids of jobs being spawned right now (the process is being created): too late to edit them
+        self._starting: set[int] = set()
 
         # in-flight notification sends (kept so they aren't garbage-collected)
         self._notify_tasks: set[asyncio.Task] = set()
@@ -207,6 +210,7 @@ class Daemon:
         losing it or re-running it. It is not retried and does not use up
         --retries. Checked across every channel that has ever been used."""
         assert self.conn is not None
+        db.clear_edit_locks(self.conn)  # editors were talking to the previous daemon; a lost lock makes their edit fail cleanly
         for channel in db.list_channels(self.conn):
             for stale in (db.get_running(self.conn, channel), db.get_stopped(self.conn, channel)):
                 if stale is not None:
@@ -247,10 +251,15 @@ class Daemon:
                         # time: sleep exactly that long (a wake event still ends the sleep
                         # early, e.g. the head was removed or cancelled)
                         remaining = self._secs_until(queue[0].get("not_before"))
-                        if remaining <= 0:
+                        if remaining <= 0 and db.live_edit_lock(self.conn, queue[0]["id"]) is not None:
+                            # `qur edit` has the head open: strict FIFO, the channel waits until the
+                            # edit is applied or abandoned (a stale lock is cleared by the check above)
+                            sleep_for = EDIT_LOCK_RECHECK_SECS
+                        elif remaining <= 0:
                             await self._run_job_safely(channel, queue[0])
                             continue
-                        sleep_for = min(remaining, IDLE_POLL_SECS)
+                        else:
+                            sleep_for = min(remaining, IDLE_POLL_SECS)
                     elif verdict != "waiting" and dep_id is not None:
                         self._skip_blocked(queue[0]["id"], verdict, dep_id)
                         continue
@@ -401,21 +410,25 @@ class Daemon:
         if self._stopping.is_set():
             return  # the job stays queued; the next daemon runs it
 
+        self._starting.add(job_id)  # `qur edit` is refused from here until the row says running
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *argv,
-                cwd=cwd,
-                env=env,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                start_new_session=True,  # own process group -> group-kill later
-            )
-        except (OSError, ValueError, TypeError) as e:
-            db.mark_finished(self.conn, job_id, status="failed", note=f"failed to start: {e}", keep_backlog=self.keep)
-            self._after_finish(job_id)
-            return
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *argv,
+                    cwd=cwd,
+                    env=env,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                    start_new_session=True,  # own process group -> group-kill later
+                )
+            except (OSError, ValueError, TypeError) as e:
+                db.mark_finished(self.conn, job_id, status="failed", note=f"failed to start: {e}", keep_backlog=self.keep)
+                self._after_finish(job_id)
+                return
 
-        db.mark_running(self.conn, job_id, pid=proc.pid, pgid=proc.pid)
+            db.mark_running(self.conn, job_id, pid=proc.pid, pgid=proc.pid)
+        finally:
+            self._starting.discard(job_id)
         self._current_proc[channel] = proc
         self._current_job_id[channel] = job_id
 
@@ -1060,6 +1073,18 @@ class Daemon:
         not_before = self._parse_not_before(args.get("not_before"))
         if now and not_before:
             raise ValueError("--now cannot be combined with --delay/--at")
+        retry_delay_secs = args.get("retry_delay_secs")
+        if retry_delay_secs is not None and (
+            type(retry_delay_secs) is not int or not 0 < retry_delay_secs <= db.MAX_RETRY_DELAY_SECS
+        ):
+            raise ValueError(f"retry delay must be between 1 second and {db.MAX_RETRY_DELAY_SECS // 86400} days")
+        retry_backoff = args.get("retry_backoff") or False
+        if type(retry_backoff) is not bool:
+            raise ValueError("retry_backoff must be true or false")
+        if retry_backoff and retry_delay_secs is None:
+            raise ValueError("--retry-backoff needs --retry-delay")
+        if retry_delay_secs is not None and not max_retries:
+            raise ValueError("--retry-delay needs --retries")
 
         for key in ("path", "virtual_env", "python_path"):
             if args.get(key) is not None and not isinstance(args[key], str):
@@ -1127,6 +1152,8 @@ class Daemon:
                 deps=deps,
                 not_before=not_before,
                 on_fail=on_fail,
+                retry_delay_secs=retry_delay_secs,
+                retry_backoff=retry_backoff,
                 commit=False,
             ))
         self.conn.executemany(
@@ -1180,7 +1207,15 @@ class Daemon:
         """`job` plus its dependencies for display: `depends_on`, `after_any` and
         `waiting_on` (job ids; the last is those that have not ended yet)."""
         assert self.conn is not None
-        return {**job, **db.dep_info(self.conn, job["id"])}
+        info: dict[str, Any] = {**job, **db.dep_info(self.conn, job["id"])}
+        info["editing"] = False
+        if job["status"] == "queued":
+            lock = db.live_edit_lock(self.conn, job["id"])
+            if lock is not None:
+                info["editing"] = True
+                info["edit_pid"] = lock["holder_pid"]
+                info["edit_expires_at"] = lock["expires_at"]
+        return info
 
     async def _cmd_list(self, args: dict[str, Any]) -> dict[str, Any]:
         assert self.conn is not None
@@ -1352,6 +1387,193 @@ class Daemon:
         assert new_job is not None
         self._wake_worker(new_job["channel"])
         return new_id
+
+    # -- edit (qur edit) ------------------------------------------------------
+
+    def _editable(self, job_id: int) -> dict[str, Any]:
+        assert self.conn is not None
+        if job_id in self._starting:
+            raise ValueError(f"job {job_id} is starting right now and can no longer be edited")
+        return db._editable_job(self.conn, job_id)
+
+    async def _cmd_edit_lock(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Lock a queued job for editing (`qur edit`): until `edit` or `edit_unlock` it is not
+        started, and its channel waits behind it. `pid` is the editor's process id; the lock
+        is dropped by the daemon if that process dies or after db.EDIT_LOCK_SECS. Returns the job."""
+        assert self.conn is not None
+        job_id = self._int_arg(args, "id")
+        pid = self._int_arg(args, "pid", positive=True)
+        assert job_id is not None and pid is not None
+        job = self._editable(job_id)
+        db.take_edit_lock(self.conn, job_id, pid)
+        self._wake_worker(job["channel"])  # so a worker about to start it re-reads the lock
+        return self._with_deps(job)
+
+    async def _cmd_edit_unlock(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Abandon an edit: drop the caller's lock and let the channel go on."""
+        assert self.conn is not None
+        job_id = self._int_arg(args, "id")
+        pid = self._int_arg(args, "pid", positive=True)
+        assert job_id is not None and pid is not None
+        released = db.release_edit_lock(self.conn, job_id, pid)
+        job = db.get_job(self.conn, job_id)
+        if job is not None:
+            self._wake_worker(job["channel"])
+        return {"released": released}
+
+    def _checked_argv(self, args: dict[str, Any], cwd: str) -> tuple[list[str], list[str]]:
+        """(raw argv, resolved argv) of an edited command, checked like an `add`."""
+        argv = args.get("argv")
+        raw_argv = args.get("raw_argv") or argv
+        for what, words in (("argv", argv), ("raw_argv", raw_argv)):
+            if not words or not isinstance(words, list) or not all(isinstance(a, str) for a in words):
+                raise ValueError(f"{what} must be a non-empty list of strings")
+        assert isinstance(argv, list) and isinstance(raw_argv, list)
+        if any("\0" in a for a in argv) or any("\0" in a for a in raw_argv):
+            raise ValueError("arguments must not contain NUL bytes")
+        path = args.get("path")
+        for key in ("path", "virtual_env", "python_path"):
+            if args.get(key) is not None and (not isinstance(args[key], str) or "\0" in args[key]):
+                raise ValueError(f"{key} must be a string without NUL bytes")
+        resolved = resolve_command(argv, cwd, path_env=path or None)
+        exe = resolved[0]
+        if not (os.path.isfile(exe) and os.access(exe, os.X_OK)):
+            raise ValueError(f"executable not found or not executable: {exe}")
+        return raw_argv, resolved
+
+    async def _cmd_edit(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Change a queued job, all or nothing. Only the keys present are changed:
+        `argv`/`raw_argv` (+ `path`, `virtual_env`, `python_path` of the editing shell: they
+        replace the job's own), `cwd`, `timeout_secs` (null = none), `channel` (moves the job to
+        the end of that channel), `max_retries`, `on_fail`, `not_before` (null = clear),
+        `depends_on` / `after_any` (replace that kind of dependency), `clear_deps`, `env`
+        (merged over the job's). `pid` is the editor's lock holder (see `edit_lock`); without it
+        the job must not be locked by someone else. Returns {"id", "changed": [...]}."""
+        assert self.conn is not None
+        job_id = self._int_arg(args, "id")
+        pid = self._int_arg(args, "pid", required=False, positive=True)
+        assert job_id is not None
+        job = self._editable(job_id)
+        updates: dict[str, Any] = {}
+        changed: list[str] = []
+
+        cwd = job["cwd"]
+        if "cwd" in args:
+            cwd = args["cwd"]
+            if not isinstance(cwd, str) or not cwd or "\0" in cwd:
+                raise ValueError("cwd must be a non-empty string without NUL bytes")
+            if cwd != job["cwd"]:
+                updates["cwd"] = cwd
+                changed.append("cwd")
+        if not os.path.isdir(cwd):
+            raise ValueError(f"working directory does not exist: {cwd}")
+
+        env_extra: dict[str, str] = json.loads(job["env_extra"]) if job["env_extra"] else {}
+        new_env = dict(env_extra)
+        if "argv" in args:
+            raw_argv, resolved = self._checked_argv(args, cwd)
+            updates["raw_cmd"] = json.dumps(raw_argv)
+            updates["resolved_cmd"] = json.dumps(resolved)
+            changed.append("command")
+            # the new command was resolved against the editing shell: its PATH etc. replace the job's
+            for key, name in (("path", "PATH"), ("virtual_env", "VIRTUAL_ENV"), ("python_path", "PYTHONPATH")):
+                if args.get(key):
+                    new_env[name] = args[key]
+                else:
+                    new_env.pop(name, None)
+        elif "cwd" in args and cwd != job["cwd"]:
+            raise ValueError("a new cwd needs the command re-resolved: send argv/raw_argv with it")
+        if "env" in args:
+            explicit = jobenv.check_env(args["env"] or {}, "env")
+            for name, value in explicit.items():
+                if name != "QUR_INDEX" or "QUR_INDEX" not in new_env:  # a sweep's index is not editable
+                    new_env[name] = value
+            if jobenv.PASSTHROUGH_KEY in new_env:
+                passed = [n for n in new_env[jobenv.PASSTHROUGH_KEY].split(",") if n and n not in explicit]
+                if passed:
+                    new_env[jobenv.PASSTHROUGH_KEY] = ",".join(passed)
+                else:
+                    del new_env[jobenv.PASSTHROUGH_KEY]
+        if new_env != env_extra:
+            updates["env_extra"] = json.dumps(new_env) if new_env else None
+            if "env" in args:
+                changed.append("env")
+
+        if "timeout_secs" in args:
+            timeout_secs = args["timeout_secs"]
+            if timeout_secs is not None and (type(timeout_secs) is not int or timeout_secs < 0):
+                raise ValueError("timeout must be a non-negative integer")
+            timeout_secs = timeout_secs or None  # 0 = no timeout
+            if timeout_secs != job["timeout_secs"]:
+                updates["timeout_secs"] = timeout_secs
+                changed.append("timeout")
+        if "max_retries" in args:
+            max_retries = args["max_retries"]
+            if type(max_retries) is not int or max_retries < 0:
+                raise ValueError("retries must be a non-negative integer")
+            if max_retries != job["max_retries"]:
+                updates["max_retries"] = max_retries
+                changed.append("retries")
+                if max_retries == 0 and job["retry_delay_secs"] is not None:
+                    updates["retry_delay_secs"] = None  # a retry delay without retries makes no sense
+                    updates["retry_backoff"] = 0
+        if "on_fail" in args:
+            on_fail = args["on_fail"]
+            if on_fail not in db.ON_FAIL_MODES:
+                raise ValueError(f"on_fail must be one of {', '.join(db.ON_FAIL_MODES)}")
+            if on_fail != job["on_fail"]:
+                updates["on_fail"] = on_fail
+                changed.append("on-fail")
+        if "not_before" in args:
+            not_before = self._parse_not_before(args["not_before"])
+            if not_before != job["not_before"]:
+                updates["not_before"] = not_before
+                changed.append("start time")
+
+        deps: dict[int, str] | None = None
+        if args.get("clear_deps") is not None and type(args["clear_deps"]) is not bool:
+            raise ValueError("clear_deps must be true or false")
+        if args.get("clear_deps") and ("depends_on" in args or "after_any" in args):
+            raise ValueError("clear_deps cannot be combined with depends_on/after_any")
+        if args.get("clear_deps") or "depends_on" in args or "after_any" in args:
+            info = db.dep_info(self.conn, job_id)
+            current = {**{i: "any" for i in info["after_any"]}, **{i: "success" for i in info["depends_on"]}}
+            if args.get("clear_deps"):
+                deps = {}
+            else:
+                keep = {i: m for i, m in current.items() if ("depends_on" not in args or m != "success")
+                        and ("after_any" not in args or m != "any")}
+                given = self._dep_args({k: args[k] for k in ("depends_on", "after_any") if k in args})
+                deps = {**keep, **given}
+                for dep_id in given:  # an id in both kinds gets the stricter mode
+                    if keep.get(dep_id) == "success":
+                        deps[dep_id] = "success"
+            if deps != current:
+                changed.append("dependencies")
+        channel: int | None = None
+        if "channel" in args:
+            channel = args["channel"]
+            if type(channel) is not int or channel < 1:
+                raise ValueError("channel must be a positive integer")
+            if channel == job["channel"]:
+                channel = None
+            else:
+                changed.append("channel")
+
+        if not changed:
+            raise ValueError("nothing to change")
+        db.edit_job(
+            self.conn, job_id, updates=updates, deps=deps if "dependencies" in changed else None,
+            channel=channel, holder_pid=pid,
+        )
+        if "dependencies" in changed:
+            verdict, dep_id = db.dep_verdict(self.conn, job_id)
+            if verdict in ("failed", "removed") and dep_id is not None:
+                self._skip_blocked(job_id, verdict, dep_id)  # a dependency already ended badly: it can never run
+        self._wake_worker(job["channel"])
+        if channel is not None:
+            self._wake_worker(channel)
+        return {"id": job_id, "changed": changed}
 
     async def _cmd_pause(self, args: dict[str, Any]) -> dict[str, Any]:
         assert self.conn is not None

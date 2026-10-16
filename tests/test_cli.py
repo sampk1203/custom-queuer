@@ -2038,3 +2038,327 @@ def test_show_json_has_no_markup_even_for_bracketed_commands(monkeypatch):
     monkeypatch.setattr(client, "send", lambda cmd, **kw: job)
     res = runner.invoke(app, ["show", "1", "--json"])
     assert res.exit_code == 0 and json.loads(res.stdout)["raw_cmd"] == job["raw_cmd"]
+
+
+# ---------------------------------------------------------------------------
+# B14: --retry-delay / --retry-backoff
+# ---------------------------------------------------------------------------
+
+def test_add_sends_the_retry_delay_in_seconds_and_backoff(monkeypatch):
+    calls = _capture_send(monkeypatch, {"id": 4, "channel": 1})
+    res = runner.invoke(app, ["add", "--retries", "3", "--retry-delay", "1h30m", "--", "true"])
+    assert res.exit_code == 0, res.output
+    assert calls[0][1]["retry_delay_secs"] == 5400 and calls[0][1]["retry_backoff"] is False
+    assert "each retry waits 1h30m" in res.output and "doubling" not in res.output
+    res = runner.invoke(app, ["add", "--retries", "3", "--retry-delay", "5m", "--retry-backoff", "--", "true"])
+    assert res.exit_code == 0, res.output
+    assert calls[1][1]["retry_delay_secs"] == 300 and calls[1][1]["retry_backoff"] is True
+    assert "doubling every attempt" in res.output
+
+
+def test_add_without_retry_delay_sends_none(monkeypatch):
+    calls = _capture_send(monkeypatch, {"id": 4, "channel": 1})
+    res = runner.invoke(app, ["add", "--retries", "2", "--", "true"])
+    assert res.exit_code == 0, res.output
+    assert calls[0][1]["retry_delay_secs"] is None and calls[0][1]["retry_backoff"] is False
+    assert "each retry waits" not in res.output
+
+
+def test_add_rejects_bad_retry_delay_combinations_without_calling_the_daemon(monkeypatch):
+    calls = _capture_send(monkeypatch, {"id": 4, "channel": 1})
+    for args, text in (
+        (["--retry-delay", "5m"], "--retries"),                         # no --retries
+        (["--retries", "2", "--retry-backoff"], "--retry-delay"),       # backoff without a delay
+        (["--retries", "2", "--retry-delay", "5"], "duration"),         # no unit
+        (["--retries", "2", "--retry-delay", "0s"], "longer than zero"),
+        (["--retries", "2", "--retry-delay", "31d"], "too long"),
+    ):
+        res = runner.invoke(app, ["add", *args, "--", "true"])
+        assert res.exit_code == 1 and text in res.output, (args, res.output)
+    assert calls == []
+
+
+def test_add_sweep_sends_the_retry_delay_too(monkeypatch):
+    calls = _capture_send(monkeypatch, {"id": 8, "channel": 1, "ids": [8, 9]})
+    res = runner.invoke(app, ["add", "--retries", "1", "--retry-delay", "10s", "--each", "a", "b", "--", "echo", "{}"])
+    assert res.exit_code == 0, res.output
+    assert calls[0][1]["retry_delay_secs"] == 10 and len(calls[0][1]["jobs"]) == 2
+
+
+def test_show_displays_the_retry_delay_only_when_set(monkeypatch):
+    monkeypatch.setattr(client, "send", lambda cmd, **kw: _job(5, max_retries=3, retry_delay_secs=300, retry_backoff=1))
+    out = runner.invoke(app, ["show", "5"], env={"COLUMNS": "200"}).output
+    assert "retry delay" in out and "5m0s, doubling every attempt" in out
+    monkeypatch.setattr(client, "send", lambda cmd, **kw: _job(5, max_retries=3, retry_delay_secs=90, retry_backoff=0))
+    out = runner.invoke(app, ["show", "5"], env={"COLUMNS": "200"}).output
+    assert "1m30s" in out and "doubling" not in out
+    monkeypatch.setattr(client, "send", lambda cmd, **kw: _job(5, max_retries=3))
+    assert "retry delay" not in runner.invoke(app, ["show", "5"], env={"COLUMNS": "200"}).output
+
+
+# ---------------------------------------------------------------------------
+# F8: qur edit
+# ---------------------------------------------------------------------------
+
+import os  # noqa: E402
+
+
+def _edit_env(monkeypatch, job=None, edit_reply=None, fail_edit=None):
+    """Fake daemon for `qur edit`: records every call, serves show/edit_lock/edit/edit_unlock."""
+    job = job or _job(5, raw_cmd=json.dumps(["echo", "old"]), timeout_secs=60)
+    calls: list[tuple[str, dict]] = []
+
+    def fake(cmd, **kw):
+        calls.append((cmd, kw))
+        if cmd in ("show", "edit_lock"):
+            return job
+        if cmd == "edit":
+            if fail_edit:
+                raise client.DaemonError(fail_edit)
+            return edit_reply or {"id": 5, "changed": ["command"]}
+        if cmd == "edit_unlock":
+            return {"released": True}
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(client, "send", fake)
+    return calls
+
+
+def _requests(calls, name="edit"):
+    return [kw for cmd, kw in calls if cmd == name]
+
+
+def test_edit_flags_send_only_what_was_asked(monkeypatch):
+    calls = _edit_env(monkeypatch)
+    res = runner.invoke(app, [
+        "edit", "5", "--timeout", "0", "--channel", "2", "--retries", "3", "--on-fail", "pause",
+        "--depends-on", "1,3-4", "--after-any", "9", "--env", "A=b",
+    ])
+    assert res.exit_code == 0 and "Edited job 5" in res.output
+    assert [c for c, _ in calls] == ["edit"]
+    assert _requests(calls)[0] == {
+        "id": 5, "timeout_secs": None, "channel": 2, "max_retries": 3, "on_fail": "pause",
+        "depends_on": [1, 3, 4], "after_any": [9], "env": {"A": "b"},
+    }
+
+
+def test_edit_delay_at_and_clear_delay(monkeypatch):
+    calls = _edit_env(monkeypatch)
+    assert runner.invoke(app, ["edit", "5", "--delay", "30m"]).exit_code == 0
+    when = datetime.fromisoformat(_requests(calls)[0]["not_before"])
+    assert when.tzinfo is not None and timedelta(minutes=29) < when - datetime.now(timezone.utc) < timedelta(minutes=31)
+    assert runner.invoke(app, ["edit", "5", "--clear-delay"]).exit_code == 0
+    assert _requests(calls)[1] == {"id": 5, "not_before": None}
+    assert runner.invoke(app, ["edit", "5", "--at", "23:59"]).exit_code == 0
+    assert "not_before" in _requests(calls)[2]
+
+
+def test_edit_clear_deps(monkeypatch):
+    calls = _edit_env(monkeypatch)
+    assert runner.invoke(app, ["edit", "5", "--clear-deps"]).exit_code == 0
+    assert _requests(calls)[0] == {"id": 5, "clear_deps": True}
+
+
+def test_edit_new_command_after_double_dash(monkeypatch):
+    calls = _edit_env(monkeypatch)
+    res = runner.invoke(app, ["edit", "5", "--", "echo", "new", "--flag"])
+    assert res.exit_code == 0
+    req = _requests(calls)[0]
+    assert req["raw_argv"] == ["echo", "new", "--flag"] and req["argv"][1:] == ["new", "--flag"]
+    assert os.path.isabs(req["argv"][0]) and req["path"] == os.environ.get("PATH", "")
+
+
+def test_edit_cmd_option_runs_shell_syntax_through_bash(monkeypatch):
+    calls = _edit_env(monkeypatch)
+    assert runner.invoke(app, ["edit", "5", "--cmd", "echo a && echo b"]).exit_code == 0
+    req = _requests(calls)[0]
+    assert req["raw_argv"] == ["echo a && echo b"] and req["argv"][1:] == ["-c", "echo a && echo b"]
+
+
+def test_edit_cmd_and_words_together_is_an_error(monkeypatch):
+    calls = _edit_env(monkeypatch)
+    res = runner.invoke(app, ["edit", "5", "--cmd", "echo a", "--", "echo", "b"])
+    assert res.exit_code == 1 and "not both" in res.output and calls == []
+
+
+def test_edit_cwd_alone_re_resolves_the_stored_command(monkeypatch, tmp_path):
+    calls = _edit_env(monkeypatch)
+    assert runner.invoke(app, ["edit", "5", "--cwd", str(tmp_path)]).exit_code == 0
+    assert [c for c, _ in calls] == ["show", "edit"]
+    req = _requests(calls)[0]
+    assert req["cwd"] == str(tmp_path) and req["raw_argv"] == ["echo", "old"] and req["argv"][1:] == ["old"]
+
+
+def test_edit_relative_cwd_is_made_absolute(monkeypatch, tmp_path):
+    calls = _edit_env(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    assert runner.invoke(app, ["edit", "5", "--cwd", "."]).exit_code == 0
+    assert _requests(calls)[0]["cwd"] == str(tmp_path)
+
+
+@pytest.mark.parametrize("args,word", [
+    (["--on-fail", "explode"], "--on-fail"),
+    (["--delay", "30m", "--clear-delay"], "--clear-delay"),
+    (["--delay", "soon"], "--delay"),
+    (["--clear-deps", "--depends-on", "3"], "--clear-deps"),
+    (["--depends-on", "x"], "--depends-on"),
+    (["--env", "1X=v"], "invalid environment"),
+    (["--env", "NOT_SET_ANYWHERE_XYZ"], "not set"),
+    (["--cmd", "  "], "--cmd is empty"),
+])
+def test_edit_bad_flags_fail_before_calling_the_daemon(monkeypatch, args, word):
+    calls = _edit_env(monkeypatch)
+    res = runner.invoke(app, ["edit", "5", *args])
+    assert res.exit_code == 1 and word in res.output and calls == []
+
+
+def test_edit_daemon_error_is_reported_with_exit_1(monkeypatch):
+    _edit_env(monkeypatch, fail_edit="job 5 is running, not queued: only queued jobs can be edited")
+    res = runner.invoke(app, ["edit", "5", "--timeout", "5"])
+    assert res.exit_code == 1 and "only queued jobs can be edited" in res.output
+
+
+def _fake_editor(monkeypatch, rewrite):
+    seen = {}
+
+    def run(path):
+        text = open(path).read()
+        seen["text"] = text
+        if rewrite is None:
+            raise RuntimeError("the editor exited with status 1")
+        with open(path, "w") as f:
+            f.write(rewrite(text))
+        seen["path"] = path
+
+    monkeypatch.setattr(cli_mod, "_run_editor", run)
+    return seen
+
+
+def test_edit_interactive_applies_the_changed_fields_and_does_not_unlock(monkeypatch):
+    calls = _edit_env(monkeypatch, edit_reply={"id": 5, "changed": ["command", "timeout"]})
+    seen = _fake_editor(monkeypatch, lambda t: t.replace("command: echo old", "command: echo new").replace("timeout: 60", "timeout: 2h"))
+    res = runner.invoke(app, ["edit", "5"])
+    assert res.exit_code == 0 and "changed command, timeout" in res.output
+    assert "command: echo old" in seen["text"] and "cwd: /tmp" in seen["text"] and "timeout: 60" in seen["text"]
+    assert [c for c, _ in calls] == ["edit_lock", "edit"]  # applying released the lock: no unlock
+    lock, req = _requests(calls, "edit_lock")[0], _requests(calls)[0]
+    assert lock == {"id": 5, "pid": os.getpid()} and req["pid"] == os.getpid()
+    assert req["raw_argv"] == ["echo new"] and req["argv"][1:] == ["new"]
+    assert req["timeout_secs"] == 7200 and "cwd" not in req
+    assert not os.path.exists(seen["path"])  # temp file removed
+
+
+def test_edit_interactive_cwd_change_re_resolves_the_command(monkeypatch, tmp_path):
+    calls = _edit_env(monkeypatch)
+    _fake_editor(monkeypatch, lambda t: t.replace("cwd: /tmp", f"cwd: {tmp_path}"))
+    assert runner.invoke(app, ["edit", "5"]).exit_code == 0
+    req = _requests(calls)[0]
+    assert req["cwd"] == str(tmp_path) and req["raw_argv"] == ["echo", "old"]  # the stored words, untouched
+
+
+def test_edit_interactive_timeout_none_removes_it(monkeypatch):
+    calls = _edit_env(monkeypatch)
+    _fake_editor(monkeypatch, lambda t: t.replace("timeout: 60", "timeout: none"))
+    assert runner.invoke(app, ["edit", "5"]).exit_code == 0
+    assert _requests(calls)[0]["timeout_secs"] is None
+
+
+def test_edit_interactive_no_change_unlocks_and_sends_nothing(monkeypatch):
+    calls = _edit_env(monkeypatch)
+    _fake_editor(monkeypatch, lambda t: t)
+    res = runner.invoke(app, ["edit", "5"])
+    assert res.exit_code == 0 and "No changes" in res.output
+    assert [c for c, _ in calls] == ["edit_lock", "edit_unlock"]
+    assert _requests(calls, "edit_unlock")[0] == {"id": 5, "pid": os.getpid()}
+
+
+def test_edit_interactive_comment_only_change_is_no_change(monkeypatch):
+    calls = _edit_env(monkeypatch)
+    _fake_editor(monkeypatch, lambda t: t + "# a note to myself\n")
+    assert runner.invoke(app, ["edit", "5"]).exit_code == 0
+    assert [c for c, _ in calls] == ["edit_lock", "edit_unlock"]
+
+
+def test_edit_interactive_editor_failure_unlocks(monkeypatch):
+    calls = _edit_env(monkeypatch)
+    _fake_editor(monkeypatch, None)
+    res = runner.invoke(app, ["edit", "5"])
+    assert res.exit_code == 1 and "left unchanged" in res.output
+    assert [c for c, _ in calls] == ["edit_lock", "edit_unlock"]
+
+
+@pytest.mark.parametrize("rewrite,word", [
+    (lambda t: t.replace("command: echo old", "command: "), "command"),
+    (lambda t: t + "colour: red\n", "cannot read"),
+    (lambda t: t.replace("timeout: 60", "timeout: soon"), "duration"),
+])
+def test_edit_interactive_bad_file_unlocks_and_changes_nothing(monkeypatch, rewrite, word):
+    calls = _edit_env(monkeypatch)
+    _fake_editor(monkeypatch, rewrite)
+    res = runner.invoke(app, ["edit", "5"])
+    assert res.exit_code == 1 and word in res.output
+    assert [c for c, _ in calls] == ["edit_lock", "edit_unlock"]
+
+
+def test_edit_interactive_daemon_rejects_the_edit_and_lock_is_released(monkeypatch):
+    calls = _edit_env(monkeypatch, fail_edit="executable not found or not executable: /x")
+    _fake_editor(monkeypatch, lambda t: t.replace("echo old", "nonexistent-tool"))
+    res = runner.invoke(app, ["edit", "5"])
+    assert res.exit_code == 1 and "executable not found" in res.output
+    assert [c for c, _ in calls] == ["edit_lock", "edit", "edit_unlock"]
+
+
+def test_edit_interactive_refused_when_the_job_is_not_queued(monkeypatch):
+    def fake(cmd, **kw):
+        raise client.DaemonError("job 5 is running, not queued: only queued jobs can be edited")
+
+    monkeypatch.setattr(client, "send", fake)
+    monkeypatch.setattr(cli_mod, "_run_editor", lambda path: pytest.fail("editor must not open"))
+    res = runner.invoke(app, ["edit", "5"])
+    assert res.exit_code == 1 and "only queued jobs can be edited" in res.output
+
+
+def test_editor_argv_prefers_visual_then_editor_then_nano_or_vi(monkeypatch):
+    monkeypatch.setenv("VISUAL", "code --wait")
+    monkeypatch.setenv("EDITOR", "vim")
+    assert cli_mod._editor_argv() == ["code", "--wait"]
+    monkeypatch.delenv("VISUAL")
+    assert cli_mod._editor_argv() == ["vim"]
+    monkeypatch.delenv("EDITOR")
+    monkeypatch.setattr(shutil, "which", lambda n: "/usr/bin/vi" if n == "vi" else None)
+    assert cli_mod._editor_argv() == ["/usr/bin/vi"]
+    monkeypatch.setattr(shutil, "which", lambda n: None)
+    with pytest.raises(cli_mod.typer.Exit):
+        cli_mod._editor_argv()
+
+
+def test_run_editor_runs_the_editor_on_the_file_and_reports_failure(monkeypatch, tmp_path):
+    f = tmp_path / "x.txt"
+    f.write_text("a")
+    monkeypatch.delenv("VISUAL", raising=False)
+    monkeypatch.setenv("EDITOR", "true")
+    cli_mod._run_editor(str(f))
+    monkeypatch.setenv("EDITOR", "false")
+    with pytest.raises(RuntimeError, match="status 1"):
+        cli_mod._run_editor(str(f))
+    monkeypatch.setenv("EDITOR", "/no/such/editor")
+    with pytest.raises(RuntimeError, match="could not start"):
+        cli_mod._run_editor(str(f))
+
+
+def test_list_shows_editing_in_the_waits_on_column(monkeypatch):
+    locked = _job(2, depends_on=[], after_any=[], waiting_on=[], editing=True)
+    plain = _job(3, depends_on=[], after_any=[], waiting_on=[])
+    listing = {"channels": {"1": _chan([locked, plain])}}
+    monkeypatch.setattr(client, "send", lambda cmd, **kw: listing)
+    out = runner.invoke(app, ["list"], env={"COLUMNS": "200"}).output
+    assert "Waits on" in out and "editing" in out
+    assert cli_mod._fmt_waits(_job(4, waiting_on=[1, 2], editing=True)) == "1, 2, editing"
+    assert cli_mod._fmt_waits(_job(4, waiting_on=[], editing=False)) == "-"
+
+
+def test_show_displays_the_edit_lock(monkeypatch):
+    job = _job(5, editing=True, edit_pid=4242)
+    monkeypatch.setattr(client, "send", lambda cmd, **kw: job)
+    out = runner.invoke(app, ["show", "5"], env={"COLUMNS": "200"}).output
+    assert "editing" in out and "4242" in out

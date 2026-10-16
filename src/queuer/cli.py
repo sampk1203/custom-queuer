@@ -11,6 +11,7 @@ import socket
 import stat
 import subprocess  # nosec B404 - only used for the fixed `ssh --` call below
 import sys
+import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -244,6 +245,30 @@ def _fmt_secs(secs: float) -> str:
     return f"{hours}h{minutes}m"
 
 
+def _fmt_retry_delay(job: dict[str, Any]) -> str:
+    """`qur show` text of a job's --retry-delay / --retry-backoff."""
+    text = _fmt_secs(job["retry_delay_secs"])
+    return text + ", doubling every attempt" if job.get("retry_backoff") else text
+
+
+def _retry_delay_secs(delay: str | None, backoff: bool, retries: int) -> int | None:
+    """`--retry-delay` / `--retry-backoff` -> seconds (None = no delay). Exits with an
+    error if they make no sense: no --retries, backoff without a delay, too long."""
+    if delay is None:
+        if backoff:
+            _fail("--retry-backoff needs --retry-delay")
+        return None
+    if not retries:
+        _fail("--retry-delay needs --retries")
+    try:
+        secs = int(parse_delay(delay).total_seconds())
+    except ValueError as e:
+        _fail(str(e))
+    if secs > db.MAX_RETRY_DELAY_SECS:
+        _fail(f"--retry-delay is too long: at most {db.MAX_RETRY_DELAY_SECS // 86400} days")
+    return secs
+
+
 def _fmt_duration(job: dict[str, Any]) -> str:
     started = job.get("started_at")
     if not started:
@@ -277,7 +302,10 @@ def _fmt_waits(job: dict[str, Any]) -> str:
     ("12, 14"), or "-" when it has none / they all ended (it is then only waiting for
     the jobs ahead of it)."""
     waiting = job.get("waiting_on") or []
-    return _fmt_ids(waiting) if waiting else "-"
+    parts = [_fmt_ids(waiting)] if waiting else []
+    if job.get("editing"):
+        parts.append("editing")  # `qur edit` has the job open: it is not started, its channel waits
+    return ", ".join(parts) if parts else "-"
 
 
 def _fmt_elapsed(ts: str | None) -> str:
@@ -600,6 +628,17 @@ def add(
         "end of its channel's queue, up to this many times. Cancelled jobs and jobs interrupted by a daemon stop "
         "are never retried.",
     ),
+    retry_delay: Optional[str] = typer.Option(
+        None, "--retry-delay", metavar="DURATION",
+        help="Wait this long before an automatic retry (--retries) may start, e.g. 5m, 1h30m (units s/m/h/d, "
+        "at most 30d). Default: retry as soon as it reaches the front. Strict FIFO applies: the waiting retry "
+        "holds its channel. A manual requeue is never delayed. Needs --retries.",
+    ),
+    retry_backoff: bool = typer.Option(
+        False, "--retry-backoff",
+        help="Double the --retry-delay for every retry already made (5m, 10m, 20m, ...; capped at 30d). "
+        "Needs --retry-delay.",
+    ),
     now: bool = typer.Option(
         False, "--now",
         help="Jump the channel's queue: freeze (SIGSTOP) the running job and run this first. "
@@ -623,6 +662,8 @@ def add(
       qur add --channel 2 -- python train.py --epochs 5
       qur add --timeout 60 -- ./run.sh
       qur add --retries 3 -- python flaky_download.py
+      qur add --retries 3 --retry-delay 5m -- ./flaky.sh   # wait 5 min before each retry
+      qur add --retries 4 --retry-delay 1m --retry-backoff -- ./flaky.sh   # 1m, 2m, 4m, 8m
       qur add --on-fail pause -- ./step1.sh          # a failure pauses the channel
       qur add --env CUDA_VISIBLE_DEVICES=1 --env OMP_NUM_THREADS=8 -- python train.py
       qur add --env MY_SETTING -- ./run.sh            # copy MY_SETTING from this shell
@@ -684,6 +725,7 @@ def add(
     if now and start is not None:
         _fail("--now cannot be combined with --delay/--at")
     not_before = start.astimezone(timezone.utc).isoformat() if start is not None else None
+    retry_delay_secs = _retry_delay_secs(retry_delay, retry_backoff, retries)
     try:
         env_explicit = jobenv.parse_env_options(env, os.environ)
     except ValueError as e:
@@ -710,6 +752,8 @@ def add(
         after_any=after_any_ids,
         not_before=not_before,
         on_fail=on_fail,
+        retry_delay_secs=retry_delay_secs,
+        retry_backoff=retry_backoff,
     )
     if sweep is None:
         console.print(f"Queued as job [bold]{data['id']}[/bold] on channel [bold]{data['channel']}[/bold]")
@@ -731,6 +775,8 @@ def add(
         console.print("on failure: this channel will be paused (`qur resume` to continue)")
     if retries:
         console.print(f"auto-retry on failure: up to {retries} time(s)")
+    if retry_delay_secs:
+        console.print(f"each retry waits {_fmt_secs(retry_delay_secs)}" + (", doubling every attempt" if retry_backoff else ""))
     if now:
         console.print("[yellow]--now[/yellow]: current job on this channel frozen (if any); this runs first")
 
@@ -758,7 +804,7 @@ def _render_queue_and_backlog(channel_data: dict[str, Any], full: bool) -> None:
     queue_table.add_column("Origin")
     queue_table.add_column("Queued")
     queue_table.add_column("Elapsed", justify="right")
-    show_waits = any(j.get("depends_on") or j.get("after_any") for j in channel_data["queue"])
+    show_waits = any(j.get("depends_on") or j.get("after_any") or j.get("editing") for j in channel_data["queue"])
     if show_waits:
         queue_table.add_column("Waits on")
     show_starts = any(_starts_in_future(j) for j in channel_data["queue"])
@@ -1052,8 +1098,12 @@ def _render_job(job: dict[str, Any]) -> None:
         table.add_row("after any", _fmt_ids(job["after_any"]) + " (any outcome)")
     if job.get("waiting_on"):
         table.add_row("waiting on", _fmt_ids(job["waiting_on"]))
+    if job.get("editing"):
+        table.add_row("editing", f"being edited by process {job.get('edit_pid')}: it does not start, its channel waits")
     if job.get("max_retries"):
         table.add_row("auto-retries", f"{job['attempt']} of {job['max_retries']} used")
+    if job.get("retry_delay_secs"):
+        table.add_row("retry delay", _fmt_retry_delay(job))
     env_lines = jobenv.describe(job.get("env_extra"))
     if env_lines:
         table.add_row("environment", escape("\n".join(env_lines)))
@@ -1429,6 +1479,266 @@ def requeue(job_id: int = typer.Argument(..., help="ID of a finished job (done/f
     """
     data = _call("requeue", id=job_id)
     console.print(f"Requeued job {job_id} as new job [bold]{data['id']}[/bold]")
+
+
+# ---------------------------------------------------------------------------
+# edit
+# ---------------------------------------------------------------------------
+
+_EDIT_HEADER = """\
+# Edit job {id} (channel {channel}). Save and quit to apply; quit without changes to abandon.
+# Lines starting with # are ignored. While this file is open the job is locked: it does not
+# start, and (strict FIFO) nothing behind it on its channel starts either.
+# command: written like `qur add -- 'COMMAND'` (one string; shell syntax runs via bash -c).
+# timeout: seconds, a duration like 2h, or none.
+"""
+
+
+def _editor_argv() -> list[str]:
+    """The editor to open: $VISUAL, $EDITOR, else nano, else vi."""
+    for var in ("VISUAL", "EDITOR"):
+        value = os.environ.get(var, "").strip()
+        if value:
+            try:
+                words = shlex.split(value)
+            except ValueError:
+                continue
+            if words:
+                return words
+    for name in ("nano", "vi"):
+        found = shutil.which(name)
+        if found:
+            return [found]
+    _fail("no editor found: set $EDITOR (or $VISUAL), or edit with flags, e.g. `qur edit ID --cwd DIR`")
+
+
+def _run_editor(path: str) -> None:
+    """Open `path` in the user's editor and wait for it. Raises RuntimeError if it fails."""
+    argv = _editor_argv() + [path]
+    try:
+        # the editor is the user's own $VISUAL/$EDITOR and the argument is our temp file
+        res = subprocess.run(argv)  # nosec B603
+    except OSError as e:
+        raise RuntimeError(f"could not start the editor {argv[0]!r}: {e.strerror or e}") from e
+    if res.returncode != 0:
+        raise RuntimeError(f"the editor exited with status {res.returncode}")
+
+
+def _edit_text(job: dict[str, Any]) -> str:
+    timeout = job.get("timeout_secs")
+    return (
+        _EDIT_HEADER.format(id=job["id"], channel=job["channel"])
+        + f"command: {_display_join(json.loads(job['raw_cmd']))}\n"
+        + f"cwd: {job['cwd']}\n"
+        + f"timeout: {timeout if timeout else 'none'}\n"
+    )
+
+
+def _parse_edit_text(text: str) -> dict[str, str]:
+    """The `key: value` lines of the edit file (comments and blank lines ignored)."""
+    out: dict[str, str] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, sep, value = line.partition(":")
+        key = key.strip().lower()
+        if not sep or key not in ("command", "cwd", "timeout"):
+            raise ValueError(f"cannot read the line {line!r}: use `command: ...`, `cwd: ...` or `timeout: ...`")
+        out[key] = value.strip()
+    for key in ("command", "cwd", "timeout"):
+        if not out.get(key):
+            raise ValueError(f"the `{key}:` line is missing or empty")
+    return out
+
+
+def _edit_timeout(text: str) -> int:
+    """`timeout:` value of the edit file -> seconds (0 = none)."""
+    value = text.strip().lower()
+    if value in ("none", "0"):
+        return 0
+    if value.isdigit():
+        return int(value)
+    return int(parse_delay(value).total_seconds())
+
+
+def _command_request(words: list[str]) -> dict[str, Any]:
+    """The `edit` request keys for a new command (what `add` sends for one)."""
+    try:
+        argv = _resolve_interpreter(_build_job_argv(words))
+    except ValueError as e:
+        _fail(str(e))
+    return {
+        "argv": argv, "raw_argv": words, "path": os.environ.get("PATH", ""),
+        "virtual_env": os.environ.get("VIRTUAL_ENV"), "python_path": os.environ.get("PYTHONPATH"),
+    }
+
+
+def _edit_interactive(job_id: int) -> None:
+    """`qur edit ID` with no flags: lock the job, edit command/cwd/timeout in $EDITOR, apply."""
+    pid = os.getpid()
+    job = _call("edit_lock", id=job_id, pid=pid)
+    applied = False
+    path: str | None = None
+    try:
+        original = _edit_text(job)
+        fd, path = tempfile.mkstemp(prefix=f"qur-edit-{job_id}-", suffix=".txt")
+        with os.fdopen(fd, "w") as f:
+            f.write(original)
+        try:
+            _run_editor(path)
+            with open(path) as f:
+                edited = f.read()
+        except (RuntimeError, OSError) as e:
+            _fail(f"{e}; job {job_id} left unchanged")
+        if edited == original:
+            console.print(f"No changes: job [bold]{job_id}[/bold] left as it was")
+            return
+        try:
+            fields = _parse_edit_text(edited)
+            old = _parse_edit_text(original)
+            request: dict[str, Any] = {}
+            if fields["command"] != old["command"]:
+                request.update(_command_request([fields["command"]]))
+            if fields["cwd"] != old["cwd"]:
+                cwd = os.path.abspath(os.path.expanduser(fields["cwd"]))
+                request["cwd"] = cwd
+                if "argv" not in request:  # a new cwd re-resolves the stored command
+                    request.update(_command_request(json.loads(job["raw_cmd"])))
+            if fields["timeout"] != old["timeout"]:
+                request["timeout_secs"] = _edit_timeout(fields["timeout"]) or None
+        except ValueError as e:
+            _fail(f"{e}; job {job_id} left unchanged")
+        if not request:
+            console.print(f"No changes: job [bold]{job_id}[/bold] left as it was")
+            return
+        data = _call("edit", id=job_id, pid=pid, **request)
+        applied = True
+        console.print(f"Edited job [bold]{job_id}[/bold]: changed {', '.join(data['changed'])}")
+    finally:
+        if path is not None:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        if not applied:  # abandoned or failed: let the channel go on
+            try:
+                client.send("edit_unlock", id=job_id, pid=pid)
+            except (client.DaemonNotRunning, client.DaemonError):
+                pass
+
+
+@app.command()
+def edit(
+    job_id: int = typer.Argument(..., help="ID of a queued job"),
+    cmd: Optional[list[str]] = typer.Argument(
+        None, metavar="[CMD...]", help="New command, written after `--` (like `qur add`).",
+    ),
+    cmd_text: Optional[str] = typer.Option(
+        None, "--cmd", metavar="COMMAND", help="New command as ONE string (shell syntax runs via bash -c). "
+        "Same as words after `--`.",
+    ),
+    cwd: Optional[str] = typer.Option(None, "--cwd", help="New working directory (relative to this shell's)."),
+    timeout: Optional[int] = typer.Option(None, "--timeout", min=0, help="New timeout in seconds; 0 removes it."),
+    channel: Optional[int] = typer.Option(
+        None, "--channel", min=1, help="Move the job to this channel, at the END of its queue.",
+    ),
+    retries: Optional[int] = typer.Option(None, "--retries", min=0, help="New --retries count."),
+    on_fail: Optional[str] = typer.Option(None, "--on-fail", metavar="pause|continue", help="New --on-fail."),
+    delay: Optional[str] = typer.Option(None, "--delay", metavar="DURATION", help="Start no earlier than this from now."),
+    at: Optional[str] = typer.Option(None, "--at", metavar="TIME", help="Start no earlier than this local time."),
+    clear_delay: bool = typer.Option(False, "--clear-delay", help="Remove the start time."),
+    depends_on: Optional[list[str]] = typer.Option(
+        None, "--depends-on", metavar="ID[,ID...]", help="REPLACE the --depends-on list with these jobs.",
+    ),
+    after_any: Optional[list[str]] = typer.Option(
+        None, "--after-any", metavar="ID[,ID...]", help="REPLACE the --after-any list with these jobs.",
+    ),
+    clear_deps: bool = typer.Option(False, "--clear-deps", help="Remove every dependency."),
+    env: Optional[list[str]] = typer.Option(
+        None, "--env", metavar="KEY[=VAL]", help="Add or change an environment variable (as in `qur add`); repeatable.",
+    ),
+) -> None:
+    """Edit a queued job.
+
+    With flags, the listed settings change and everything else stays; all of it is
+    checked like `qur add` (executable, dependencies, deadlocks) and applied all or
+    nothing. With no flags, command, cwd and timeout open in $VISUAL/$EDITOR (else
+    nano/vi) as a small text file.
+
+    Only a job that is still `queued` can be edited. While an edit is open the job is
+    LOCKED: it does not start, and since each channel is strict FIFO the jobs behind it
+    wait too, even if the job ahead of it has finished. When you save (or abandon) the
+    edit the channel goes on and runs the edited job. A lock of an editor that died, or
+    older than 30 minutes, is ignored by the daemon, and a daemon restart drops all locks
+    (the edit then fails with a clear message). `qur rm` / `qur cancel` still work on a
+    locked job (the editor then reports that the job is gone).
+
+    --channel moves the job to the end of the other channel's queue. --depends-on /
+    --after-any replace that kind of dependency; --clear-deps removes all. A new command
+    or cwd is resolved against this shell's PATH, which also replaces the job's PATH,
+    VIRTUAL_ENV and PYTHONPATH. Setting --retries 0 also drops the job's retry delay.
+
+    \b
+    Examples:
+      qur edit 12                              # edit command/cwd/timeout in $EDITOR
+      qur edit 12 -- python train.py --epochs 10
+      qur edit 12 --cwd ~/run2 --timeout 7200
+      qur edit 12 --channel 2 --delay 1h
+      qur edit 12 --depends-on 10,11 --env OMP_NUM_THREADS=4
+      qur edit 12 --clear-delay --clear-deps
+    """
+    words = list(cmd or [])
+    if cmd_text is not None:
+        if words:
+            _fail("give the new command either with --cmd or after `--`, not both")
+        words = [cmd_text]
+    if cmd_text is not None and not cmd_text.strip():
+        _fail("--cmd is empty")
+    flagged = any(v is not None for v in (cwd, timeout, channel, retries, on_fail, delay, at, depends_on, after_any, env))
+    if not words and not flagged and not clear_delay and not clear_deps:
+        _edit_interactive(job_id)
+        return
+
+    request: dict[str, Any] = {}
+    if on_fail is not None:
+        if on_fail not in db.ON_FAIL_MODES:
+            _fail(f"--on-fail must be one of {', '.join(db.ON_FAIL_MODES)} (got {on_fail!r})")
+        request["on_fail"] = on_fail
+    if clear_delay and (delay is not None or at is not None):
+        _fail("--clear-delay cannot be combined with --delay/--at")
+    start = _start_time(delay, at)
+    if start is not None:
+        request["not_before"] = start.astimezone(timezone.utc).isoformat()
+    elif clear_delay:
+        request["not_before"] = None
+    if clear_deps and (depends_on or after_any):
+        _fail("--clear-deps cannot be combined with --depends-on/--after-any")
+    if clear_deps:
+        request["clear_deps"] = True
+    if depends_on:
+        request["depends_on"] = _parse_job_ids(depends_on, "--depends-on")
+    if after_any:
+        request["after_any"] = _parse_job_ids(after_any, "--after-any")
+    if env:
+        try:
+            request["env"] = jobenv.parse_env_options(env, os.environ)
+        except ValueError as e:
+            _fail(str(e))
+    if timeout is not None:
+        request["timeout_secs"] = timeout or None
+    if channel is not None:
+        request["channel"] = channel
+    if retries is not None:
+        request["max_retries"] = retries
+    if cwd is not None:
+        request["cwd"] = os.path.abspath(os.path.expanduser(cwd))
+    if words or cwd is not None:
+        if not words:  # a new cwd re-resolves the stored command
+            words = json.loads(_call("show", id=job_id)["raw_cmd"])
+        request.update(_command_request(words))
+    data = _call("edit", id=job_id, **request)
+    console.print(f"Edited job [bold]{job_id}[/bold]: changed {', '.join(data['changed'])}")
 
 
 @app.command()

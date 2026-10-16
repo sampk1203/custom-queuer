@@ -65,7 +65,7 @@ Every command also has worked examples under `qur <command> --help`, and `qur --
 prints the help for every command at once.
 
 ```
-queuer add [--channel N] [--before ID | --after ID | --now] [--depends-on IDS] [--after-any IDS] [--each V... | --array A-B] [--on-fail pause|continue] [--delay DURATION | --at TIME] [--timeout SECONDS] [--retries N] -- <cmd...>
+queuer add [--channel N] [--before ID | --after ID | --now] [--depends-on IDS] [--after-any IDS] [--each V... | --array A-B] [--on-fail pause|continue] [--delay DURATION | --at TIME] [--timeout SECONDS] [--retries N [--retry-delay DURATION [--retry-backoff]]] -- <cmd...>
 queuer list [--channel N] [--full] [--json]
 queuer status [--json]
 queuer show ID|RANGE [ID|RANGE...] [--json]
@@ -75,6 +75,7 @@ queuer cancel [JOB_ID] [--channel N]
 queuer clear [--channel N]
 queuer rm ID
 queuer requeue ID
+queuer edit ID [--cmd CMD | -- <cmd...>] [--cwd DIR] [--timeout SECONDS] [--channel N] [--retries N] [--on-fail pause|continue] [--delay DURATION | --at TIME | --clear-delay] [--depends-on IDS] [--after-any IDS] [--clear-deps] [--env KEY[=VAL]]...
 queuer pause [--channel N]
 queuer resume [--channel N]
 queuer logs ID [--tail]
@@ -223,6 +224,18 @@ note says which job replaced it. Cancelled jobs are never retried, and
 jobs interrupted by a daemon stop (see "Daemon stop / restart" below) are not
 retried either and do not use up `--retries`.
 
+`--retry-delay DURATION` (units s/m/h/d, chainable: `5m`, `1h30m`; at most 30d; needs
+`--retries`) makes each automatic retry wait that long before it may start, so a job that
+fails at once does not burn all its retries in seconds. The retry is stored with a start
+time exactly like `--delay`, so the same rules apply: strict FIFO (the waiting retry holds
+its channel, jobs queued behind it wait), it survives a daemon restart, and a paused
+channel waits for `qur resume`. Dependants of the failed job are still skipped at once.
+`--retry-backoff` (needs `--retry-delay`) doubles the wait with every retry already made:
+`--retry-delay 1m --retry-backoff` waits 1m, 2m, 4m, 8m, ... (never more than 30d). A
+manual requeue (`qur requeue`, the Telegram button) is never delayed but keeps the setting.
+`qur show` and the Telegram Details list it as `retry delay`. Without `--retry-delay`
+retries start as soon as they reach the front, as before.
+
 `add` validates the executable exists and is executable *before*
 accepting the job — a bad command is rejected immediately, not an hour
 later when it reaches the front of the queue.
@@ -251,7 +264,7 @@ IDs can also be ranges and comma lists, like `--depends-on`: `qur show 31-33`, `
 They are shown in the order you give them.
 
 Full detail on one or more jobs — both command forms, cwd, every timestamp,
-duration, exit code, timeout, auto-retry count, extra environment (see "Environment" under
+duration, exit code, timeout, auto-retry count and retry delay, extra environment (see "Environment" under
 `add`), pid, and log path. With
 `--json`, one ID prints an object; several print a list.
 
@@ -348,6 +361,38 @@ Re-enqueues a finished job (done/failed/cancelled) with its exact
 original command, working directory, timeout, and retry setting, appended to the end
 of the queue. Handy for rerunning a job that failed without retyping it.
 
+### `edit ID`
+
+Changes a job that is still `queued`; a running or finished job gives a clear error.
+
+```
+qur edit 12                                   # command, cwd, timeout in $VISUAL/$EDITOR (else nano, vi)
+qur edit 12 -- python train.py --epochs 10    # new command
+qur edit 12 --cwd ~/run2 --timeout 7200
+qur edit 12 --channel 2 --delay 1h
+qur edit 12 --depends-on 10,11 --env OMP_NUM_THREADS=4
+qur edit 12 --clear-delay --clear-deps
+```
+
+With flags, only what you list changes. Everything is checked like `qur add` (executable,
+cwd, dependencies, deadlocks) and applied all or nothing. `--timeout 0` removes the timeout,
+`--channel` moves the job to the END of that channel's queue, `--depends-on` / `--after-any`
+replace that kind of dependency, `--clear-deps` removes all, `--env` adds or changes variables
+(a sweep's `QUR_INDEX` stays). A new command or `--cwd` is resolved against this shell's PATH,
+which also replaces the job's PATH, VIRTUAL_ENV and PYTHONPATH. `--retries 0` also drops the
+job's retry delay. In the editor file, `command:` is read like `qur add -- 'COMMAND'` (shell
+syntax runs via `bash -c`); an untouched command line keeps the original words.
+
+**Edit lock.** While the editor is open the job is locked: it does not start, and since each
+channel is strict FIFO the jobs behind it wait too, even after the job ahead has finished.
+When you save or abandon the edit the channel goes on and runs the edited job. `qur list`
+shows "editing" in the Waits on column, `qur show` an `editing` row. A lock whose editor
+process died, or that is older than 30 minutes, is ignored and cleared by the daemon, and a
+daemon restart drops all locks (the edit then fails with a clear message), so a crashed editor
+can never block a channel. `qur rm` / `qur cancel` still work on a locked job. A job that is
+being started at that very moment can no longer be edited. Locking is per job: other
+channels are not affected.
+
 ### `pause` / `resume`
 
 `pause` stops the daemon from starting new jobs — the current job (if
@@ -388,7 +433,7 @@ your paired chats only and only when you press it. Don't press it for jobs that 
 secrets.
 
 **Requeue button.** Pressing it re-runs the finished job exactly like
-`qur requeue ID` (same command, cwd, timeout, retries; end of its channel's
+`qur requeue ID` (same command, cwd, timeout, retries and retry delay; end of its channel's
 queue) and replies `🔁 job 12 requeued as job 13`; the Requeue button is then
 removed from that message (Details stays). A second Requeue press of the same job
 within 30 s (a double tap) is answered `already requeued as job N` and does nothing.
@@ -648,7 +693,7 @@ For a design/architecture writeup and the phase-by-phase build plan, see
 - Serial within a channel — one job at a time per channel (channels run in parallel). To run
   jobs in parallel, use several channels.
 - A job waiting on a dependency blocks the jobs behind it on its channel (strict FIFO).
-- Retries are opt-in per job (`--retries`), immediate, and go to the end of the queue.
+- Retries are opt-in per job (`--retries`), immediate unless `--retry-delay` is set, and go to the end of the queue.
 - Notifications are Telegram-only, best-effort (a send that fails is dropped,
   not retried), and visible to Telegram. Pair one machine at a time (see
   `connect`).

@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +32,8 @@ ON_FAIL_MODES = ("continue", "pause")
 DEFAULT_KEEP = 200  # finished jobs kept per channel by the daemon (QUEUER_KEEP changes it)
 LIST_BACKLOG = 10  # finished jobs `qur list` / the Telegram list show per channel
 MAX_HISTORY = 10000  # most rows one history query returns
+MAX_RETRY_DELAY_SECS = 30 * 86400  # longest wait before an automatic retry (also caps --retry-backoff)
+EDIT_LOCK_SECS = 30 * 60  # an edit lock older than this is stale and ignored (a crashed editor never blocks a channel)
 MAX_SWEEP = 1000  # most jobs one `add` creates (--each/--array) and most ids one dependency list holds
 
 _JOBS_DDL = """
@@ -61,7 +63,9 @@ CREATE TABLE IF NOT EXISTS {name} (
     parent_id     INTEGER,
     origin        TEXT,
     not_before    TEXT,
-    on_fail       TEXT NOT NULL DEFAULT 'continue' CHECK (on_fail IN ('continue','pause'))
+    on_fail       TEXT NOT NULL DEFAULT 'continue' CHECK (on_fail IN ('continue','pause')),
+    retry_delay_secs INTEGER,
+    retry_backoff INTEGER NOT NULL DEFAULT 0
 );
 """
 
@@ -86,6 +90,13 @@ CREATE TABLE IF NOT EXISTS job_deps (
 );
 
 CREATE INDEX IF NOT EXISTS idx_job_deps_dep ON job_deps (dep_id);
+
+CREATE TABLE IF NOT EXISTS edit_locks (
+    job_id     INTEGER PRIMARY KEY,
+    holder_pid INTEGER NOT NULL,
+    taken_at   TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
 """
 
 
@@ -190,12 +201,25 @@ def _migrate_add_deps_and_delay(conn: sqlite3.Connection) -> None:
         raise
 
 
+def _migrate_add_retry_delay(conn: sqlite3.Connection) -> None:
+    """DBs created before `--retry-delay` lack `retry_delay_secs` (NULL = retry at
+    once) and `retry_backoff` (0/1). Plain ADD COLUMN, no CHECK change. No-op once
+    migrated (a DB rebuilt by the migration above already has both)."""
+    cols = [r["name"] for r in conn.execute("PRAGMA table_info(jobs)").fetchall()]
+    if "retry_delay_secs" not in cols:
+        conn.execute("ALTER TABLE jobs ADD COLUMN retry_delay_secs INTEGER")
+    if "retry_backoff" not in cols:
+        conn.execute("ALTER TABLE jobs ADD COLUMN retry_backoff INTEGER NOT NULL DEFAULT 0")
+    conn.commit()
+
+
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA)
     conn.commit()
     _migrate_add_priority_lane(conn)
     _migrate_add_retries(conn)
     _migrate_add_deps_and_delay(conn)
+    _migrate_add_retry_delay(conn)
 
 
 def _now() -> str:
@@ -272,6 +296,8 @@ def enqueue(
     deps: dict[int, str] | None = None,
     not_before: str | None = None,
     on_fail: str = "continue",
+    retry_delay_secs: int | None = None,
+    retry_backoff: bool = False,
     commit: bool = True,
 ) -> int:
     """Insert a new queued job on `channel`. Returns the new job's id.
@@ -303,6 +329,10 @@ def enqueue(
     "pause") says what a failure of this job does to its channel. Priority
     (`--now`) jobs can have neither dependencies nor a start time.
 
+    `retry_delay_secs` (None = none) is how long an automatic retry of this job
+    waits before it may start; `retry_backoff` doubles that wait for every
+    attempt already made. Both are copied to retries and requeues.
+
     Nothing is written if anything is rejected. `commit=False` leaves the
     insert in the open transaction so several jobs can be added all-or-nothing
     (the caller commits, or rolls back).
@@ -311,6 +341,10 @@ def enqueue(
         raise ValueError("before and after are mutually exclusive")
     if on_fail not in ON_FAIL_MODES:
         raise ValueError(f"on_fail must be one of {', '.join(ON_FAIL_MODES)}")
+    if retry_delay_secs is not None and not 0 < retry_delay_secs <= MAX_RETRY_DELAY_SECS:
+        raise ValueError(f"retry delay must be between 1 second and {MAX_RETRY_DELAY_SECS // 86400} days")
+    if retry_backoff and retry_delay_secs is None:
+        raise ValueError("retry backoff needs a retry delay")
     deps = deps or {}
     if is_priority and (deps or not_before):
         raise ValueError("--now cannot be combined with dependencies or a start time")
@@ -328,8 +362,8 @@ def enqueue(
             INSERT INTO jobs
                 (channel, status, position, raw_cmd, resolved_cmd, cwd, env_extra,
                  enqueued_at, log_path, timeout_secs, is_priority, max_retries, attempt,
-                 parent_id, origin, not_before, on_fail)
-            VALUES (?, 'queued', NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 parent_id, origin, not_before, on_fail, retry_delay_secs, retry_backoff)
+            VALUES (?, 'queued', NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 channel,
@@ -347,6 +381,8 @@ def enqueue(
                 origin,
                 not_before,
                 on_fail,
+                retry_delay_secs,
+                int(retry_backoff),
             ),
         )
         new_id = cur.lastrowid
@@ -558,6 +594,7 @@ def mark_running(conn: sqlite3.Connection, job_id: int, pid: int, pgid: int) -> 
         """,
         (pid, pgid, _now(), job_id),
     )
+    conn.execute("DELETE FROM edit_locks WHERE job_id = ?", (job_id,))
     remaining = [i for i in _queued_ids_ordered(conn, job["channel"], bool(job["is_priority"])) if i != job_id]
     _reindex_queue(conn, remaining)
     conn.commit()
@@ -704,6 +741,7 @@ def remove_from_queue(conn: sqlite3.Connection, job_id: int) -> None:
         )
     conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
     conn.execute("DELETE FROM job_deps WHERE job_id = ? OR dep_id = ?", (job_id, job_id))
+    conn.execute("DELETE FROM edit_locks WHERE job_id = ?", (job_id,))  # rm wins over an open editor
     remaining = [i for i in _queued_ids_ordered(conn, job["channel"], bool(job["is_priority"])) if i != job_id]
     _reindex_queue(conn, remaining)
     conn.commit()
@@ -718,6 +756,7 @@ def _end_queued(conn: sqlite3.Connection, job_id: int, status: str, note: str, k
     if job["status"] != "queued":
         raise ValueError(f"job {job_id} is not queued (status={job['status']!r})")
     conn.execute("UPDATE jobs SET position = NULL WHERE id = ?", (job_id,))
+    conn.execute("DELETE FROM edit_locks WHERE job_id = ?", (job_id,))  # cancel wins over an open editor
     remaining = [i for i in _queued_ids_ordered(conn, job["channel"], bool(job["is_priority"])) if i != job_id]
     _reindex_queue(conn, remaining)
     conn.commit()
@@ -829,6 +868,174 @@ def skip_dependants(
     return skipped, channels
 
 
+# ---------------------------------------------------------------------------
+# Edit lock + `qur edit`
+# ---------------------------------------------------------------------------
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)  # signal 0: only asks whether the process exists
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, belongs to someone else
+    except OSError:
+        return False
+    return True
+
+
+def live_edit_lock(conn: sqlite3.Connection, job_id: int) -> dict[str, Any] | None:
+    """The edit lock on `job_id` if there is one that still counts, else None. A lock
+    whose holder process is gone, or that is past its expiry, is stale: it is deleted
+    here, so a crashed editor can never hold a channel for ever."""
+    row = conn.execute("SELECT * FROM edit_locks WHERE job_id = ?", (job_id,)).fetchone()
+    if row is None:
+        return None
+    lock = _row_to_dict(row)
+    try:
+        expired = datetime.fromisoformat(lock["expires_at"]) <= datetime.now(timezone.utc)
+    except ValueError:
+        expired = True
+    if expired or not _pid_alive(lock["holder_pid"]):
+        conn.execute("DELETE FROM edit_locks WHERE job_id = ?", (job_id,))
+        conn.commit()
+        return None
+    return lock
+
+
+def clear_edit_locks(conn: sqlite3.Connection) -> int:
+    """Forget every edit lock (daemon start: the editors talked to the previous daemon)."""
+    cur = conn.execute("DELETE FROM edit_locks")
+    conn.commit()
+    return cur.rowcount
+
+
+def _editable_job(conn: sqlite3.Connection, job_id: int) -> dict[str, Any]:
+    job = get_job(conn, job_id)
+    if job is None:
+        raise ValueError(f"job {job_id} does not exist")
+    if job["status"] != "queued":
+        raise ValueError(f"job {job_id} is {job['status']}, not queued: only queued jobs can be edited")
+    if job["is_priority"]:
+        raise ValueError(f"job {job_id} is a --now job: it starts at once and cannot be edited")
+    return job
+
+
+def take_edit_lock(conn: sqlite3.Connection, job_id: int, holder_pid: int, secs: int = EDIT_LOCK_SECS) -> dict[str, Any]:
+    """Lock a queued job for editing: while the lock is live the daemon does not start
+    it (strict FIFO: its channel waits). Re-taking your own lock renews it; a live lock
+    of another process is refused. Returns the lock row."""
+    _editable_job(conn, job_id)
+    held = live_edit_lock(conn, job_id)
+    if held is not None and held["holder_pid"] != holder_pid:
+        raise ValueError(f"job {job_id} is already being edited (process {held['holder_pid']})")
+    now = datetime.now(timezone.utc)
+    conn.execute(
+        "INSERT OR REPLACE INTO edit_locks (job_id, holder_pid, taken_at, expires_at) VALUES (?, ?, ?, ?)",
+        (job_id, holder_pid, now.isoformat(), (now + timedelta(seconds=secs)).isoformat()),
+    )
+    conn.commit()
+    lock = live_edit_lock(conn, job_id)
+    if lock is None:
+        raise ValueError(f"could not lock job {job_id} (is process {holder_pid} running?)")
+    return lock
+
+
+def release_edit_lock(conn: sqlite3.Connection, job_id: int, holder_pid: int | None = None) -> bool:
+    """Drop the lock on `job_id` (only the holder's, when `holder_pid` is given).
+    True if a lock was removed."""
+    if holder_pid is None:
+        cur = conn.execute("DELETE FROM edit_locks WHERE job_id = ?", (job_id,))
+    else:
+        cur = conn.execute("DELETE FROM edit_locks WHERE job_id = ? AND holder_pid = ?", (job_id, holder_pid))
+    conn.commit()
+    return cur.rowcount > 0
+
+
+# columns `edit_job` may set: a fixed whitelist, so the SET clause below is never built from input
+_EDITABLE_COLUMNS = (
+    "raw_cmd", "resolved_cmd", "cwd", "env_extra", "timeout_secs", "max_retries", "on_fail",
+    "not_before", "retry_delay_secs", "retry_backoff",
+)
+
+
+def edit_job(
+    conn: sqlite3.Connection,
+    job_id: int,
+    *,
+    updates: dict[str, Any],
+    deps: dict[int, str] | None = None,
+    channel: int | None = None,
+    holder_pid: int | None = None,
+) -> dict[str, Any]:
+    """Change a queued job, all or nothing. `updates` maps column names (a subset of
+    _EDITABLE_COLUMNS; values already in their stored form) to new values; `deps` (None =
+    unchanged) replaces the job's whole dependency set; `channel` moves it to the END of
+    another channel's queue. The dependency/deadlock rules are those of `enqueue`.
+
+    `holder_pid` is the editor holding the job's edit lock: the lock must still be live
+    and theirs, and it is released with the edit. Without it the job must not be locked
+    by someone else. Returns the new row. Nothing is written if anything is rejected."""
+    unknown = sorted(set(updates) - set(_EDITABLE_COLUMNS))
+    if unknown:
+        raise ValueError(f"cannot edit: {', '.join(unknown)}")
+    job = _editable_job(conn, job_id)
+    held = live_edit_lock(conn, job_id)
+    if holder_pid is None:
+        if held is not None:
+            raise ValueError(f"job {job_id} is being edited by process {held['holder_pid']}")
+    elif held is None or held["holder_pid"] != holder_pid:
+        raise ValueError(f"the edit lock on job {job_id} was lost (expired, or the daemon restarted): edit again")
+    if "on_fail" in updates and updates["on_fail"] not in ON_FAIL_MODES:
+        raise ValueError(f"on_fail must be one of {', '.join(ON_FAIL_MODES)}")
+    deps = dict(deps) if deps is not None else None
+    if deps is not None:
+        for dep_id, mode in deps.items():
+            if mode not in DEP_MODES:
+                raise ValueError(f"dependency mode must be one of {', '.join(DEP_MODES)}")
+            if dep_id == job_id:
+                raise ValueError("a job cannot depend on itself")
+            if get_job(conn, dep_id) is None:
+                raise ValueError(f"dependency job {dep_id} does not exist")
+    try:
+        for column, value in updates.items():
+            # column comes from the fixed _EDITABLE_COLUMNS whitelist checked above; the value is bound
+            conn.execute(f"UPDATE jobs SET {column} = ? WHERE id = ?", (value, job_id))  # nosec B608
+        old_channel = job["channel"]
+        if channel is not None and channel != old_channel:
+            register_channel(conn, channel, commit=False)
+            conn.execute("UPDATE jobs SET channel = ?, position = NULL WHERE id = ?", (channel, job_id))
+            _reindex_queue(conn, _queued_ids_ordered(conn, old_channel))
+            _reindex_queue(conn, [i for i in _queued_ids_ordered(conn, channel) if i != job_id] + [job_id])
+        if deps is not None:
+            conn.execute("DELETE FROM job_deps WHERE job_id = ?", (job_id,))
+            conn.executemany(
+                "INSERT INTO job_deps (job_id, dep_id, mode) VALUES (?, ?, ?)",
+                [(job_id, dep_id, mode) for dep_id, mode in deps.items()],
+            )
+        if deps or channel is not None:
+            ordered = _queued_ids_ordered(conn, channel if channel is not None else old_channel)
+            behind = set(ordered[ordered.index(job_id) + 1:])
+            for dep_id in deps or {}:
+                if dep_id in behind:
+                    raise ValueError(
+                        f"job {dep_id} is queued behind this job on channel {job['channel'] if channel is None else channel}, "
+                        f"so this job could never start (strict FIFO: a waiting job blocks the ones behind it)"
+                    )
+            loop = _find_deadlock(conn, job_id)
+            if loop:
+                raise ValueError("this would deadlock: " + _describe_loop(loop))
+        conn.execute("DELETE FROM edit_locks WHERE job_id = ?", (job_id,))
+    except BaseException:
+        conn.rollback()
+        raise
+    conn.commit()
+    new = get_job(conn, job_id)
+    assert new is not None
+    return new
+
+
 def list_active(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     """Every job marked running or frozen (stopped), on any channel."""
     rows = conn.execute("SELECT * FROM jobs WHERE status IN ('running', 'stopped') ORDER BY id").fetchall()
@@ -873,13 +1080,16 @@ def _reorder(
 
 def requeue(conn: sqlite3.Connection, job_id: int, *, log_path: str, auto: bool = False) -> int:
     """Re-enqueue a finished job (any terminal state) with its original argv/
-    cwd/env/timeout/channel/max_retries/on_fail, appended to the end of its
-    channel's queue. Dependencies and a start time are NOT copied: the copy
+    cwd/env/timeout/channel/max_retries/on_fail/retry delay, appended to the end
+    of its channel's queue. Dependencies and a start time are NOT copied: the copy
     runs when it reaches the front. Returns the new job's id.
 
     `auto=False` is a manual requeue: origin 'requeue', fresh retry count
     (attempt 0). `auto=True` is the daemon retrying a failure: origin
-    'retry', attempt = old attempt + 1. Either way parent_id is `job_id`."""
+    'retry', attempt = old attempt + 1, and the copy may not start before
+    now + the job's retry delay (doubled per earlier attempt with backoff,
+    capped at MAX_RETRY_DELAY_SECS). A manual requeue is never delayed.
+    Either way parent_id is `job_id`."""
     job = get_job(conn, job_id)
     if job is None:
         raise ValueError(f"job {job_id} does not exist")
@@ -888,6 +1098,13 @@ def requeue(conn: sqlite3.Connection, job_id: int, *, log_path: str, auto: bool 
             f"job {job_id} has status {job['status']!r}; "
             "only finished jobs can be requeued"
         )
+    not_before: str | None = None
+    delay = job["retry_delay_secs"]
+    if auto and delay:
+        if job["retry_backoff"]:
+            delay = delay * 2 ** min(job["attempt"], 40)
+        delay = min(delay, MAX_RETRY_DELAY_SECS)
+        not_before = (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat()
     return enqueue(
         conn,
         raw_cmd=json.loads(job["raw_cmd"]),
@@ -899,6 +1116,9 @@ def requeue(conn: sqlite3.Connection, job_id: int, *, log_path: str, auto: bool 
         timeout_secs=job["timeout_secs"],
         max_retries=job["max_retries"],
         on_fail=job["on_fail"],
+        retry_delay_secs=job["retry_delay_secs"],
+        retry_backoff=bool(job["retry_backoff"]),
+        not_before=not_before,
         attempt=job["attempt"] + 1 if auto else 0,
         parent_id=job_id,
         origin="retry" if auto else "requeue",

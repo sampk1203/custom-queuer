@@ -871,3 +871,12 @@ def test_telegram_list_stays_capped_however_long_the_history_is():
     assert text.count("job-") <= notify.LIST_TEXT_MAX_BACKLOG == 100 and "job-100<" not in text
     markup = notify.list_markup(CFG, chan)["inline_keyboard"]
     assert sum(len(r) for r in markup) == notify.LIST_MAX_BACKLOG * 3 <= 100
+
+
+def test_format_details_shows_the_retry_delay_only_when_set():
+    base = dict(status="failed", max_retries=2, attempt=0)
+    t = notify.format_details(_job(**base, retry_delay_secs=300, retry_backoff=1), CFG)
+    assert "<b>retry delay</b>" in t and "5m0s, doubling every attempt" in t
+    t = notify.format_details(_job(**base, retry_delay_secs=90, retry_backoff=0), CFG)
+    assert "1m30s" in t and "doubling" not in t
+    assert "retry delay" not in notify.format_details(_job(**base), CFG)

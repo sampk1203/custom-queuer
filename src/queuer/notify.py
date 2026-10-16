@@ -826,6 +826,9 @@ def _format_details(job: dict[str, Any], cfg: dict[str, Any], cmd_cap: int) -> s
     ]
     if job.get("max_retries"):
         lines.append(row("auto-retries", f"{job['attempt']} of {job['max_retries']} used"))
+    if job.get("retry_delay_secs"):
+        wait = _fmt_secs(job["retry_delay_secs"])
+        lines.append(row("retry delay", wait + (", doubling every attempt" if job.get("retry_backoff") else "")))
     if job.get("on_fail") == "pause":
         lines.append(row("on fail", "pause the channel"))
     if job.get("not_before"):

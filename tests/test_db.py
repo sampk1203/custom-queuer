@@ -1238,3 +1238,365 @@ def test_history_filters_combine(conn):
     _fin(conn, c, status="failed")
     got = db.get_history(conn, statuses=["failed"], channel=1, grep="train")
     assert [j["id"] for j in got] == [a]
+
+
+# ---------------------------------------------------------------------------
+# B14: --retry-delay / --retry-backoff
+# ---------------------------------------------------------------------------
+
+def _fail_and_retry(conn, job_id):
+    """Fail `job_id` and requeue it the way the daemon does for --retries."""
+    _fin(conn, job_id, status="failed")
+    return db.requeue(conn, job_id, log_path="/tmp/retry.log", auto=True)
+
+
+def _secs_from_now(ts):
+    from datetime import datetime, timezone
+
+    return (datetime.fromisoformat(ts) - datetime.now(timezone.utc)).total_seconds()
+
+
+def test_retry_delay_defaults_to_none(conn):
+    a = _mk(conn, "a", max_retries=1)
+    job = db.get_job(conn, a)
+    assert job["retry_delay_secs"] is None and job["retry_backoff"] == 0
+    retry = _fail_and_retry(conn, a)
+    assert db.get_job(conn, retry)["not_before"] is None  # today's behaviour: retry at once
+
+
+def test_retry_delay_is_stored_and_delays_the_automatic_retry(conn):
+    a = _mk(conn, "a", max_retries=2, retry_delay_secs=300)
+    assert db.get_job(conn, a)["retry_delay_secs"] == 300
+    assert db.get_job(conn, a)["not_before"] is None  # the first run itself is not delayed
+    retry = db.get_job(conn, _fail_and_retry(conn, a))
+    assert 295 <= _secs_from_now(retry["not_before"]) <= 300
+    assert (retry["origin"], retry["parent_id"], retry["attempt"]) == ("retry", a, 1)
+    assert retry["retry_delay_secs"] == 300 and retry["retry_backoff"] == 0  # copied on to the next retry
+    again = db.get_job(conn, _fail_and_retry(conn, retry["id"]))
+    assert 295 <= _secs_from_now(again["not_before"]) <= 300  # same wait every time without backoff
+
+
+def test_retry_backoff_doubles_the_delay_per_attempt(conn):
+    a = _mk(conn, "a", max_retries=3, retry_delay_secs=60, retry_backoff=True)
+    assert db.get_job(conn, a)["retry_backoff"] == 1
+    waits = []
+    job_id = a
+    for _ in range(3):
+        job_id = _fail_and_retry(conn, job_id)
+        waits.append(_secs_from_now(db.get_job(conn, job_id)["not_before"]))
+    for got, want in zip(waits, (60, 120, 240)):
+        assert want - 5 <= got <= want
+
+
+def test_retry_backoff_is_capped(conn):
+    a = _mk(conn, "a", max_retries=100, retry_delay_secs=db.MAX_RETRY_DELAY_SECS, retry_backoff=True)
+    job_id = a
+    for _ in range(3):
+        job_id = _fail_and_retry(conn, job_id)
+    assert _secs_from_now(db.get_job(conn, job_id)["not_before"]) <= db.MAX_RETRY_DELAY_SECS
+    # a huge attempt count must not overflow either
+    conn.execute("UPDATE jobs SET attempt = 100000 WHERE id = ?", (job_id,))
+    conn.commit()
+    job_id = _fail_and_retry(conn, job_id)
+    assert _secs_from_now(db.get_job(conn, job_id)["not_before"]) <= db.MAX_RETRY_DELAY_SECS
+
+
+def test_manual_requeue_is_not_delayed_but_keeps_the_setting(conn):
+    a = _mk(conn, "a", max_retries=2, retry_delay_secs=300, retry_backoff=True)
+    _fin(conn, a, status="failed")
+    new = db.get_job(conn, db.requeue(conn, a, log_path="/tmp/x.log"))
+    assert new["not_before"] is None and new["origin"] == "requeue" and new["attempt"] == 0
+    assert (new["retry_delay_secs"], new["retry_backoff"], new["max_retries"]) == (300, 1, 2)
+
+
+def test_retry_delay_validation_writes_nothing(conn):
+    for bad in (0, -5, db.MAX_RETRY_DELAY_SECS + 1):
+        with pytest.raises(ValueError, match="retry delay"):
+            _mk(conn, "a", retry_delay_secs=bad)
+    with pytest.raises(ValueError, match="backoff"):
+        _mk(conn, "a", retry_backoff=True)
+    assert conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
+
+
+def test_requeue_is_independent_of_dependants_of_a_delayed_retry(conn):
+    # a dependant of the failed job is skipped at once, delay or not (the retry is a new job)
+    a = _mk(conn, "a", max_retries=1, retry_delay_secs=3600)
+    b = _mk(conn, "b", deps={a: "success"})
+    _fin(conn, a, status="failed")
+    db.requeue(conn, a, log_path="/tmp/r.log", auto=True)
+    skipped, _channels = db.skip_dependants(conn, a, 200)
+    assert skipped == [b] and db.get_job(conn, b)["status"] == "skipped"
+
+
+def test_init_db_adds_the_retry_delay_columns_to_a_database_from_before(tmp_path):
+    """A DB that already has dependencies and `not_before` (the previous schema) but no
+    retry-delay columns gets them by ADD COLUMN: rows survive, a second run is a no-op."""
+    import sqlite3
+
+    path = tmp_path / "prev.db"
+    raw = sqlite3.connect(path)
+    raw.executescript(
+        """
+        CREATE TABLE jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel INTEGER NOT NULL DEFAULT 1,
+            status TEXT NOT NULL CHECK (status IN
+                ('queued','running','stopped','done','failed','cancelled','interrupted','skipped')),
+            position INTEGER, raw_cmd TEXT NOT NULL, resolved_cmd TEXT NOT NULL,
+            cwd TEXT NOT NULL, env_extra TEXT, pid INTEGER, pgid INTEGER,
+            enqueued_at TEXT NOT NULL, started_at TEXT, finished_at TEXT,
+            exit_code INTEGER, log_path TEXT NOT NULL, note TEXT,
+            timeout_secs INTEGER, is_priority INTEGER NOT NULL DEFAULT 0,
+            max_retries INTEGER NOT NULL DEFAULT 0, attempt INTEGER NOT NULL DEFAULT 0,
+            parent_id INTEGER, origin TEXT, not_before TEXT,
+            on_fail TEXT NOT NULL DEFAULT 'continue' CHECK (on_fail IN ('continue','pause'))
+        );
+        INSERT INTO jobs (status, position, raw_cmd, resolved_cmd, cwd, enqueued_at, log_path, max_retries)
+        VALUES ('queued', 0, '["a"]', '["/usr/bin/a"]', '/tmp', '2026-01-01T00:00:00+00:00', '/tmp/1.log', 2);
+        """
+    )
+    raw.commit()
+    raw.close()
+
+    c = db.connect(path)
+    db.init_db(c)
+    db.init_db(c)
+    job = db.get_job(c, 1)
+    assert job["raw_cmd"] == '["a"]' and job["max_retries"] == 2
+    assert job["retry_delay_secs"] is None and job["retry_backoff"] == 0
+    new_id = _mk(c, "n", max_retries=1, retry_delay_secs=60)
+    assert new_id == 2 and db.get_job(c, new_id)["retry_delay_secs"] == 60
+    c.close()
+
+
+def test_a_database_rebuilt_by_the_older_migration_gets_the_retry_columns_too(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    raw = sqlite3.connect(path)
+    raw.executescript(
+        """
+        CREATE TABLE jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel INTEGER NOT NULL DEFAULT 1,
+            status TEXT NOT NULL CHECK (status IN
+                ('queued','running','stopped','done','failed','cancelled')),
+            position INTEGER, raw_cmd TEXT NOT NULL, resolved_cmd TEXT NOT NULL,
+            cwd TEXT NOT NULL, env_extra TEXT, pid INTEGER, pgid INTEGER,
+            enqueued_at TEXT NOT NULL, started_at TEXT, finished_at TEXT,
+            exit_code INTEGER, log_path TEXT NOT NULL, note TEXT,
+            timeout_secs INTEGER, is_priority INTEGER NOT NULL DEFAULT 0,
+            max_retries INTEGER NOT NULL DEFAULT 0, attempt INTEGER NOT NULL DEFAULT 0,
+            parent_id INTEGER, origin TEXT
+        );
+        INSERT INTO jobs (status, position, raw_cmd, resolved_cmd, cwd, enqueued_at, log_path)
+        VALUES ('queued', 0, '["a"]', '["/usr/bin/a"]', '/tmp', '2026-01-01T00:00:00+00:00', '/tmp/1.log');
+        """
+    )
+    raw.commit()
+    raw.close()
+    c = db.connect(path)
+    db.init_db(c)
+    cols = [r["name"] for r in c.execute("PRAGMA table_info(jobs)").fetchall()]
+    assert cols.count("retry_delay_secs") == 1 and cols.count("retry_backoff") == 1
+    assert db.get_job(c, 1)["retry_backoff"] == 0
+    c.close()
+
+
+# ---------------------------------------------------------------------------
+# F8: edit lock + edit_job
+# ---------------------------------------------------------------------------
+
+import os  # noqa: E402
+import subprocess  # noqa: E402
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+
+def _dead_pid() -> int:
+    p = subprocess.Popen(["true"])  # noqa: S603, S607
+    p.wait()
+    return p.pid
+
+
+def _lock_row(conn, job_id):
+    return conn.execute("SELECT * FROM edit_locks WHERE job_id = ?", (job_id,)).fetchone()
+
+
+def test_take_and_release_edit_lock(conn):
+    a = _mk(conn, "a")
+    lock = db.take_edit_lock(conn, a, os.getpid())
+    assert lock["holder_pid"] == os.getpid()
+    assert db.live_edit_lock(conn, a) is not None
+    assert db.release_edit_lock(conn, a, os.getpid()) is True
+    assert db.live_edit_lock(conn, a) is None
+    assert db.release_edit_lock(conn, a, os.getpid()) is False
+
+
+def test_edit_lock_of_another_live_process_is_refused_own_is_renewed(conn):
+    a = _mk(conn, "a")
+    db.take_edit_lock(conn, a, os.getpid())
+    with pytest.raises(ValueError, match="already being edited"):
+        db.take_edit_lock(conn, a, 1)  # pid 1 always exists
+    first = _lock_row(conn, a)["expires_at"]
+    db.take_edit_lock(conn, a, os.getpid())
+    assert _lock_row(conn, a)["expires_at"] >= first
+
+
+def test_edit_lock_needs_a_queued_job(conn):
+    a = _mk(conn, "a")
+    db.mark_running(conn, a, pid=1, pgid=1)
+    with pytest.raises(ValueError, match="not queued"):
+        db.take_edit_lock(conn, a, os.getpid())
+    with pytest.raises(ValueError, match="does not exist"):
+        db.take_edit_lock(conn, 999, os.getpid())
+
+
+def test_priority_job_cannot_be_edited(conn):
+    a = _mk(conn, "a", is_priority=True)
+    with pytest.raises(ValueError, match="--now"):
+        db.take_edit_lock(conn, a, os.getpid())
+
+
+def test_edit_lock_of_a_dead_process_is_stale_and_cleared(conn):
+    a = _mk(conn, "a")
+    db.take_edit_lock(conn, a, os.getpid())
+    conn.execute("UPDATE edit_locks SET holder_pid = ?", (_dead_pid(),))
+    conn.commit()
+    assert db.live_edit_lock(conn, a) is None
+    assert _lock_row(conn, a) is None
+    db.take_edit_lock(conn, a, 1)  # free for anyone now
+
+
+def test_expired_edit_lock_is_stale_and_cleared(conn):
+    a = _mk(conn, "a")
+    db.take_edit_lock(conn, a, os.getpid())
+    past = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    conn.execute("UPDATE edit_locks SET expires_at = ?", (past,))
+    conn.commit()
+    assert db.live_edit_lock(conn, a) is None
+    assert _lock_row(conn, a) is None
+
+
+def test_edit_lock_lifetime_is_30_minutes(conn):
+    a = _mk(conn, "a")
+    lock = db.take_edit_lock(conn, a, os.getpid())
+    left = (datetime.fromisoformat(lock["expires_at"]) - datetime.fromisoformat(lock["taken_at"])).total_seconds()
+    assert left == db.EDIT_LOCK_SECS == 1800
+
+
+def test_clear_edit_locks(conn):
+    a, b = _mk(conn, "a"), _mk(conn, "b")
+    db.take_edit_lock(conn, a, os.getpid())
+    db.take_edit_lock(conn, b, os.getpid())
+    assert db.clear_edit_locks(conn) == 2
+    assert db.live_edit_lock(conn, a) is None
+
+
+def test_rm_cancel_and_start_drop_the_lock(conn):
+    a, b, c = _mk(conn, "a"), _mk(conn, "b"), _mk(conn, "c")
+    for j in (a, b, c):
+        db.take_edit_lock(conn, j, os.getpid())
+    db.remove_from_queue(conn, a)
+    db.cancel_queued(conn, b)
+    db.mark_running(conn, c, pid=1, pgid=1)
+    assert conn.execute("SELECT COUNT(*) FROM edit_locks").fetchone()[0] == 0
+
+
+def test_edit_job_changes_fields_and_keeps_the_rest(conn):
+    a = _mk(conn, "a", timeout_secs=5)
+    new = db.edit_job(conn, a, updates={"raw_cmd": '["x"]', "timeout_secs": None, "on_fail": "pause", "max_retries": 2})
+    assert new["raw_cmd"] == '["x"]' and new["timeout_secs"] is None
+    assert new["on_fail"] == "pause" and new["max_retries"] == 2
+    assert new["resolved_cmd"] == '["/usr/bin/a"]' and new["status"] == "queued"
+
+
+def test_edit_job_rejects_unknown_columns_and_bad_values(conn):
+    a = _mk(conn, "a")
+    with pytest.raises(ValueError, match="cannot edit"):
+        db.edit_job(conn, a, updates={"status": "done"})
+    with pytest.raises(ValueError, match="on_fail"):
+        db.edit_job(conn, a, updates={"on_fail": "explode"})
+    assert db.get_job(conn, a)["status"] == "queued"
+
+
+def test_edit_job_only_queued(conn):
+    a, b = _mk(conn, "a"), _mk(conn, "b")
+    db.mark_running(conn, a, pid=1, pgid=1)
+    db.mark_finished(conn, a, status="done", exit_code=0)
+    with pytest.raises(ValueError, match="only queued jobs can be edited"):
+        db.edit_job(conn, a, updates={"cwd": "/x"})
+    db.mark_running(conn, b, pid=1, pgid=1)
+    with pytest.raises(ValueError, match="running, not queued"):
+        db.edit_job(conn, b, updates={"cwd": "/x"})
+    with pytest.raises(ValueError, match="does not exist"):
+        db.edit_job(conn, 999, updates={"cwd": "/x"})
+
+
+def test_edit_job_respects_the_lock(conn):
+    a = _mk(conn, "a")
+    db.take_edit_lock(conn, a, os.getpid())
+    with pytest.raises(ValueError, match="being edited"):
+        db.edit_job(conn, a, updates={"cwd": "/x"})  # someone else's lock (no holder given)
+    new = db.edit_job(conn, a, updates={"cwd": "/x"}, holder_pid=os.getpid())
+    assert new["cwd"] == "/x" and _lock_row(conn, a) is None  # released with the edit
+
+
+def test_edit_job_with_a_lost_lock_fails(conn):
+    a = _mk(conn, "a")
+    with pytest.raises(ValueError, match="lock on job"):
+        db.edit_job(conn, a, updates={"cwd": "/x"}, holder_pid=os.getpid())
+    assert db.get_job(conn, a)["cwd"] == "/tmp"
+
+
+def test_edit_job_moves_to_the_end_of_another_channel(conn):
+    a, b, c = _mk(conn, "a"), _mk(conn, "b"), _mk(conn, "c")
+    x = _mk(conn, "x", channel=2)
+    db.edit_job(conn, a, updates={}, channel=2)
+    assert [j["id"] for j in db.get_queue(conn, 1)] == [b, c]
+    assert [j["position"] for j in db.get_queue(conn, 1)] == [0, 1]
+    assert [j["id"] for j in db.get_queue(conn, 2)] == [x, a]
+    assert db.get_job(conn, a)["channel"] == 2
+    db.edit_job(conn, b, updates={}, channel=7)  # a brand-new channel is registered
+    assert 7 in db.list_channels(conn)
+
+
+def test_edit_job_replaces_dependencies(conn):
+    a, b, c = _mk(conn, "a", channel=2), _mk(conn, "b", channel=2), _mk(conn, "c")
+    db.edit_job(conn, c, updates={}, deps={a: "success", b: "any"})
+    info = db.dep_info(conn, c)
+    assert info["depends_on"] == [a] and info["after_any"] == [b]
+    db.edit_job(conn, c, updates={}, deps={})
+    assert db.dep_info(conn, c)["depends_on"] == []
+
+
+def test_edit_job_dependency_errors_change_nothing(conn):
+    a = _mk(conn, "a")
+    b = _mk(conn, "b")
+    with pytest.raises(ValueError, match="does not exist"):
+        db.edit_job(conn, a, updates={"cwd": "/x"}, deps={999: "success"})
+    with pytest.raises(ValueError, match="itself"):
+        db.edit_job(conn, a, updates={"cwd": "/x"}, deps={a: "success"})
+    with pytest.raises(ValueError, match="behind this job"):
+        db.edit_job(conn, a, updates={"cwd": "/x"}, deps={b: "success"})  # b is queued behind a
+    with pytest.raises(ValueError, match="mode"):
+        db.edit_job(conn, a, updates={"cwd": "/x"}, deps={b: "maybe"})
+    assert db.get_job(conn, a)["cwd"] == "/tmp" and db.dep_info(conn, a)["depends_on"] == []
+
+
+def test_edit_job_deadlock_is_rejected_and_rolled_back(conn):
+    a, b = _mk(conn, "a", channel=1), _mk(conn, "b", channel=2)
+    db.edit_job(conn, b, updates={}, deps={a: "success"})
+    with pytest.raises(ValueError, match="deadlock"):
+        db.edit_job(conn, a, updates={"cwd": "/x"}, deps={b: "success"})
+    assert db.get_job(conn, a)["cwd"] == "/tmp" and db.dep_info(conn, a)["depends_on"] == []
+
+
+def test_edit_job_move_that_would_deadlock_is_rejected(conn):
+    a = _mk(conn, "a")
+    b = _mk(conn, "b", channel=2, deps={a: "success"})
+    c = _mk(conn, "c", channel=2)
+    # moving a behind b on channel 2: b waits for a, a waits (FIFO) for b
+    with pytest.raises(ValueError, match="deadlock"):
+        db.edit_job(conn, a, updates={}, channel=2)
+    assert db.get_job(conn, a)["channel"] == 1
+    assert [j["id"] for j in db.get_queue(conn, 2)] == [b, c]
