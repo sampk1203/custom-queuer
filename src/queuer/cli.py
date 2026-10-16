@@ -428,7 +428,9 @@ def _expand_each(args: list[str]) -> list[str]:
 class _AddCommand(TyperCommand):
     """`qur add`, whose `--each` takes several values (see `_expand_each`)."""
 
-    def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
+    # ctx is typed Any on purpose: typer >= 0.27 bundles its own copy of click (typer._click),
+    # so neither `click.Context` nor a private import matches the base class for mypy.
+    def parse_args(self, ctx: Any, args: list[str]) -> list[str]:
         return super().parse_args(ctx, _expand_each(args))
 
 

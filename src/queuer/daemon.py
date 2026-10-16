@@ -1490,9 +1490,9 @@ class Daemon:
             # a stop request, or a worker/server that ended: either way the daemon is going
             # down, so running jobs are recorded as interrupted before the process exits
             await self._shutdown(server)
-            for task in done:
-                if task is not stop_wait and not task.cancelled():
-                    task.result()  # a crashed worker still surfaces its error
+            for finished in done:
+                if finished is not stop_wait and not finished.cancelled():
+                    finished.result()  # a crashed worker still surfaces its error
 
 
 def main() -> None:
