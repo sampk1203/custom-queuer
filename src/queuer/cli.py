@@ -897,11 +897,14 @@ def parse_since(text: str, now: datetime) -> datetime:
     return when
 
 
+_TERMINAL_STATUSES_HELP = ", ".join(db.TERMINAL_STATUSES)
+
+
 @app.command()
 def history(
     status: Optional[list[str]] = typer.Option(
         None, "--status", metavar="STATUS",
-        help=f"Only jobs that ended like this ({', '.join(db.TERMINAL_STATUSES)}); repeat for several.",
+        help=f"Only jobs that ended like this ({_TERMINAL_STATUSES_HELP}); repeat for several.",
     ),
     channel: Optional[int] = typer.Option(None, "--channel", min=1, help="Only this channel (default: all)"),
     since: Optional[str] = typer.Option(
