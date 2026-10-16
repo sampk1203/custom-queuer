@@ -28,6 +28,8 @@ import struct
 import sys
 import time
 import traceback
+from collections.abc import Callable
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +47,16 @@ MAX_CLIENTS = 32  # socket connections served at the same time; more get "too ma
 TG_STALE_SECS = 300  # offline longer than this -> button presses that piled up meanwhile are dropped
 TG_ALIVE_SAVE_SECS = 60  # how often "the bot was polled fine just now" is written to the DB
 REQUEUE_GUARD_SECS = 30  # a second Telegram Requeue of the same job within this is a double tap
+# Shutdown budget (install.sh sets TimeoutStopSec=30): job kill grace (DEFAULT_GRACE_SECS, 5 s,
+# all jobs in parallel) + workers recording the result (<= SHUTDOWN_WAIT_SECS) + the
+# "interrupted" Telegram messages going out (<= SHUTDOWN_NOTIFY_SECS) stays well under it.
+SHUTDOWN_WAIT_SECS = 8
+SHUTDOWN_NOTIFY_SECS = 8
+STOP_RACE_SECS = 1.0  # systemd signals jobs and daemon together: how long a signal-death waits for our own SIGTERM
+STOP_NOTE = "daemon stopped"  # note of a job the daemon's stop (or a crash/reboot) cut short
+# exit codes of a job that died to SIGHUP/SIGINT/SIGKILL/SIGTERM: negative = killed by the signal
+# itself, 128+n = a shell/wrapper that reported it
+_SIGNAL_EXITS = frozenset({-1, -2, -9, -15, 129, 130, 137, 143})
 
 
 def _default_db_path() -> Path:
@@ -148,6 +160,9 @@ class Daemon:
         self._tg_alive: dict[str, float] = {}  # bot token -> time of its last good poll
         self._tg_alive_saved: dict[str, float] = {}  # bot token -> when that was last written to the DB
         self._clients = 0  # socket connections being served right now
+        # set by SIGTERM/SIGINT (systemctl stop/restart, reboot): no new job starts, running
+        # jobs are killed and recorded as `interrupted`, then the daemon exits
+        self._stopping = asyncio.Event()
         self._seen_callbacks: list[str] = []
 
         # `--now` priority lane: at most one job can be frozen per channel
@@ -167,24 +182,25 @@ class Daemon:
         _tighten_or_warn(self.db_path.parent, created=False, ours_by_default=False)  # warn only
 
     def _recover_on_startup(self) -> None:
-        """A row still marked 'running' from a previous daemon instance
-        cannot actually still be running -- we just started. Mark it
-        failed rather than silently losing it or re-running it. Checked
-        across every channel that has ever been used."""
+        """A row still marked 'running' (or 'stopped', frozen by `--now`) from a
+        previous daemon instance cannot actually still be running -- we just
+        started. That daemon died without recording it (crash, SIGKILL, power
+        loss, reboot): mark it `interrupted`, not `failed`, rather than silently
+        losing it or re-running it. It is not retried and does not use up
+        --retries. Checked across every channel that has ever been used."""
         assert self.conn is not None
         for channel in db.list_channels(self.conn):
-            running = db.get_running(self.conn, channel)
-            if running is not None:
-                db.mark_finished(
-                    self.conn,
-                    running["id"],
-                    status="failed",
-                    note="interrupted by daemon restart",
-                )
-                self._notify_finished(running["id"])
+            for stale in (db.get_running(self.conn, channel), db.get_stopped(self.conn, channel)):
+                if stale is not None:
+                    db.mark_finished(self.conn, stale["id"], status="interrupted", note=STOP_NOTE)
+                    self._settle_dependants(stale["id"])
+                    self._notify_finished(stale["id"])
 
     def _ensure_channel_worker(self, channel: int) -> None:
-        """Lazily spawn a channel's worker loop if it isn't running yet."""
+        """Lazily spawn a channel's worker loop if it isn't running yet (never
+        once the daemon is stopping: a new worker would start the next job)."""
+        if self._stopping.is_set():
+            return
         task = self._worker_tasks.get(channel)
         if task is not None and not task.done():
             return
@@ -198,21 +214,74 @@ class Daemon:
         wake = self._wake[channel]
         while True:
             wake.clear()
+            if self._stopping.is_set():
+                return
+            sleep_for: float = IDLE_POLL_SECS
             if not db.get_paused(self.conn, channel):
                 queue = db.get_queue(self.conn, channel)
                 if queue:
-                    await self._run_job_safely(channel, queue[0])
-                    continue
-            # idle: wait for something to wake us (new job, resume, retry, ...),
-            # with a slow periodic recheck as a safety net
+                    # strict FIFO: only the head is ever considered. A head that waits on
+                    # an unfinished dependency holds the whole channel (nothing jumps
+                    # ahead); it is woken when that dependency ends (`_settle_dependants`)
+                    verdict, dep_id = db.dep_verdict(self.conn, queue[0]["id"])
+                    if verdict == "ready":
+                        # a delayed head (`--delay` / `--at`) holds the channel until its
+                        # time: sleep exactly that long (a wake event still ends the sleep
+                        # early, e.g. the head was removed or cancelled)
+                        remaining = self._secs_until(queue[0].get("not_before"))
+                        if remaining <= 0:
+                            await self._run_job_safely(channel, queue[0])
+                            continue
+                        sleep_for = min(remaining, IDLE_POLL_SECS)
+                    elif verdict != "waiting" and dep_id is not None:
+                        self._skip_blocked(queue[0]["id"], verdict, dep_id)
+                        continue
+            # idle: wait for something to wake us (new job, resume, retry, dependency
+            # finished, ...), with a slow periodic recheck as a safety net. Sleeps are
+            # capped at the recheck interval so a clock jump or a suspend cannot make a
+            # delayed job late by more than that; the last sleep before not_before is
+            # exactly the time that is left.
             try:
-                await asyncio.wait_for(wake.wait(), timeout=IDLE_POLL_SECS)
+                await asyncio.wait_for(wake.wait(), timeout=sleep_for)
             except asyncio.TimeoutError:
                 pass
 
+    @staticmethod
+    def _secs_until(not_before: str | None) -> float:
+        """Seconds until the absolute time `not_before` (<= 0: already passed, or none
+        set). An unreadable value counts as passed: a job must never be stuck behind
+        a bad timestamp."""
+        if not not_before:
+            return 0.0
+        try:
+            when = datetime.fromisoformat(not_before)
+        except ValueError:
+            return 0.0
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        return (when - datetime.now(timezone.utc)).total_seconds()
+
+    @staticmethod
+    def _parse_not_before(value: Any) -> str | None:
+        """The `not_before` of an `add` request as a normalised UTC ISO string (None if
+        absent). It must be an ISO timestamp WITH a UTC offset: the client works out
+        local times, the daemon only ever stores absolute ones."""
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("not_before must be an ISO timestamp string")
+        try:
+            when = datetime.fromisoformat(value)
+        except ValueError:
+            raise ValueError(f"not_before is not an ISO timestamp: {value!r}") from None
+        if when.tzinfo is None:
+            raise ValueError("not_before must include a UTC offset")
+        return when.astimezone(timezone.utc).isoformat()
+
     def _wake_worker(self, channel: int) -> None:
         self._ensure_channel_worker(channel)
-        self._wake[channel].set()
+        if channel in self._wake:
+            self._wake[channel].set()
 
     # -- priority lane (`--now`) ------------------------------------------
 
@@ -221,6 +290,8 @@ class Daemon:
         already draining one. Idempotent -- additional `--now` jobs while
         one is already running just land in the DB queue and get picked
         up by the existing task's next loop iteration."""
+        if self._stopping.is_set():
+            return
         task = self._priority_worker_tasks.get(channel)
         if task is not None and not task.done():
             return
@@ -228,12 +299,12 @@ class Daemon:
 
     async def _priority_worker_loop(self, channel: int) -> None:
         assert self.conn is not None
-        while True:
+        while not self._stopping.is_set():
             queue = db.get_queue(self.conn, channel, is_priority=True)
             if not queue:
                 break
             await self._run_job_safely(channel, queue[0])
-        if channel in self._frozen:
+        if channel in self._frozen and not self._stopping.is_set():
             await self._resume_frozen(channel)
 
     def _freeze_current_if_normal(self, channel: int) -> None:
@@ -245,7 +316,7 @@ class Daemon:
         is already in the foreground (the new one queues in FIFO behind
         it, no additional freeze needed)."""
         assert self.conn is not None
-        if channel in self._frozen:
+        if channel in self._frozen or self._stopping.is_set():
             return
         job_id = self._current_job_id.get(channel)
         proc = self._current_proc.get(channel)
@@ -306,6 +377,8 @@ class Daemon:
         env.update(env_extra)
         log_path = Path(job["log_path"])
         log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if self._stopping.is_set():
+            return  # the job stays queued; the next daemon runs it
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -327,6 +400,9 @@ class Daemon:
 
         log_task = asyncio.create_task(self._pump_log(proc, log_path))
         timeout = job["timeout_secs"]
+        if self._stopping.is_set():
+            # the stop began while the process was being spawned, so _shutdown did not see it
+            await self._kill_group_for_shutdown(proc)
 
         try:
             if timeout:
@@ -345,14 +421,35 @@ class Daemon:
 
         await log_task
 
+        note: str | None = None
         if job_id in self._cancelled:
             status = "cancelled"
             self._cancelled.discard(job_id)
+        elif await self._cut_short_by_stop(exit_code):
+            status = "interrupted"  # not "failed": the job did nothing wrong; never auto-retried
+            note = STOP_NOTE
         else:
             status = "done" if exit_code == 0 else "failed"
-        db.mark_finished(self.conn, job_id, status=status, exit_code=exit_code)
+        db.mark_finished(self.conn, job_id, status=status, exit_code=exit_code, note=note)
         self._release(channel, job_id)
         self._after_finish(job_id)
+
+    async def _cut_short_by_stop(self, exit_code: int) -> bool:
+        """True if the daemon's stop ended this job. Under systemd's default
+        KillMode the job gets SIGTERM in the same instant as the daemon, so the job's
+        exit can be seen a moment BEFORE our own signal handler has run: a job that
+        died to a signal waits briefly for the stop flag before it is called failed."""
+        if exit_code == 0:
+            return False  # it finished by itself (or handled the TERM and finished cleanly): done
+        if self._stopping.is_set():
+            return True
+        if exit_code not in _SIGNAL_EXITS:
+            return False
+        try:
+            await asyncio.wait_for(self._stopping.wait(), timeout=STOP_RACE_SECS)
+        except asyncio.TimeoutError:
+            return False
+        return True
 
     async def _wait_running_time(self, proc: asyncio.subprocess.Process, channel: int, job_id: int, timeout: float) -> int:
         """Wait for `proc`, enforcing `timeout` seconds of RUN time: time spent
@@ -388,8 +485,46 @@ class Daemon:
         """A job just reached a terminal state: retry it if it has retries
         left, otherwise tell the user. A failure that was requeued stays
         silent -- you hear about the final outcome only."""
+        self._settle_dependants(job_id)
         if not self._maybe_auto_retry(job_id):
             self._notify_finished(job_id)
+            self._pause_if_asked(job_id)
+
+    def _pause_if_asked(self, job_id: int) -> None:
+        """`--on-fail pause`: a job that ended `failed` (not cancelled, skipped or
+        interrupted) pauses its channel -- the queued jobs behind it stay queued until
+        `qur resume`. Only called for a FINAL failure: a failure that `--retries`
+        requeued does not pause, the retry would just sit there."""
+        assert self.conn is not None
+        job = db.get_job(self.conn, job_id)
+        if job is None or job["status"] != "failed" or job["on_fail"] != "pause":
+            return
+        db.set_paused(self.conn, True, job["channel"])
+        failed_job: dict[str, Any] = job
+        self._notify_text(lambda bcfg: notify.format_paused(failed_job, bcfg))
+
+    def _settle_dependants(self, job_id: int) -> None:
+        """`job_id` just reached a terminal state: skip every queued job that needed
+        it to succeed (cascading to their own dependants), tell the user about each,
+        and wake every channel holding a job that waited on it -- its head may be free
+        to start now. A failed job that is auto-retried still skips its dependants:
+        the retry is a new job at the end of the queue, so waiting for it could
+        deadlock a dependant that sits ahead of it."""
+        assert self.conn is not None
+        skipped, channels = db.skip_dependants(self.conn, job_id)
+        for skipped_id in skipped:
+            self._notify_finished(skipped_id)
+        for channel in channels:
+            self._wake_worker(channel)
+
+    def _skip_blocked(self, job_id: int, verdict: str, dep_id: int) -> None:
+        """A queued job whose dependency can never be satisfied (it failed, or its
+        row is gone): record it as `skipped`, then skip whatever needed it."""
+        assert self.conn is not None
+        what = "removed" if verdict == "removed" else "failed"
+        db.skip_queued(self.conn, job_id, f"dependency {dep_id} {what}")
+        self._notify_finished(job_id)
+        self._settle_dependants(job_id)
 
     def _notify_finished(self, job_id: int) -> None:
         """Fire-and-forget Telegram message for a finished job, sent through
@@ -413,6 +548,23 @@ class Daemon:
             # the buttons only go out through bots this machine listens to
             markup = notify.job_markup(bcfg, job_id) if notify.listening(bcfg) else None
             task = loop.create_task(self._send_notification(bcfg, notify.format_job(job, bcfg), markup))
+            self._notify_tasks.add(task)
+            task.add_done_callback(self._notify_tasks.discard)
+
+    def _notify_text(self, make_text: Callable[[dict[str, Any]], str]) -> None:
+        """Fire-and-forget plain Telegram message through every connected bot
+        (`make_text` gets each bot's flat config). No-op if notifications aren't set up."""
+        cfg = notify.load(self.notify_path)
+        if cfg is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        for bcfg in notify.bot_cfgs(cfg):
+            if not bcfg["chat_ids"]:
+                continue
+            task = loop.create_task(self._send_notification(bcfg, make_text(bcfg)))
             self._notify_tasks.add(task)
             task.add_done_callback(self._notify_tasks.discard)
 
@@ -608,7 +760,7 @@ class Daemon:
                 return
             await reply("")
             if action == "sh":
-                await asyncio.to_thread(notify.send, to_chat, notify.format_details(job, cfg), None, "HTML")
+                await asyncio.to_thread(notify.send, to_chat, notify.format_details(self._with_deps(job), cfg), None, "HTML")
             else:
                 # path from our own log dir + the integer id, not the DB's log_path column
                 tail = await asyncio.to_thread(notify.read_log_tail, self.log_dir / f"{job_id}.log")
@@ -754,6 +906,62 @@ class Daemon:
         except ProcessLookupError:
             pass
 
+    async def _kill_group_for_shutdown(self, proc: asyncio.subprocess.Process, grace: float | None = None) -> None:
+        """SIGTERM the job's whole process group, give it `grace` seconds, then
+        SIGKILL whatever is left. Unlike `_kill_process_group` this watches the
+        GROUP, not just the main process: a backgrounded child that ignores SIGTERM
+        would otherwise keep the log pipe (and so the job) open past our exit."""
+        pgid = proc.pid
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        deadline = time.monotonic() + (DEFAULT_GRACE_SECS if grace is None else grace)
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+            try:
+                os.killpg(pgid, 0)  # signal 0: only asks whether the group still has members
+            except ProcessLookupError:
+                return
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    async def _shutdown(self, server: asyncio.AbstractServer) -> None:
+        """SIGTERM/SIGINT path (systemctl stop/restart, reboot). Order matters:
+        1. stop taking requests and starting jobs (`_stopping`, wake every worker so
+           idle ones return);
+        2. kill every running/frozen job's process group (in parallel);
+        3. wait for the workers: each records its job as `interrupted` (see
+           `_cut_short_by_stop`) BEFORE we return, so the status is on disk before the
+           process exits;
+        4. let the "interrupted" Telegram messages go out.
+        Every wait is bounded, so the whole thing fits in TimeoutStopSec=30."""
+        self._stopping.set()
+        server.close()
+        for event in self._wake.values():
+            event.set()
+        procs: dict[int, asyncio.subprocess.Process] = {p.pid: p for p in self._current_proc.values()}
+        for _job_id, proc in self._frozen.values():
+            procs[proc.pid] = proc
+            try:
+                os.killpg(proc.pid, signal.SIGCONT)  # a stopped group does not act on SIGTERM
+            except ProcessLookupError:
+                pass
+        if procs:
+            await asyncio.gather(*(self._kill_group_for_shutdown(p) for p in procs.values()))
+        tasks: set[asyncio.Task[Any]] = {
+            t for t in (*self._worker_tasks.values(), *self._priority_worker_tasks.values()) if not t.done()
+        }
+        if tasks:
+            await asyncio.wait(tasks, timeout=SHUTDOWN_WAIT_SECS)
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+        if self._notify_tasks:
+            await asyncio.wait(set(self._notify_tasks), timeout=SHUTDOWN_NOTIFY_SECS)
+
     # -- request handlers --------------------------------------------------
 
     async def handle_request(self, req: dict[str, Any]) -> dict[str, Any]:
@@ -776,24 +984,43 @@ class Daemon:
             return {"ok": False, "error": str(e)}
 
     async def _cmd_add(self, args: dict[str, Any]) -> dict[str, Any]:
-        argv = args["argv"]
+        """Queue one job, or -- with `jobs` (a list of {argv, raw_argv, index}, from
+        `--each` / `--array`) -- one independent job per entry, all-or-nothing, with
+        the same channel/cwd/timeout/flags/dependencies. `index` becomes the job's
+        QUR_INDEX env var."""
         # `raw_argv` is exactly what the user typed after `--`, with no
         # interpreter-pinning or bash-wrapping applied -- kept separate from
         # `argv` (which is what's actually resolved/exec'd) so `raw command`
         # in show/list reflects what was typed. Older clients that don't
         # send it fall back to `argv`, same as before this field existed.
-        raw_argv = args.get("raw_argv") or argv
+        jobs_arg = args.get("jobs")
+        specs: list[dict[str, Any]]
+        if jobs_arg is None:
+            specs = [{"argv": args["argv"], "raw_argv": args.get("raw_argv"), "index": None}]
+        else:
+            if not isinstance(jobs_arg, list) or not jobs_arg or not all(isinstance(j, dict) for j in jobs_arg):
+                raise ValueError("jobs must be a non-empty list of objects")
+            if len(jobs_arg) > db.MAX_SWEEP:
+                raise ValueError(f"too many jobs: at most {db.MAX_SWEEP} per add")
+            specs = [{"argv": j.get("argv"), "raw_argv": j.get("raw_argv"), "index": j.get("index")} for j in jobs_arg]
+            for spec in specs:
+                idx = spec["index"]
+                if idx is not None and (type(idx) is not int or idx < 0):
+                    raise ValueError("index must be a non-negative integer")
         cwd = args["cwd"]
         channel = args.get("channel") or db.DEFAULT_CHANNEL
         now = bool(args.get("now"))
         max_retries = args.get("max_retries") or 0
-        if not argv:
-            raise ValueError("empty command")
-        if not (isinstance(argv, list) and all(isinstance(a, str) for a in argv)) or not isinstance(cwd, str):
-            raise ValueError("argv must be a list of strings and cwd a string")
+        timeout_secs = args.get("timeout_secs")
+        # validate everything before anything is written
+        for spec in specs:
+            argv = spec["argv"]
+            if not argv:
+                raise ValueError("empty command")
+            if not (isinstance(argv, list) and all(isinstance(a, str) for a in argv)) or not isinstance(cwd, str):
+                raise ValueError("argv must be a list of strings and cwd a string")
         if type(channel) is not int or channel < 1:
             raise ValueError("channel must be a positive integer")
-        timeout_secs = args.get("timeout_secs")
         if timeout_secs is not None and (type(timeout_secs) is not int or timeout_secs < 0):
             raise ValueError("timeout must be a non-negative integer")
         for key in ("before", "after"):
@@ -803,24 +1030,37 @@ class Daemon:
             raise ValueError("retries must be a non-negative integer")
         if now and (args.get("before") is not None or args.get("after") is not None):
             raise ValueError("--now cannot be combined with --before/--after")
+        on_fail = args.get("on_fail") or "continue"
+        if on_fail not in db.ON_FAIL_MODES:  # also catches non-strings: they are never in the tuple
+            raise ValueError(f"on_fail must be one of {', '.join(db.ON_FAIL_MODES)}")
+        deps = self._dep_args(args)
+        if now and deps:
+            raise ValueError("--now cannot be combined with --depends-on/--after-any")
+        not_before = self._parse_not_before(args.get("not_before"))
+        if now and not_before:
+            raise ValueError("--now cannot be combined with --delay/--at")
 
         for key in ("path", "virtual_env", "python_path"):
             if args.get(key) is not None and not isinstance(args[key], str):
                 raise ValueError(f"{key} must be a string")
-        if raw_argv is not argv and not (isinstance(raw_argv, list) and all(isinstance(a, str) for a in raw_argv)):
-            raise ValueError("raw_argv must be a list of strings")
-        if any("\0" in a for a in argv) or any("\0" in a for a in raw_argv) or "\0" in cwd:
-            raise ValueError("arguments must not contain NUL bytes")
-        if any("\0" in (args.get(k) or "") for k in ("path", "virtual_env", "python_path")):
-            raise ValueError("environment values must not contain NUL bytes")
-        if not os.path.isdir(cwd):
-            raise ValueError(f"working directory does not exist: {cwd}")
-
         client_path = args.get("path") or None
-        resolved = resolve_command(argv, cwd, path_env=client_path)
-        exe = resolved[0]
-        if not (os.path.isfile(exe) and os.access(exe, os.X_OK)):
-            raise ValueError(f"executable not found or not executable: {exe}")
+        prepared: list[tuple[list[str], list[str], int | None]] = []  # (raw argv, resolved argv, index)
+        for spec in specs:
+            argv = spec["argv"]
+            raw_argv = spec["raw_argv"] or argv
+            if raw_argv is not argv and not (isinstance(raw_argv, list) and all(isinstance(a, str) for a in raw_argv)):
+                raise ValueError("raw_argv must be a list of strings")
+            if any("\0" in a for a in argv) or any("\0" in a for a in raw_argv) or "\0" in cwd:
+                raise ValueError("arguments must not contain NUL bytes")
+            if any("\0" in (args.get(k) or "") for k in ("path", "virtual_env", "python_path")):
+                raise ValueError("environment values must not contain NUL bytes")
+            if not os.path.isdir(cwd):
+                raise ValueError(f"working directory does not exist: {cwd}")
+            resolved = resolve_command(argv, cwd, path_env=client_path)
+            exe = resolved[0]
+            if not (os.path.isfile(exe) and os.access(exe, os.X_OK)):
+                raise ValueError(f"executable not found or not executable: {exe}")
+            prepared.append((raw_argv, resolved, spec["index"]))
         env_extra: dict[str, str] = {}
         if client_path:
             env_extra["PATH"] = client_path
@@ -830,36 +1070,88 @@ class Daemon:
         python_path = args.get("python_path")
         if python_path:
             env_extra["PYTHONPATH"] = python_path
-        env_for_row: dict[str, str] | None = env_extra or None
 
         # log_path needs the row's own id, which we don't have until after
         # insert -- write a placeholder, then patch it in immediately
-        # (no await happens in between, so this is effectively atomic).
+        # (no await happens in between, so this is effectively atomic). A sweep is
+        # inserted in ONE transaction: if any job is rejected, none is created.
         assert self.conn is not None
-        job_id = db.enqueue(
-            self.conn,
-            raw_cmd=raw_argv,
-            resolved_cmd=resolved,
-            cwd=cwd,
-            log_path="pending",
-            channel=channel,
-            timeout_secs=timeout_secs,
-            before=args.get("before"),
-            after=args.get("after"),
-            is_priority=now,
-            env_extra=env_for_row,
-            max_retries=max_retries,
+        job_ids: list[int] = []
+        for raw_argv, resolved, index in prepared:
+            job_env = dict(env_extra)
+            if index is not None:
+                job_env["QUR_INDEX"] = str(index)
+            job_ids.append(db.enqueue(
+                self.conn,
+                raw_cmd=raw_argv,
+                resolved_cmd=resolved,
+                cwd=cwd,
+                log_path="pending",
+                channel=channel,
+                timeout_secs=timeout_secs,
+                before=args.get("before"),
+                # after=X would put every new job right behind X, i.e. in reverse order
+                after=job_ids[-1] if job_ids and args.get("after") is not None else args.get("after"),
+                is_priority=now,
+                env_extra=job_env or None,
+                max_retries=max_retries,
+                deps=deps,
+                not_before=not_before,
+                on_fail=on_fail,
+                commit=False,
+            ))
+        self.conn.executemany(
+            "UPDATE jobs SET log_path = ? WHERE id = ?",
+            [(str(self.log_dir / f"{i}.log"), i) for i in job_ids],
         )
-        log_path = str(self.log_dir / f"{job_id}.log")
-        self.conn.execute("UPDATE jobs SET log_path = ? WHERE id = ?", (log_path, job_id))
         self.conn.commit()
+        job_id = job_ids[0]
+        result: dict[str, Any] = {"id": job_id, "channel": channel}
+        if jobs_arg is not None:
+            result["ids"] = job_ids
+
+        if deps:
+            was_skipped = False
+            skipped_note: str | None = None
+            for new_id in job_ids:
+                verdict, dep_id = db.dep_verdict(self.conn, new_id)
+                if verdict in ("failed", "removed") and dep_id is not None:
+                    # a dependency has already ended badly: this job can never run
+                    self._skip_blocked(new_id, verdict, dep_id)
+                    was_skipped = True
+                    skipped_job = db.get_job(self.conn, new_id)
+                    skipped_note = skipped_job["note"] if skipped_job else None
+            if was_skipped:
+                result["skipped"] = skipped_note
 
         if now:
             self._freeze_current_if_normal(channel)
             self._ensure_priority_worker(channel)
         else:
             self._wake_worker(channel)
-        return {"id": job_id, "channel": channel}
+        return result
+
+    @staticmethod
+    def _dep_args(args: dict[str, Any]) -> dict[int, str]:
+        """`depends_on` (must end done) and `after_any` (any end) job ids from an
+        `add` request, as the {id: mode} map db.enqueue takes. An id in both lists
+        gets the stricter mode, `success`."""
+        deps: dict[int, str] = {}
+        for key, mode in (("after_any", "any"), ("depends_on", "success")):
+            ids = args.get(key) or []
+            if not isinstance(ids, list) or any(type(i) is not int or i < 1 for i in ids):
+                raise ValueError(f"{key} must be a list of job ids")
+            if len(ids) > db.MAX_SWEEP:
+                raise ValueError(f"too many jobs in {key} (at most {db.MAX_SWEEP})")
+            for i in ids:
+                deps[i] = mode
+        return deps
+
+    def _with_deps(self, job: dict[str, Any]) -> dict[str, Any]:
+        """`job` plus its dependencies for display: `depends_on`, `after_any` and
+        `waiting_on` (job ids; the last is those that have not ended yet)."""
+        assert self.conn is not None
+        return {**job, **db.dep_info(self.conn, job["id"])}
 
     async def _cmd_list(self, args: dict[str, Any]) -> dict[str, Any]:
         assert self.conn is not None
@@ -867,7 +1159,7 @@ class Daemon:
         for channel in db.list_channels(self.conn):
             channels[channel] = {
                 "running": db.get_running(self.conn, channel),
-                "queue": db.get_queue(self.conn, channel),
+                "queue": [self._with_deps(j) for j in db.get_queue(self.conn, channel)],
                 "priority_queue": db.get_queue(self.conn, channel, is_priority=True),
                 "frozen": db.get_stopped(self.conn, channel),
                 "backlog": db.get_backlog(self.conn, channel),
@@ -906,7 +1198,7 @@ class Daemon:
         job = db.get_job(self.conn, args["id"])
         if job is None:
             raise ValueError(f"job {args['id']} does not exist")
-        return job
+        return self._with_deps(job)
 
     async def _cmd_clear(self, args: dict[str, Any]) -> dict[str, Any]:
         assert self.conn is not None
@@ -917,7 +1209,10 @@ class Daemon:
     async def _cmd_rm(self, args: dict[str, Any]) -> dict[str, Any]:
         assert self.conn is not None
         self._int_arg(args, "id")
+        job = db.get_job(self.conn, args["id"])
         db.remove_from_queue(self.conn, args["id"])
+        if job is not None:
+            self._wake_worker(job["channel"])  # it may have been the waiting head that held the channel
         return {"removed": args["id"]}
 
     async def _cmd_cancel(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -948,6 +1243,8 @@ class Daemon:
         status = job["status"]
         if status == "queued":
             db.cancel_queued(self.conn, job_id)
+            self._settle_dependants(job_id)
+            self._wake_worker(channel)  # it may have been the waiting head that held the channel
             self._notify_finished(job_id)
         elif status == "running":
             proc = self._current_proc.get(channel)
@@ -1102,10 +1399,36 @@ class Daemon:
 
         async with server:
             listener = asyncio.create_task(self._telegram_listener())
+            serving = asyncio.create_task(server.serve_forever())
+            stop_wait = asyncio.ensure_future(self._stopping.wait())
+            loop = asyncio.get_running_loop()
+            handled: list[signal.Signals] = []
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                try:
+                    loop.add_signal_handler(sig, self._stopping.set)
+                    handled.append(sig)
+                except (NotImplementedError, RuntimeError, ValueError):  # not the main thread
+                    pass
             try:
-                await asyncio.gather(server.serve_forever(), *self._worker_tasks.values())
+                waitables: set[asyncio.Future[Any]] = {serving, stop_wait, *self._worker_tasks.values()}
+                done, _ = await asyncio.wait(waitables, return_when=asyncio.FIRST_COMPLETED)
+            except asyncio.CancelledError:
+                # cancelled from outside (not a stop request): hard stop, as before
+                for task in self._worker_tasks.values():
+                    task.cancel()
+                raise
             finally:
+                for sig in handled:
+                    loop.remove_signal_handler(sig)
+                stop_wait.cancel()
+                serving.cancel()
                 listener.cancel()
+            # a stop request, or a worker/server that ended: either way the daemon is going
+            # down, so running jobs are recorded as interrupted before the process exits
+            await self._shutdown(server)
+            for task in done:
+                if task is not stop_wait and not task.cancelled():
+                    task.result()  # a crashed worker still surfaces its error
 
 
 def main() -> None:

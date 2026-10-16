@@ -50,7 +50,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
@@ -647,7 +647,7 @@ def edit_markup(cfg: dict[str, Any], chat_id: int, message_id: int, markup: dict
 # job messages
 # ---------------------------------------------------------------------------
 
-_ICONS = {"done": "✅", "failed": "❌", "cancelled": "🚫"}
+_ICONS = {"done": "✅", "failed": "❌", "cancelled": "🚫", "interrupted": "⏹️", "skipped": "⏭️"}
 
 
 def _fmt_secs(secs: float) -> str:
@@ -672,7 +672,10 @@ def _reason(note: str | None) -> str | None:
     and message content is visible to Telegram."""
     if not note:
         return None
-    for known in ("timed out", "interrupted by daemon restart", "failed to start", "cancelled while queued"):
+    # "interrupted by daemon restart" is the note of rows written before the `interrupted` status existed
+    if re.fullmatch(r"dependency \d+ (failed|removed)", note):  # only a job id: safe to show
+        return note
+    for known in ("timed out", "daemon stopped", "interrupted by daemon restart", "failed to start", "cancelled while queued"):
         if note.startswith(known):
             return known
     return None
@@ -713,7 +716,8 @@ def format_job(job: dict[str, Any], cfg: dict[str, Any]) -> str:
     typed, machine, channel, exit code. No cwd, resolved paths or raw
     notes -- `qur show <id>` on the machine has those."""
     status = job["status"]
-    head = f"{_ICONS.get(status, '•')} {status} · job {job['id']}"
+    label = "interrupted (daemon stopped)" if status == "interrupted" else status
+    head = f"{_ICONS.get(status, '•')} {label} · job {job['id']}"
     dur = _duration(job)
     if dur:
         head += f" · {dur}"
@@ -727,16 +731,34 @@ def format_job(job: dict[str, Any], cfg: dict[str, Any]) -> str:
     if job.get("max_retries"):
         parts.append(f"attempt {job['attempt'] + 1}/{job['max_retries'] + 1}")
     reason = _reason(job.get("note"))
-    if reason:
+    if reason and not (status == "interrupted" and reason == "daemon stopped"):  # already in the head
         parts.append(reason)
     lines.append(f"{_who(cfg)} · " + " · ".join(parts))
     return "\n".join(lines)
+
+
+def format_paused(job: dict[str, Any], cfg: dict[str, Any]) -> str:
+    """Message for a channel that `--on-fail pause` just paused."""
+    return (
+        f"⏸ channel {job['channel']} paused after job {job['id']} failed\n"
+        f"{_who(cfg)} · resume with: qur resume --channel {job['channel']}"
+    )
 
 
 def _local(ts: str | None) -> str:
     if not ts:
         return "-"
     return datetime.fromisoformat(ts).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _in_future(ts: str | None) -> bool:
+    """True if the ISO timestamp is a moment that has not come yet."""
+    if not ts:
+        return False
+    when = datetime.fromisoformat(ts)
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return when > datetime.now(timezone.utc)
 
 
 def _cap(text: str, limit: int = DETAIL_FIELD_MAX_CHARS) -> str:
@@ -800,6 +822,16 @@ def _format_details(job: dict[str, Any], cfg: dict[str, Any], cmd_cap: int) -> s
     ]
     if job.get("max_retries"):
         lines.append(row("auto-retries", f"{job['attempt']} of {job['max_retries']} used"))
+    if job.get("on_fail") == "pause":
+        lines.append(row("on fail", "pause the channel"))
+    if job.get("not_before"):
+        lines.append(row("not before", _local(job["not_before"])))
+    if job.get("depends_on"):
+        lines.append(row("depends on", _id_list(job["depends_on"])))
+    if job.get("after_any"):
+        lines.append(row("after any", _id_list(job["after_any"])))
+    if job.get("waiting_on"):
+        lines.append(row("waiting on", _id_list(job["waiting_on"])))
     lines.append(row("pid", str(job["pid"]) if job.get("pid") else "-"))
     lines.append(row("log", _cap(job.get("log_path") or "-", field_cap), code=True))
     if job.get("note"):
@@ -840,6 +872,11 @@ def _fit(header: str, lines: list[str]) -> str:
     return "\n".join(out)
 
 
+def _id_list(ids: list[int]) -> str:
+    """Job ids for display: "12", "12, 14"."""
+    return ", ".join(str(i) for i in ids)
+
+
 def _job_line(job: dict[str, Any], icon: str, extra: str = "", limit: int = LIST_CMD_MAX_CHARS) -> str:
     return f"{icon} #{job['id']} <code>{html.escape(_short_cmd(job, limit))}</code>{extra}"
 
@@ -874,7 +911,10 @@ def format_list(data: dict[str, Any], cfg: dict[str, Any], channel: int) -> str:
     if chan.get("running"):
         entries.append((chan["running"], "▶️", f" · {_since(chan['running'].get('started_at'))}"))
     for job in (chan.get("priority_queue") or []) + chan["queue"]:
-        entries.append((job, "⏳", f" · queued {_since(job.get('enqueued_at'))}"))
+        waiting = f" · waiting on {_id_list(job['waiting_on'])}" if job.get("waiting_on") else ""
+        if _in_future(job.get("not_before")):
+            waiting += f" · starts {_local(job['not_before'])}"
+        entries.append((job, "⏳", f" · queued {_since(job.get('enqueued_at'))}{waiting}"))
     for job in chan["backlog"]:
         dur = _duration(job)
         exit_s = f" · exit {job['exit_code']}" if job.get("exit_code") is not None else ""

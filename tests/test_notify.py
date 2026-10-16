@@ -780,3 +780,70 @@ def test_get_updates_wait_defaults_to_a_long_poll_and_can_be_zero(monkeypatch):
     notify.get_updates(CFG, None, 0)
     assert seen[0][0]["timeout"] == notify.POLL_SECS and seen[0][0]["offset"] == 5
     assert seen[1][0]["timeout"] == 0 and "offset" not in seen[1][0] and seen[1][1] == 10
+
+
+# ---------------------------------------------------------------------------
+# B5: interrupted jobs
+# ---------------------------------------------------------------------------
+
+def test_format_interrupted_says_daemon_stopped_not_failed(monkeypatch):
+    monkeypatch.setattr(notify.socket, "gethostname", lambda: "bigbox")
+    t = notify.format_job(_job(status="interrupted", exit_code=-15, note="daemon stopped"), CFG)
+    assert t.startswith("⏹️ interrupted (daemon stopped) · job 12 · 2h13m\n")
+    assert "failed" not in t
+    assert t.count("daemon stopped") == 1  # in the head only, not repeated in the detail line
+
+
+def test_interrupted_message_has_requeue_button():
+    keys = [b["callback_data"] for row in notify.job_markup(CFG, 12)["inline_keyboard"] for b in row]
+    assert any(k.startswith("rq:") for k in keys)
+
+
+def test_legacy_restart_note_is_still_a_known_reason():
+    t = notify.format_job(_job(status="failed", note="interrupted by daemon restart"), CFG)
+    assert "interrupted by daemon restart" in t  # rows written before the interrupted status existed
+
+
+# ---------------------------------------------------------------------------
+# F2: dependencies in messages
+# ---------------------------------------------------------------------------
+
+def test_skipped_message_shows_the_dependency_reason():
+    msg = notify.format_job(_job(status="skipped", exit_code=None, started_at=None, finished_at=None,
+                                 note="dependency 7 failed"), CFG)
+    assert "skipped" in msg and "dependency 7 failed" in msg
+
+
+def test_list_and_details_show_what_a_queued_job_waits_on():
+    job = _list_job(5, ["run"])
+    job.update(status="queued", depends_on=[3], after_any=[4], waiting_on=[3, 4])
+    data = {"channels": {1: {"queue": [job], "backlog": []}}}
+    assert "waiting on 3, 4" in notify.format_list(data, CFG, 1)
+    text = notify.format_details(_job(depends_on=[3], after_any=[4], waiting_on=[3, 4]), CFG)
+    assert "depends on" in text and "after any" in text and "waiting on" in text
+
+
+def test_format_paused_names_the_channel_job_and_resume_command():
+    text = notify.format_paused(_job(id=7, channel=3), CFG)
+    assert "channel 3 paused after job 7 failed" in text and "qur resume --channel 3" in text and "[a3f9]" in text
+
+
+def test_details_show_on_fail_pause_only():
+    assert "on fail" in notify.format_details(_job(on_fail="pause"), CFG)
+    assert "on fail" not in notify.format_details(_job(on_fail="continue"), CFG)
+
+
+def test_format_details_and_list_show_a_start_time():
+    from datetime import datetime, timedelta, timezone
+
+    future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    base = {"id": 7, "raw_cmd": json.dumps(["echo"]), "resolved_cmd": json.dumps(["/bin/echo"]), "cwd": "/tmp",
+            "channel": 1, "status": "queued", "enqueued_at": "2026-01-01T00:00:00+00:00"}
+    assert "<b>not before</b>" in notify.format_details({**base, "not_before": future}, CFG)
+    assert "<b>not before</b>" not in notify.format_details(base, CFG)
+    data = {"channels": {1: {"running": None, "frozen": None, "paused": False, "priority_queue": [],
+                             "backlog": [], "queue": [{**base, "not_before": future}]}}}
+    assert "starts " in notify.format_list(data, CFG, 1)
+    data["channels"][1]["queue"] = [{**base, "not_before": past}]
+    assert "starts " not in notify.format_list(data, CFG, 1)

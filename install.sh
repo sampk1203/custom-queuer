@@ -72,7 +72,9 @@ if [ "$ACTION" = "uninstall" ]; then
     echo "==> Stopping and disabling queuerd"
     systemctl --user disable --now queuerd 2>/dev/null || true
     pkill -x queuerd 2>/dev/null || true
-    sleep 1
+    # a stopping daemon kills its jobs (up to 5 s grace) and records them as "interrupted"
+    # before it exits: give a stray one time to do that
+    for _ in $(seq 1 25); do pgrep -x queuerd > /dev/null || break; sleep 1; done
     if pgrep -x queuerd > /dev/null; then
         echo "WARNING: a queuerd process is still running:" >&2
         pgrep -a -x queuerd >&2
@@ -233,7 +235,9 @@ done
 echo "==> Stopping any existing queuerd (systemd-managed or stray manual process)"
 systemctl --user stop queuerd 2>/dev/null || true
 pkill -x queuerd 2>/dev/null || true
-sleep 1
+# a stopping daemon kills its jobs (up to 5 s grace) and records them as "interrupted"
+# before it exits: give a stray one time to do that
+for _ in $(seq 1 25); do pgrep -x queuerd > /dev/null || break; sleep 1; done
 if pgrep -x queuerd > /dev/null; then
     echo "WARNING: a queuerd process is still running after attempting to stop it." >&2
     pgrep -a -x queuerd >&2
@@ -310,7 +314,8 @@ Type=simple
 ExecStart=$PROJECT_DIR/.venv/bin/queuerd
 Restart=on-failure
 RestartSec=2
-# Jobs get SIGTERM then SIGKILL from the daemon on stop; do not hang a logout on them.
+# On stop the daemon SIGTERMs (5 s later SIGKILLs) running jobs, records them as "interrupted" and
+# sends the Telegram message: ~20 s worst case. Do not hang a logout on them.
 TimeoutStopSec=30
 $(hardening_lines "$1")
 

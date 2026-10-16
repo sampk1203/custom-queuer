@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import socket
@@ -11,14 +12,16 @@ import stat
 import subprocess  # nosec B404 - only used for the fixed `ssh --` call below
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, NoReturn, Optional
 
+import click
 import typer
 from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
+from typer.core import TyperCommand
 
 from queuer import client, db, notify
 from queuer.daemon import _default_db_path, _default_log_dir
@@ -260,6 +263,14 @@ def _fmt_origin(job: dict[str, Any]) -> str:
     return "new"
 
 
+def _fmt_waits(job: dict[str, Any]) -> str:
+    """The "Waits on" cell of a queued job: the dependencies that have not ended yet
+    ("12, 14"), or "-" when it has none / they all ended (it is then only waiting for
+    the jobs ahead of it)."""
+    waiting = job.get("waiting_on") or []
+    return _fmt_ids(waiting) if waiting else "-"
+
+
 def _fmt_elapsed(ts: str | None) -> str:
     """Time since `ts` (an ISO timestamp), e.g. how long a job has been queued."""
     if not ts:
@@ -271,6 +282,194 @@ def _fmt_elapsed(ts: str | None) -> str:
 # ---------------------------------------------------------------------------
 # add
 # ---------------------------------------------------------------------------
+
+def _parse_job_ids(values: list[str] | None, flag: str) -> list[int]:
+    """Job ids from repeated `--depends-on` / `--after-any` values. Each value is a
+    comma list of ids and `A-B` ranges ("12", "12,14", "31-33,40"); several flags
+    combine. Returns the distinct ids, ascending. Exits with a clear error on junk."""
+    ids: set[int] = set()
+    for value in values or []:
+        for part in value.split(","):
+            part = part.strip()
+            m = re.fullmatch(r"(\d+)(?:-(\d+))?", part)
+            if m is None:
+                _fail(f"{flag}: {part!r} is not a job id or a range like 31-33")
+            first = int(m.group(1))
+            last = int(m.group(2)) if m.group(2) is not None else first
+            if first < 1 or last < first:
+                _fail(f"{flag}: {part!r} is not a valid job id range (ids start at 1, low end first)")
+            if last - first + 1 > db.MAX_SWEEP:
+                _fail(f"{flag}: {part!r} is more than {db.MAX_SWEEP} jobs")
+            ids.update(range(first, last + 1))
+            if len(ids) > db.MAX_SWEEP:
+                _fail(f"{flag}: more than {db.MAX_SWEEP} jobs listed")
+    return sorted(ids)
+
+
+_DELAY_UNIT_SECS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+def parse_delay(text: str) -> timedelta:
+    """`--delay` value -> timedelta. Units s/m/h/d, which can be chained: "30m", "2h",
+    "1h30m", "90s". A bare number is rejected (seconds or minutes? say which)."""
+    value = text.strip().lower()
+    if not re.fullmatch(r"(?:\d+[smhd])+", value):
+        raise ValueError(f"{text!r} is not a duration: use a number with a unit s/m/h/d, e.g. 30m, 2h, 1h30m")
+    secs = sum(int(n) * _DELAY_UNIT_SECS[u] for n, u in re.findall(r"(\d+)([smhd])", value))
+    if secs <= 0:
+        raise ValueError(f"{text!r}: the delay must be longer than zero")
+    try:
+        return timedelta(seconds=secs)
+    except OverflowError:
+        raise ValueError(f"{text!r} is too long a delay") from None
+
+
+def parse_at(text: str, now: datetime) -> datetime:
+    """`--at` value -> an absolute local time (timezone-aware), `now` being the current
+    local time. "HH:MM" is the NEXT occurrence of that clock time (today if still ahead,
+    else tomorrow); "YYYY-MM-DD HH:MM" is that exact moment and must be in the future."""
+    value = text.strip()
+    clock = re.fullmatch(r"(\d{1,2}):(\d{2})", value)
+    if clock is not None:
+        hour, minute = int(clock.group(1)), int(clock.group(2))
+        if hour > 23 or minute > 59:
+            raise ValueError(f"{text!r} is not a valid time of day (HH:MM, 00:00 to 23:59)")
+        first = datetime(now.year, now.month, now.day, hour, minute).astimezone()
+        if first > now:
+            return first
+        nxt = datetime(now.year, now.month, now.day) + timedelta(days=1)
+        return datetime(nxt.year, nxt.month, nxt.day, hour, minute).astimezone()
+    full = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})[ T](\d{1,2}):(\d{2})", value)
+    if full is None:
+        raise ValueError(f"{text!r} is not a time: use HH:MM (e.g. 22:00) or 'YYYY-MM-DD HH:MM'")
+    year, month, day, hour, minute = (int(g) for g in full.groups())
+    try:
+        when = datetime(year, month, day, hour, minute).astimezone()
+    except (ValueError, OverflowError):
+        raise ValueError(f"{text!r} is not a valid date and time") from None
+    if when <= now:
+        raise ValueError(f"{text!r} is in the past (it is {now.strftime('%Y-%m-%d %H:%M')} now)")
+    return when
+
+
+def _start_time(delay: str | None, at: str | None) -> datetime | None:
+    """The absolute start time asked for by `--delay` / `--at` (None if neither); exits
+    with a clear error on junk or on both flags together."""
+    if delay is not None and at is not None:
+        _fail("--delay and --at cannot be combined; use one of them")
+    now = datetime.now().astimezone()
+    try:
+        if delay is not None:
+            return now + parse_delay(delay)
+        if at is not None:
+            return parse_at(at, now)
+    except (ValueError, OverflowError) as e:
+        _fail(f"{'--delay' if delay is not None else '--at'}: {e}")
+    return None
+
+
+def _starts_in_future(job: dict[str, Any]) -> bool:
+    """True if the job has a start time (`--delay` / `--at`) that has not come yet."""
+    not_before = job.get("not_before")
+    if not not_before:
+        return False
+    when = datetime.fromisoformat(not_before)
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return when > datetime.now(timezone.utc)
+
+
+def _fmt_start(job: dict[str, Any]) -> str:
+    """The "Starts at" cell of a queued job: its start time while that is still ahead,
+    else "-"."""
+    return _fmt_time(job["not_before"]) if _starts_in_future(job) else "-"
+
+
+def _expand_each(args: list[str]) -> list[str]:
+    """`--each V1 V2 V3 -- CMD` -> `--each V1 --each V2 --each V3 -- CMD`: click options
+    take one value each, so the values after `--each` (up to the next `--flag` or the
+    `--` before the command) are split into repeated options before parsing. Everything
+    after the first `--` is the command and is never touched."""
+    out: list[str] = []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--":
+            out.extend(args[i:])
+            break
+        if arg == "--each":
+            j = i + 1
+            while j < len(args) and not args[j].startswith("--"):
+                out.extend(["--each", args[j]])
+                j += 1
+            if j == i + 1:  # click would swallow the `--` as the value, so say it here
+                raise click.UsageError("--each needs at least one value, e.g. --each a b c -- CMD {}")
+            i = j
+            continue
+        out.append(arg)
+        i += 1
+    return out
+
+
+class _AddCommand(TyperCommand):
+    """`qur add`, whose `--each` takes several values (see `_expand_each`)."""
+
+    def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
+        return super().parse_args(ctx, _expand_each(args))
+
+
+def _sweep_jobs(cmd: list[str], each: list[str] | None, array: str | None) -> list[dict[str, Any]] | None:
+    """The per-job requests of a `--each` / `--array` sweep (None if neither flag).
+
+    --each: one job per value, `{}` replaced by the value in every word that has it;
+    QUR_INDEX is the 1-based position. A value substituted into a command that a shell
+    will parse (one quoted word, or a hand-written `bash -c`) is shell-quoted first.
+    --array A-B: one job per number A..B inclusive, the same command, QUR_INDEX = the number."""
+    if each and array:
+        _fail("--each and --array cannot be combined")
+    if each:
+        if len(each) > db.MAX_SWEEP:
+            _fail(f"--each: {len(each)} values is too many (at most {db.MAX_SWEEP} jobs per add)")
+        if not any("{}" in word for word in cmd):
+            _fail("--each needs {} somewhere in the command, e.g. qur add --each a b c -- ./run.sh {}")
+        quote_at = {0} if len(cmd) == 1 else ({2} if _is_explicit_shell_c(cmd) else set())
+        jobs = []
+        for position, value in enumerate(each, 1):
+            words = [
+                word.replace("{}", shlex.quote(value) if n in quote_at else value) for n, word in enumerate(cmd)
+            ]
+            try:
+                argv = _resolve_interpreter(_build_job_argv(words))
+            except ValueError as e:
+                _fail(f"--each value {value!r}: {e}")
+            jobs.append({"argv": argv, "raw_argv": words, "index": position})
+        return jobs
+    if array is not None:
+        m = re.fullmatch(r"(\d+)-(\d+)", array.strip())
+        if m is None:
+            _fail(f"--array: {array!r} is not a range like 1-20")
+        low, high = int(m.group(1)), int(m.group(2))
+        if high < low:
+            _fail(f"--array: {array!r} is backwards (write the smaller number first)")
+        if high - low + 1 > db.MAX_SWEEP:
+            _fail(f"--array: {high - low + 1} jobs is too many (at most {db.MAX_SWEEP} per add)")
+        argv = _resolve_interpreter(_build_job_argv(cmd))
+        return [{"argv": argv, "raw_argv": cmd, "index": n} for n in range(low, high + 1)]
+    return None
+
+
+def _fmt_ids(ids: list[int]) -> str:
+    """Job ids for display, runs collapsed: [31, 32, 33, 40] -> "31-33, 40"."""
+    parts: list[str] = []
+    i = 0
+    while i < len(ids):
+        j = i
+        while j + 1 < len(ids) and ids[j + 1] == ids[j] + 1:
+            j += 1
+        parts.append(str(ids[i]) if j == i else (f"{ids[i]}, {ids[j]}" if j == i + 1 else f"{ids[i]}-{ids[j]}"))
+        i = j + 1
+    return ", ".join(parts)
+
 
 def _help_all(ctx: typer.Context, value: bool) -> None:
     if not value or ctx.resilient_parsing:
@@ -296,7 +495,7 @@ def main(
     pass
 
 
-@app.command()
+@app.command(cls=_AddCommand)
 def add(
     cmd: list[str] = typer.Argument(
         ..., metavar="CMD...",
@@ -318,13 +517,62 @@ def add(
         "It does NOT make this job wait for that one to finish or succeed; "
         "if that job already started, the add is rejected.",
     ),
+    depends_on: Optional[list[str]] = typer.Option(
+        None, "--depends-on", metavar="ID[,ID...]",
+        help="Run this job only if every listed job ENDS SUCCESSFULLY (done, exit 0). If any of them ends "
+        "failed/cancelled/skipped/interrupted (or was removed), this job is marked skipped and the queue moves "
+        "on. IDs may be a comma list or a range (31-33); repeat the flag to add more. Unlike --before/--after "
+        "this is about WHEN the job may run, not where it sits. Strict FIFO: while it waits it blocks the jobs "
+        "behind it on its channel -- put it on another channel if something else must run meanwhile.",
+    ),
+    after_any: Optional[list[str]] = typer.Option(
+        None, "--after-any", metavar="ID[,ID...]",
+        help="Run this job once every listed job has ENDED, however it ended (done, failed, cancelled, skipped, "
+        "interrupted). Same ID syntax and the same blocking behaviour as --depends-on; the two can be combined.",
+    ),
+    each: Optional[list[str]] = typer.Option(
+        None, "--each", metavar="V1 V2 ...",
+        help="Sweep: queue one independent job per value, in order, with {} in the command replaced by the "
+        "value (in every word that contains it; an error if there is no {}). The values run up to the next "
+        "--flag or the `--`. QUR_INDEX is set to the value's 1-based position. All jobs share the channel, "
+        "timeout, retries and dependencies. At most 1000 jobs.",
+    ),
+    array: Optional[str] = typer.Option(
+        None, "--array", metavar="A-B",
+        help="Sweep: queue one job per number A..B inclusive, all running the same command; each job's "
+        "environment has QUR_INDEX set to its number. Same sharing and 1000-job cap as --each. "
+        "Prints the created id range for use with --depends-on.",
+    ),
+    on_fail: str = typer.Option(
+        "continue", "--on-fail", metavar="pause|continue",
+        help="What a FAILURE of this job does to its channel. continue (default): the next job starts as "
+        "usual. pause: the channel is paused and a Telegram message says so; resume it with "
+        "`qur resume`. Only `failed` counts (non-zero exit, timeout, failed start): not cancelled, skipped "
+        "or interrupted jobs, and not a failure that --retries requeues (only the last one).",
+    ),
+    delay: Optional[str] = typer.Option(
+        None, "--delay", metavar="DURATION",
+        help="Do not start this job until this long from now: a number with a unit s/m/h/d "
+        "(30m, 2h, 1h30m). Stored as an absolute time, so it survives daemon restarts. Strict FIFO: "
+        "if this job reaches the front of its channel early it holds the channel until its time; "
+        "put it on another channel if the queue must keep running meanwhile. After its time it also "
+        "waits for any --depends-on/--after-any. The timeout counts run time only. "
+        "Not with --at or --now.",
+    ),
+    at: Optional[str] = typer.Option(
+        None, "--at", metavar="TIME",
+        help="Do not start this job before this local time: HH:MM (the next time the clock shows it: "
+        "today if still ahead, else tomorrow) or 'YYYY-MM-DD HH:MM'. Same holding rule as --delay. "
+        "Not with --delay or --now.",
+    ),
     timeout: Optional[int] = typer.Option(
         None, "--timeout", help="Kill the job if it runs longer than this many seconds (counts as a failure)"
     ),
     retries: int = typer.Option(
         0, "--retries", min=0,
         help="If the job fails (non-zero exit, timeout, or failed start), requeue it automatically at the "
-        "end of its channel's queue, up to this many times. Cancelled jobs are never retried.",
+        "end of its channel's queue, up to this many times. Cancelled jobs and jobs interrupted by a daemon stop "
+        "are never retried.",
     ),
     now: bool = typer.Option(
         False, "--now",
@@ -349,8 +597,17 @@ def add(
       qur add --channel 2 -- python train.py --epochs 5
       qur add --timeout 60 -- ./run.sh
       qur add --retries 3 -- python flaky_download.py
+      qur add --on-fail pause -- ./step1.sh          # a failure pauses the channel
       qur add --after 12 -- python eval.py
       qur add --before 12 -- python setup.py
+      qur add --depends-on 12 -- python eval.py
+      qur add --depends-on 31-33,40 --after-any 35 -- python collect.py
+      qur add --each 0.1 0.2 0.5 -- python train.py --lr {}
+      qur add --array 1-20 -- ./run.sh               # $QUR_INDEX is 1..20
+      qur add --depends-on 31-33 -- python collect.py
+      qur add --delay 30m -- ./later.sh              # start in 30 minutes
+      qur add --at 22:00 -- ./overnight.sh           # start at 22:00 (tomorrow if it is past)
+      qur add --at "2026-12-01 06:30" -- ./run.sh
       qur add --now -- python urgent_eval.py
       qur add -- curl -d '{"key": "value"}' https://example.com/api
       qur add -- 'g16 < input.gjf > output.log'
@@ -387,12 +644,23 @@ def add(
     # `show`/`list` so that view reflects what the user wrote, not queuer's
     # own interpreter-pinning. `resolved command` (see pathresolve.py,
     # daemon-side) is where absolute executable/file paths belong.
-    job_argv = _resolve_interpreter(_build_job_argv(cmd))
+    if on_fail not in db.ON_FAIL_MODES:
+        _fail(f"--on-fail must be one of {', '.join(db.ON_FAIL_MODES)} (got {on_fail!r})")
+    sweep = _sweep_jobs(cmd, each, array)
+    job_argv = _resolve_interpreter(_build_job_argv(cmd)) if sweep is None else []
+    depends_ids = _parse_job_ids(depends_on, "--depends-on")
+    after_any_ids = _parse_job_ids(after_any, "--after-any")
+    if now and (depends_ids or after_any_ids):
+        _fail("--now cannot be combined with --depends-on/--after-any")
+    start = _start_time(delay, at)
+    if now and start is not None:
+        _fail("--now cannot be combined with --delay/--at")
+    not_before = start.astimezone(timezone.utc).isoformat() if start is not None else None
 
+    job_kwargs: dict[str, Any] = {"argv": job_argv, "raw_argv": cmd} if sweep is None else {"jobs": sweep}
     data = _call(
         "add",
-        argv=job_argv,
-        raw_argv=cmd,
+        **job_kwargs,
         cwd=os.getcwd(),
         path=os.environ.get("PATH", ""),
         virtual_env=os.environ.get("VIRTUAL_ENV"),
@@ -403,8 +671,27 @@ def add(
         timeout_secs=timeout,
         now=now,
         max_retries=retries,
+        depends_on=depends_ids,
+        after_any=after_any_ids,
+        not_before=not_before,
+        on_fail=on_fail,
     )
-    console.print(f"Queued as job [bold]{data['id']}[/bold] on channel [bold]{data['channel']}[/bold]")
+    if sweep is None:
+        console.print(f"Queued as job [bold]{data['id']}[/bold] on channel [bold]{data['channel']}[/bold]")
+    else:
+        ids = data.get("ids") or [data["id"]]
+        span = f"{ids[0]}-{ids[-1]}" if len(ids) > 1 and ids == list(range(ids[0], ids[-1] + 1)) else _fmt_ids(ids)
+        console.print(f"added jobs [bold]{span}[/bold] ({len(ids)}) on channel [bold]{data['channel']}[/bold]")
+    if depends_ids:
+        console.print(f"runs only if job(s) {_fmt_ids(depends_ids)} finish successfully")
+    if after_any_ids:
+        console.print(f"runs after job(s) {_fmt_ids(after_any_ids)} have ended (any outcome)")
+    if start is not None:
+        console.print(f"starts no earlier than {_fmt_time(not_before)}")
+    if data.get("skipped"):
+        console.print(f"[yellow]skipped right away:[/yellow] {escape(str(data['skipped']))}")
+    if on_fail == "pause":
+        console.print("on failure: this channel will be paused (`qur resume` to continue)")
     if retries:
         console.print(f"auto-retry on failure: up to {retries} time(s)")
     if now:
@@ -434,6 +721,12 @@ def _render_queue_and_backlog(channel_data: dict[str, Any], full: bool) -> None:
     queue_table.add_column("Origin")
     queue_table.add_column("Queued")
     queue_table.add_column("Elapsed", justify="right")
+    show_waits = any(j.get("depends_on") or j.get("after_any") for j in channel_data["queue"])
+    if show_waits:
+        queue_table.add_column("Waits on")
+    show_starts = any(_starts_in_future(j) for j in channel_data["queue"])
+    if show_starts:
+        queue_table.add_column("Starts at")
     if running:
         marker = "* (priority)" if running.get("is_priority") else "*"
         queue_table.add_row(
@@ -447,10 +740,15 @@ def _render_queue_and_backlog(channel_data: dict[str, Any], full: bool) -> None:
             _fmt_time(job["enqueued_at"]), _fmt_elapsed(job["enqueued_at"]),
         )
     for job in channel_data["queue"]:
-        queue_table.add_row(
+        row = [
             str(job["id"]), _cmd_str(job, full), _fmt_origin(job),
             _fmt_time(job["enqueued_at"]), _fmt_elapsed(job["enqueued_at"]),
-        )
+        ]
+        if show_waits:
+            row.append(_fmt_waits(job))
+        if show_starts:
+            row.append(_fmt_start(job))
+        queue_table.add_row(*row)
 
     if running or priority_queue or channel_data["queue"]:
         console.print(queue_table)
@@ -465,7 +763,9 @@ def _render_queue_and_backlog(channel_data: dict[str, Any], full: bool) -> None:
     backlog_table.add_column("Duration", justify="right")
     backlog_table.add_column("Exit", justify="right")
     for job in channel_data["backlog"]:
-        status_style = {"done": "green", "failed": "red", "cancelled": "yellow"}.get(job["status"], "")
+        status_style = {
+            "done": "green", "failed": "red", "cancelled": "yellow", "interrupted": "magenta", "skipped": "dim",
+        }.get(job["status"], "")
         backlog_table.add_row(
             str(job["id"]),
             f"[{status_style}]{job['status']}[/{status_style}]" if status_style else job["status"],
@@ -495,6 +795,10 @@ def list_jobs(
     "retry of #N" (queued automatically by --retries after job N failed; shows
     the retry count), or "requeue of #N" (you ran `qur requeue N`). Only channels
     that have had a job show up. For one job's full detail, use `qur show`.
+
+    A queued job that was added with --depends-on / --after-any stays "queued"; the
+    "Waits on" column then lists the dependencies that have not ended yet. While it
+    waits, the jobs behind it on that channel wait too (strict FIFO).
 
     \b
     Examples:
@@ -593,6 +897,17 @@ def _render_job(job: dict[str, Any]) -> None:
     table.add_row("exit code", str(job["exit_code"]) if job["exit_code"] is not None else "-")
     table.add_row("timeout", f"{job['timeout_secs']}s" if job["timeout_secs"] else "none")
     table.add_row("origin", _fmt_origin(job))
+    if job.get("on_fail") == "pause":
+        table.add_row("on fail", "pause the channel")
+    if job.get("not_before"):
+        waiting = " (still waiting)" if job["status"] == "queued" and _starts_in_future(job) else ""
+        table.add_row("not before", _fmt_time(job["not_before"]) + waiting)
+    if job.get("depends_on"):
+        table.add_row("depends on", _fmt_ids(job["depends_on"]) + " (must finish done)")
+    if job.get("after_any"):
+        table.add_row("after any", _fmt_ids(job["after_any"]) + " (any outcome)")
+    if job.get("waiting_on"):
+        table.add_row("waiting on", _fmt_ids(job["waiting_on"]))
     if job.get("max_retries"):
         table.add_row("auto-retries", f"{job['attempt']} of {job['max_retries']} used")
     table.add_row("pid", str(job["pid"]) if job["pid"] else "-")
@@ -610,7 +925,8 @@ def show(
     """Show full detail for one or more jobs.
 
     Shows raw and resolved command, cwd, timestamps, duration, exit code, timeout,
-    auto-retry count, pid, log path, and any note. With several IDs, an unknown ID
+    dependencies (depends on / after any / waiting on), auto-retry count, pid, log
+    path, and any note. With several IDs, an unknown ID
     prints an error but the others are still shown (exit code 1 at the end).
 
     \b
@@ -662,7 +978,7 @@ def cancel(
     With no JOB_ID: kills a channel's running job. With a JOB_ID: cancels that job
     whatever state it is in -- running, frozen by `--now`, or still waiting in the
     queue (a queued job is kept in history as `cancelled`; `qur rm` deletes it
-    instead).
+    instead). Queued jobs that needed it to succeed (--depends-on) become `skipped`.
 
     Killing sends SIGTERM to the job's whole process group, then SIGKILL if it is
     still alive after a short grace period. A cancelled job is never auto-retried.
@@ -689,7 +1005,7 @@ def clear(
         None, "--channel", help="Only clear this channel's history (default: every channel)"
     ),
 ) -> None:
-    """Delete finished-job records (done/failed/cancelled).
+    """Delete finished-job records (done/failed/cancelled/interrupted).
 
     Clears the "Recent" section of `qur list`. Queued, running, and frozen jobs are
     never touched. Channels left with no jobs at all drop off the list (channel 1
@@ -710,7 +1026,9 @@ def rm(job_id: int = typer.Argument(..., help="ID of a queued job")) -> None:
     """Remove a queued job.
 
     The job is deleted outright, not kept as history. Only works on jobs that are
-    still waiting; for a running job use `qur cancel`.
+    still waiting; for a running job use `qur cancel`. Refused while another queued
+    job depends on it (--depends-on / --after-any): remove or cancel those first,
+    or `qur cancel` this one, which skips them.
 
     \b
     Example:
@@ -721,12 +1039,12 @@ def rm(job_id: int = typer.Argument(..., help="ID of a queued job")) -> None:
 
 
 @app.command()
-def requeue(job_id: int = typer.Argument(..., help="ID of a finished job (done/failed/cancelled)")) -> None:
+def requeue(job_id: int = typer.Argument(..., help="ID of a finished job (done/failed/cancelled/interrupted)")) -> None:
     """Queue a finished job again.
 
     Makes a new job with the original command, cwd, environment, timeout, channel,
     and --retries setting (with a fresh retry count), added to the end of that
-    channel's queue. Only works on done/failed/cancelled jobs.
+    channel's queue. Works on any finished job (done/failed/cancelled/interrupted).
 
     \b
     Example:
@@ -873,7 +1191,7 @@ def connect(
 ) -> None:
     """Get a Telegram message when a job finishes, on any machine running qur.
 
-    Messages say done / failed / cancelled, the job id, how long it took, the
+    Messages say done / failed / cancelled / interrupted (daemon stopped), the job id, how long it took, the
     command as you typed it, the exit code, and which machine sent it (hostname
     plus that qur's id, shown when you connect; change it with --id). They never
     include the working directory or resolved paths; use `qur show ID` on the
@@ -1236,7 +1554,7 @@ def clean_logs(
 ) -> None:
     """Delete old log files from disk.
 
-    Removes logs of finished jobs (done/failed/cancelled) finished more than --days
+    Removes logs of finished jobs (done/failed/cancelled/interrupted) finished more than --days
     ago, plus orphaned logs whose job record no longer exists (e.g. pruned from
     Recent). Never touches logs of queued, running, or frozen jobs. Reads the DB
     directly, so it works even if the daemon isn't running.
@@ -1275,7 +1593,7 @@ def clean_logs(
             except OSError:
                 pass
             continue
-        if job["status"] not in ("done", "failed", "cancelled"):
+        if job["status"] not in db.TERMINAL_STATUSES:
             continue  # queued/running/stopped -- never touch
         if not job["finished_at"]:
             continue

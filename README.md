@@ -65,7 +65,7 @@ Every command also has worked examples under `qur <command> --help`, and `qur --
 prints the help for every command at once.
 
 ```
-queuer add [--channel N] [--before ID | --after ID | --now] [--timeout SECONDS] [--retries N] -- <cmd...>
+queuer add [--channel N] [--before ID | --after ID | --now] [--depends-on IDS] [--after-any IDS] [--each V... | --array A-B] [--on-fail pause|continue] [--delay DURATION | --at TIME] [--timeout SECONDS] [--retries N] -- <cmd...>
 queuer list [--channel N] [--full] [--json]
 queuer status [--json]
 queuer show ID [ID...] [--json]
@@ -106,11 +106,95 @@ still be queued on the same channel (once it started, the add is rejected).
 `--now` freezes the running job (SIGSTOP) while the priority job runs; a frozen job
 stays alive and keeps its memory, so briefly one channel can have two live jobs.
 
+**Dependencies.** `--depends-on IDS` runs the job only if every listed job ended
+`done` (exit 0); if any ended failed, cancelled, skipped, interrupted or was removed,
+this job is marked `skipped` (note `dependency N failed`) and the queue moves on.
+Skips cascade to the jobs that depended on the skipped one. `--after-any IDS` runs
+the job once every listed job has *ended*, however it ended. `IDS` is a comma list
+and/or a range (`--depends-on 31-33,40`); the flags can be repeated and combined (an
+id in both counts as `--depends-on`). They are about *when* the job may run;
+`--before/--after` only choose its queue position.
+
+```bash
+qur add -- ./prepare.sh                        # job 12
+qur add --depends-on 12 -- ./train.sh          # only if 12 succeeded
+qur add --after-any 12,13 -- ./cleanup.sh      # once both ended, whatever happened
+```
+
+The queue stays strict FIFO per channel: a job waiting for an unfinished dependency
+**blocks the jobs behind it** on its channel; nothing jumps ahead. If something must
+run meanwhile, put it on another channel. A waiting job stays `queued`; `qur list`
+shows a "Waits on" column and `qur show` lists `depends on` / `after any` /
+`waiting on`. `add` checks the ids exist and rejects a dependency that could never
+run (a job queued *behind* this one on the same channel, or any longer cycle through
+queue order and dependencies). `qur rm` of a still-queued job that others depend on is
+refused with the list of dependants; `qur cancel` of it skips them. A job that
+`--retries` requeues still counts as failed for its dependants (they are skipped: the
+retry goes to the end of the queue, so waiting for it could deadlock). Requeueing a
+job does not copy its dependencies. Timeouts count run time only, as always. Finished
+jobs that a queued job still needs are kept in history until it has run or been skipped.
+
+**Sweeps.** `--each V1 V2 V3 -- CMD ... {} ...` queues one independent job per
+value, in order, with `{}` replaced by the value in every word of the command that
+contains it (an error if there is no `{}`). `--array A-B -- CMD ...` queues one job
+per number A..B inclusive; each job's environment has `QUR_INDEX` set to its number
+(for `--each`, to the value's 1-based position). `--array` does not touch `{}`.
+
+```bash
+qur add --each 0.1 0.2 0.5 -- python train.py --lr {}     # added jobs 31-33
+qur add --array 1-20 -- ./run.sh                          # $QUR_INDEX is 1..20
+qur add --depends-on 31-33 -- python collect.py           # waits for the whole sweep
+```
+
+All jobs share the channel, timeout, `--retries`, `--before/--after` position and
+dependencies (`--depends-on` applies to every created job). The jobs are created
+all-or-nothing, at most 1000 per `add`, and `add` prints the id range it created.
+`--each` values run up to the next `--flag` or the `--` before the command, so a value
+can't start with `--`. If the command is one quoted word (or a hand-written
+`bash -c`), a value substituted into it is shell-quoted; with separate words it is
+used as is. `--before ID` puts the jobs before ID in order; `--after ID` puts them
+after ID in order.
+
+**`--on-fail pause|continue`** (default `continue`, today's behaviour). A job added
+with `pause` that ends `failed` — non-zero exit, timeout or failed start; not
+cancelled, skipped or interrupted — pauses its channel and sends the Telegram message
+"channel N paused after job X failed". The jobs behind it stay queued; `qur resume`
+(with `--channel N`) carries on. With `--retries`, only the final failure pauses
+(retries copy the setting). Requeued jobs and sweep jobs keep it.
+
+**Delayed start.** `--delay 30m` (units `s`/`m`/`h`/`d`, chainable: `1h30m`) or
+`--at 22:00` (the next time your local clock shows that; today if it is still ahead,
+else tomorrow) or `--at "2026-12-01 06:30"` (that exact local moment, which must be in
+the future) keeps the job from starting before that time. The time is stored in the
+database as an absolute timestamp, so it survives daemon restarts and reboots; if the
+daemon was off at that time the job starts as soon as it is back and it reaches the
+front. The daemon sleeps until exactly that moment (it does not poll for it).
+
+```bash
+qur add --delay 30m -- ./later.sh
+qur add --at 22:00 -- ./overnight.sh
+qur add --at "2026-12-01 06:30" --array 1-20 -- ./run.sh     # applies to every job
+```
+
+Same strict FIFO rule as dependencies: a delayed job that reaches the front of its
+channel **holds the channel until its time**; the jobs behind it wait too, and nothing
+jumps ahead. If the queue must keep running meanwhile, put the delayed job on another
+channel. A job with both a delay and `--depends-on`/`--after-any` starts when its time
+has come **and** its dependencies have ended (a dependency that already failed skips it
+at once, without waiting for its time). A paused channel does not start it when its time
+comes; it starts after `qur resume`. The job stays `queued` until then: `qur list` shows
+a "Starts at" column and `qur show` / the Telegram Details show `not before`. `qur rm`
+and `qur cancel` work as on any queued job and free the channel at once. The timeout
+counts run time only, so the delay never eats into it. `--delay` and `--at` cannot be
+combined with each other or with `--now`; a requeued job (button or `--retries`) is not
+delayed again.
+
 `--retries N` requeues the job automatically (at the end of its channel's
 queue) if it fails — non-zero exit, timeout, or failed start — up to N
 times. Each retry is a new job with its own ID and log; the failed job's
 note says which job replaced it. Cancelled jobs are never retried, and
-jobs interrupted by a daemon restart are not retried either.
+jobs interrupted by a daemon stop (see "Daemon stop / restart" below) are not
+retried either and do not use up `--retries`.
 
 `add` validates the executable exists and is executable *before*
 accepting the job — a bad command is rejected immediately, not an hour
@@ -164,7 +248,8 @@ are never auto-retried.
 
 Removes a **queued** job entirely — it's gone, not kept as a backlog
 entry. Errors if the ID is currently running (use `cancel` instead) or
-doesn't exist.
+doesn't exist, or if another queued job depends on it (`--depends-on` /
+`--after-any`; remove those first, or `cancel` this one to skip them).
 
 ### `requeue ID`
 
@@ -190,8 +275,9 @@ bigbox [a3f9] · ch 1 · exit 0
 [ 🔁 Requeue ] [ ℹ️ Details ] [ 📄 Logs ]
 ```
 
-Sent for **done**, **failed** (including timeouts, failed starts, and jobs
-interrupted by a daemon restart) and **cancelled** (running or queued). Each
+Sent for **done**, **failed** (including timeouts and failed starts),
+**cancelled** (running or queued) and **interrupted** (`interrupted (daemon
+stopped)`: the daemon stopped while the job ran; the Requeue button works on it). Each
 qur has its own short id (`a3f9` above, shown when you connect), so with
 several machines you can see exactly which one a message came from. A job with
 `--retries` stays silent while retries remain; you get one message for its
@@ -329,21 +415,31 @@ Job output goes to `~/.local/state/queuer/logs/<id>.log` (via `queuer
 logs`), separate from the daemon's own stderr/stdout, which systemd
 sends to the journal.
 
-## Crash / restart recovery
+## Daemon stop / restart
 
-If `queuerd` dies while a job is running (crash, `kill -9`, reboot), that
-job is never silently lost or blindly re-run. On startup, any job still
-marked `running` from a previous instance is marked `failed` with
-`note: interrupted by daemon restart` (and, if notifications are set up, you get
-a message for it). Note this only updates the job's
-record — if the job's own subprocess is still alive (it runs in its own
-process group, independent of the daemon's), it keeps running
-unsupervised until it finishes or you kill it manually (`pgrep`/`kill`).
+Jobs do **not** survive a daemon stop. A stopped daemon never marks a running job
+`failed`; it records the new terminal status **`interrupted`** (`note: daemon
+stopped`). An interrupted job is not auto-retried, does not count against
+`--retries`, and shows up in `qur list/status/show`, `--json`, `qur clear` and
+`qur clean-logs` like any other finished job. Requeue it with `qur requeue ID` or
+the Telegram button.
+
+- **Clean stop** (`systemctl --user stop/restart queuerd`, reboot, SIGTERM/SIGINT): the
+  daemon stops starting jobs, sends SIGTERM to every running (and `--now`-frozen)
+  job's process group, SIGKILLs what is left after 5 s, writes `interrupted` for each
+  job, sends the Telegram messages, then exits. That takes at most about 20 s, inside
+  the unit's `TimeoutStopSec=30`. Queued jobs stay queued.
+- **Unclean stop** (crash, `kill -9`, power loss): the daemon could not write anything. On
+  the next start every row still `running` (or `stopped`) from the previous instance is
+  marked `interrupted` and you get a message for it. If the job's own process is still
+  alive (it runs in its own process group), it keeps running unsupervised until it
+  finishes or you kill it (`pgrep`/`kill`); systemd may also kill it when it cleans up
+  the dead service (unsure, depends on the unit's KillMode).
 
 With `install.sh` the daemon is a systemd user service with lingering enabled, so it
-starts at boot (no login needed) and is restarted if it crashes. After a reboot it
-works through what was queued: the one interrupted job is marked failed and you
-are told, then the next queued job of each channel starts. Nothing can send
+starts at boot (no login needed) and is restarted if it crashes. After a restart or reboot
+the queue continues by itself: the interrupted job is recorded and you are told, then
+the next queued job of each channel starts. Nothing can send
 a message while the daemon itself is down; if you need to hear about that, watch it
 from outside (e.g. a ping from another machine).
 
@@ -453,7 +549,9 @@ For a design/architecture writeup and the phase-by-phase build plan, see
 
 ## Known limitations (by design, not oversights)
 
-- Serial within a channel — one job at a time per channel (channels run in parallel).
+- Serial within a channel — one job at a time per channel (channels run in parallel). To run
+  jobs in parallel, use several channels.
+- A job waiting on a dependency blocks the jobs behind it on its channel (strict FIFO).
 - Retries are opt-in per job (`--retries`), immediate, and go to the end of the queue.
 - Notifications are Telegram-only, best-effort (a send that fails is dropped,
   not retried), and visible to Telegram. Pair one machine at a time (see

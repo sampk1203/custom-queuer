@@ -23,12 +23,21 @@ from typing import Any
 DEFAULT_DB_PATH = Path.home() / ".local" / "state" / "queuer" / "queuer.db"
 DEFAULT_CHANNEL = 1
 
-_JOBS_TABLE = """
-CREATE TABLE IF NOT EXISTS jobs (
+# Every state a job can end in. `interrupted`: the daemon stopped while it ran.
+# `skipped`: a dependency failed (or was removed), so it never ran.
+TERMINAL_STATUSES = ("done", "failed", "cancelled", "skipped", "interrupted")
+ACTIVE_STATUSES = ("queued", "running", "stopped")
+DEP_MODES = ("success", "any")  # `--depends-on` (must end done) / `--after-any` (any end)
+ON_FAIL_MODES = ("continue", "pause")
+MAX_SWEEP = 1000  # most jobs one `add` creates (--each/--array) and most ids one dependency list holds
+
+_JOBS_DDL = """
+CREATE TABLE IF NOT EXISTS {name} (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     channel       INTEGER NOT NULL DEFAULT 1,
     status        TEXT NOT NULL CHECK (status IN
-                    ('queued','running','stopped','done','failed','cancelled')),
+                    ('queued','running','stopped','done','failed','cancelled',
+                     'interrupted','skipped')),
     position      INTEGER,
     raw_cmd       TEXT NOT NULL,
     resolved_cmd  TEXT NOT NULL,
@@ -47,9 +56,13 @@ CREATE TABLE IF NOT EXISTS jobs (
     max_retries   INTEGER NOT NULL DEFAULT 0,
     attempt       INTEGER NOT NULL DEFAULT 0,
     parent_id     INTEGER,
-    origin        TEXT
+    origin        TEXT,
+    not_before    TEXT,
+    on_fail       TEXT NOT NULL DEFAULT 'continue' CHECK (on_fail IN ('continue','pause'))
 );
 """
+
+_JOBS_TABLE = _JOBS_DDL.format(name="jobs")
 
 _SCHEMA = _JOBS_TABLE + """
 CREATE TABLE IF NOT EXISTS channels (
@@ -61,6 +74,15 @@ CREATE TABLE IF NOT EXISTS daemon_state (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS job_deps (
+    job_id  INTEGER NOT NULL,
+    dep_id  INTEGER NOT NULL,
+    mode    TEXT NOT NULL CHECK (mode IN ('success','any')),
+    PRIMARY KEY (job_id, dep_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_job_deps_dep ON job_deps (dep_id);
 """
 
 
@@ -122,11 +144,55 @@ def _migrate_add_retries(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _migrate_add_deps_and_delay(conn: sqlite3.Connection) -> None:
+    """DBs created before dependencies / delayed start / `--on-fail` lack the
+    `interrupted` and `skipped` statuses (a CHECK constraint, so the table must be
+    rebuilt) and the `not_before` / `on_fail` columns. The whole rebuild runs in ONE
+    transaction: a crash half-way leaves the old table untouched. No-op once migrated
+    (or on a fresh DB, which is created with the new schema). Runs after the two
+    older migrations, so the old table already has every column up to `origin`."""
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'jobs'").fetchone()
+    if row is None or ("'interrupted'" in row["sql"] and "not_before" in row["sql"]):
+        return
+    conn.commit()  # no half-open implicit transaction when we BEGIN
+    conn.execute("BEGIN")
+    try:
+        seq = conn.execute("SELECT seq FROM sqlite_sequence WHERE name = 'jobs'").fetchone()
+        conn.execute("DROP TABLE IF EXISTS jobs_new")
+        conn.execute(_JOBS_DDL.format(name="jobs_new"))
+        conn.execute(
+            """
+            INSERT INTO jobs_new (id, channel, status, position, raw_cmd, resolved_cmd, cwd,
+                                  env_extra, pid, pgid, enqueued_at, started_at, finished_at,
+                                  exit_code, log_path, note, timeout_secs, is_priority,
+                                  max_retries, attempt, parent_id, origin)
+            SELECT id, channel, status, position, raw_cmd, resolved_cmd, cwd,
+                   env_extra, pid, pgid, enqueued_at, started_at, finished_at,
+                   exit_code, log_path, note, timeout_secs, is_priority,
+                   max_retries, attempt, parent_id, origin
+            FROM jobs
+            """
+        )
+        conn.execute("DROP TABLE jobs")
+        conn.execute("ALTER TABLE jobs_new RENAME TO jobs")
+        if seq is not None:
+            # AUTOINCREMENT must never hand out an id that was used before (pruned
+            # history rows included): dependencies refer to jobs by id
+            cur = conn.execute("UPDATE sqlite_sequence SET seq = MAX(seq, ?) WHERE name = 'jobs'", (seq["seq"],))
+            if cur.rowcount == 0:
+                conn.execute("INSERT INTO sqlite_sequence (name, seq) VALUES ('jobs', ?)", (seq["seq"],))
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+
+
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA)
     conn.commit()
     _migrate_add_priority_lane(conn)
     _migrate_add_retries(conn)
+    _migrate_add_deps_and_delay(conn)
 
 
 def _now() -> str:
@@ -142,13 +208,14 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def register_channel(conn: sqlite3.Connection, channel: int) -> None:
+def register_channel(conn: sqlite3.Connection, channel: int, commit: bool = True) -> None:
     """Mark a channel as seen. No-op if already registered."""
     conn.execute(
         "INSERT OR IGNORE INTO channels (id, first_seen_at) VALUES (?, ?)",
         (channel, _now()),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 def list_channels(conn: sqlite3.Connection) -> list[int]:
@@ -199,6 +266,10 @@ def enqueue(
     attempt: int = 0,
     parent_id: int | None = None,
     origin: str | None = None,
+    deps: dict[int, str] | None = None,
+    not_before: str | None = None,
+    on_fail: str = "continue",
+    commit: bool = True,
 ) -> int:
     """Insert a new queued job on `channel`. Returns the new job's id.
 
@@ -219,58 +290,165 @@ def enqueue(
     record where the job came from: origin is None for a fresh job,
     'retry' (daemon auto-retry) or 'requeue' (manual), with parent_id the
     job it was copied from.
+
+    `deps` maps a job id to "success" (run only if it ended `done`) or "any"
+    (run once it ended in any terminal state). Every id must exist. A set of
+    dependencies that could never be satisfied -- a job queued behind this one
+    on the same channel, or any longer cycle through queue order and
+    dependencies -- is rejected with a ValueError. `not_before` is an absolute
+    ISO timestamp the job must not start before; `on_fail` ("continue" or
+    "pause") says what a failure of this job does to its channel. Priority
+    (`--now`) jobs can have neither dependencies nor a start time.
+
+    Nothing is written if anything is rejected. `commit=False` leaves the
+    insert in the open transaction so several jobs can be added all-or-nothing
+    (the caller commits, or rolls back).
     """
     if before is not None and after is not None:
         raise ValueError("before and after are mutually exclusive")
+    if on_fail not in ON_FAIL_MODES:
+        raise ValueError(f"on_fail must be one of {', '.join(ON_FAIL_MODES)}")
+    deps = deps or {}
+    if is_priority and (deps or not_before):
+        raise ValueError("--now cannot be combined with dependencies or a start time")
+    for dep_id, mode in deps.items():
+        if mode not in DEP_MODES:
+            raise ValueError(f"dependency mode must be one of {', '.join(DEP_MODES)}")
+        if get_job(conn, dep_id) is None:
+            raise ValueError(f"dependency job {dep_id} does not exist")
 
-    register_channel(conn, channel)
+    try:
+        register_channel(conn, channel, commit=False)
 
-    cur = conn.execute(
-        """
-        INSERT INTO jobs
-            (channel, status, position, raw_cmd, resolved_cmd, cwd, env_extra,
-             enqueued_at, log_path, timeout_secs, is_priority, max_retries, attempt,
-             parent_id, origin)
-        VALUES (?, 'queued', NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            channel,
-            json.dumps(raw_cmd),
-            json.dumps(resolved_cmd),
-            cwd,
-            json.dumps(env_extra) if env_extra else None,
-            _now(),
-            log_path,
-            timeout_secs,
-            int(is_priority),
-            max_retries,
-            attempt,
-            parent_id,
-            origin,
-        ),
-    )
-    new_id = cur.lastrowid
-    if new_id is None:  # an INSERT always sets it; this narrows the type and fails loudly
-        raise RuntimeError("INSERT into jobs returned no rowid")
+        cur = conn.execute(
+            """
+            INSERT INTO jobs
+                (channel, status, position, raw_cmd, resolved_cmd, cwd, env_extra,
+                 enqueued_at, log_path, timeout_secs, is_priority, max_retries, attempt,
+                 parent_id, origin, not_before, on_fail)
+            VALUES (?, 'queued', NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                channel,
+                json.dumps(raw_cmd),
+                json.dumps(resolved_cmd),
+                cwd,
+                json.dumps(env_extra) if env_extra else None,
+                _now(),
+                log_path,
+                timeout_secs,
+                int(is_priority),
+                max_retries,
+                attempt,
+                parent_id,
+                origin,
+                not_before,
+                on_fail,
+            ),
+        )
+        new_id = cur.lastrowid
+        if new_id is None:  # an INSERT always sets it; this narrows the type and fails loudly
+            raise RuntimeError("INSERT into jobs returned no rowid")
 
-    existing = [i for i in _queued_ids_ordered(conn, channel, is_priority) if i != new_id]
+        existing = [i for i in _queued_ids_ordered(conn, channel, is_priority) if i != new_id]
 
-    if before is not None:
-        if before not in existing:
-            raise ValueError(f"job {before} is not currently queued on channel {channel}")
-        idx = existing.index(before)
-        existing.insert(idx, new_id)
-    elif after is not None:
-        if after not in existing:
-            raise ValueError(f"job {after} is not currently queued on channel {channel}")
-        idx = existing.index(after)
-        existing.insert(idx + 1, new_id)
-    else:
-        existing.append(new_id)
+        if before is not None:
+            if before not in existing:
+                raise ValueError(f"job {before} is not currently queued on channel {channel}")
+            idx = existing.index(before)
+            existing.insert(idx, new_id)
+        elif after is not None:
+            if after not in existing:
+                raise ValueError(f"job {after} is not currently queued on channel {channel}")
+            idx = existing.index(after)
+            existing.insert(idx + 1, new_id)
+        else:
+            existing.append(new_id)
 
-    _reindex_queue(conn, existing)
-    conn.commit()
+        _reindex_queue(conn, existing)
+
+        if deps:
+            behind = set(existing[existing.index(new_id) + 1:])
+            for dep_id in deps:
+                if dep_id in behind:
+                    raise ValueError(
+                        f"job {dep_id} is queued behind this job on channel {channel}, so this job could "
+                        f"never start (strict FIFO: a waiting job blocks the ones behind it). Queue it "
+                        f"after job {dep_id} or on another channel"
+                    )
+            conn.executemany(
+                "INSERT INTO job_deps (job_id, dep_id, mode) VALUES (?, ?, ?)",
+                [(new_id, dep_id, mode) for dep_id, mode in deps.items()],
+            )
+        if deps or before is not None or after is not None:
+            # appended without dependencies, nothing can wait on the new job, so no
+            # cycle is possible; every other case is checked
+            loop = _find_deadlock(conn, new_id)
+            if loop:
+                raise ValueError("this would deadlock: " + _describe_loop(loop))
+    except BaseException:
+        conn.rollback()  # an uncommitted half-insert must never be committed by a later call
+        raise
+    if commit:
+        conn.commit()
     return new_id
+
+
+def _find_deadlock(conn: sqlite3.Connection, job_id: int) -> list[tuple[int, str]] | None:
+    """A cycle through `job_id` in the "waits for" graph, else None. A queued
+    job waits for (a) each unfinished dependency and (b) the job ahead of it in its
+    channel's normal lane (strict FIFO). Every edge a new job adds touches that
+    job, so any new cycle passes through it. Returns [(job, why), ...]: each job
+    reached on the way round, with the reason for the step into it; the last
+    entry is `job_id` itself."""
+    pred: dict[int, int] = {}
+    last: dict[int, int] = {}
+    for r in conn.execute(
+        "SELECT id, channel FROM jobs WHERE status = 'queued' AND is_priority = 0 ORDER BY channel, position"
+    ):
+        if r["channel"] in last:
+            pred[r["id"]] = last[r["channel"]]
+        last[r["channel"]] = r["id"]
+    deps: dict[int, list[int]] = {}
+    for r in conn.execute(
+        """
+        SELECT d.job_id, d.dep_id FROM job_deps d JOIN jobs dj ON dj.id = d.dep_id
+        WHERE dj.status IN ('queued', 'running', 'stopped')
+        """
+    ):
+        deps.setdefault(r["job_id"], []).append(r["dep_id"])
+
+    parent: dict[int, tuple[int, str]] = {}
+    seen = {job_id}
+    todo = [job_id]
+    while todo:
+        node = todo.pop()
+        steps = [(d, "dependency") for d in deps.get(node, [])]
+        if node in pred:
+            steps.append((pred[node], "queue order"))
+        for nxt, why in steps:
+            if nxt == job_id:
+                loop = [(job_id, why)]
+                cur = node
+                while cur != job_id:
+                    prev, prev_why = parent[cur]
+                    loop.append((cur, prev_why))
+                    cur = prev
+                loop.reverse()
+                return loop
+            if nxt not in seen:
+                seen.add(nxt)
+                parent[nxt] = (node, why)
+                todo.append(nxt)
+    return None
+
+
+def _describe_loop(loop: list[tuple[int, str]]) -> str:
+    parts = ["this job"]
+    for node, why in loop:
+        name = "this job" if node == loop[-1][0] else f"job {node}"
+        parts.append(f"-> {name} ({why})")
+    return " ".join(parts)
 
 
 def get_queue(
@@ -306,7 +484,7 @@ def get_backlog(
     rows = conn.execute(
         """
         SELECT * FROM jobs
-        WHERE status IN ('done', 'failed', 'cancelled') AND channel = ?
+        WHERE status IN ('done', 'failed', 'cancelled', 'skipped', 'interrupted') AND channel = ?
         ORDER BY finished_at DESC
         LIMIT ?
         """,
@@ -367,7 +545,7 @@ def mark_finished(
     note: str | None = None,
     keep_backlog: int = 10,
 ) -> None:
-    if status not in ("done", "failed", "cancelled"):
+    if status not in TERMINAL_STATUSES:
         raise ValueError(f"invalid terminal status: {status}")
     job = get_job(conn, job_id)
     if job is None:
@@ -384,14 +562,31 @@ def mark_finished(
     _prune_backlog(conn, job["channel"], keep=keep_backlog)
 
 
+def _drop_orphan_deps(conn: sqlite3.Connection) -> None:
+    """Forget dependency rows whose job is gone. A row whose DEPENDENCY is gone is
+    kept while its job is still queued, so that job is skipped ("dependency
+    removed") instead of silently losing the condition and running."""
+    conn.execute(
+        """
+        DELETE FROM job_deps
+        WHERE job_id NOT IN (SELECT id FROM jobs)
+           OR (dep_id NOT IN (SELECT id FROM jobs)
+               AND job_id NOT IN (SELECT id FROM jobs WHERE status = 'queued'))
+        """
+    )
+
+
 def _prune_backlog(conn: sqlite3.Connection, channel: int, keep: int = 10) -> None:
     """Delete finished-job DB rows beyond the most recent `keep`, scoped to
     one channel. Log files on disk are left untouched -- only the row is
-    pruned."""
+    pruned. A finished job a still-queued job depends on is kept (it may push
+    the history past `keep` until that job has run or been skipped)."""
     rows = conn.execute(
         """
         SELECT id FROM jobs
-        WHERE status IN ('done', 'failed', 'cancelled') AND channel = ?
+        WHERE status IN ('done', 'failed', 'cancelled', 'skipped', 'interrupted') AND channel = ?
+          AND id NOT IN (SELECT d.dep_id FROM job_deps d JOIN jobs w ON w.id = d.job_id
+                         WHERE w.status = 'queued')
         ORDER BY finished_at DESC
         """,
         (channel,),
@@ -399,26 +594,40 @@ def _prune_backlog(conn: sqlite3.Connection, channel: int, keep: int = 10) -> No
     stale_ids = [r["id"] for r in rows[keep:]]
     if stale_ids:
         conn.executemany("DELETE FROM jobs WHERE id = ?", [(i,) for i in stale_ids])
+        _drop_orphan_deps(conn)
         conn.commit()
 
 
 def clear_backlog(conn: sqlite3.Connection, channel: int | None = None) -> int:
-    """Delete all finished (done/failed/cancelled) job rows -- the history
-    shown by `list`/`status`, and nothing else. Queued, running, and
-    stopped (frozen by `--now`) jobs are never touched by this. Log files
-    on disk are left alone (see `clean-logs` for those). Returns the
-    number of rows deleted.
+    """Delete all finished (done/failed/cancelled/skipped/interrupted) job rows
+    -- the history shown by `list`/`status`, and nothing else. Queued, running,
+    and stopped (frozen by `--now`) jobs are never touched by this, nor is a
+    finished job that a still-queued job depends on. Log files on disk are left
+    alone (see `clean-logs` for those). Returns the number of rows deleted.
 
     `channel=None` clears every channel's backlog; passing a channel
     number scopes it to just that one.
     """
     if channel is None:
-        cur = conn.execute("DELETE FROM jobs WHERE status IN ('done', 'failed', 'cancelled')")
+        cur = conn.execute(
+            """
+            DELETE FROM jobs
+            WHERE status IN ('done', 'failed', 'cancelled', 'skipped', 'interrupted')
+              AND id NOT IN (SELECT d.dep_id FROM job_deps d JOIN jobs w ON w.id = d.job_id
+                             WHERE w.status = 'queued')
+            """
+        )
     else:
         cur = conn.execute(
-            "DELETE FROM jobs WHERE status IN ('done', 'failed', 'cancelled') AND channel = ?",
+            """
+            DELETE FROM jobs
+            WHERE status IN ('done', 'failed', 'cancelled', 'skipped', 'interrupted') AND channel = ?
+              AND id NOT IN (SELECT d.dep_id FROM job_deps d JOIN jobs w ON w.id = d.job_id
+                             WHERE w.status = 'queued')
+            """,
             (channel,),
         )
+    _drop_orphan_deps(conn)
     # Drop registry rows for channels (other than the default) that now have
     # no jobs at all, so `list`/`status` stop showing empty channels.
     conn.execute(
@@ -438,16 +647,22 @@ def remove_from_queue(conn: sqlite3.Connection, job_id: int) -> None:
             f"job {job_id} is not queued (status={job['status']!r}); "
             "use cancel for a running job"
         )
+    dependants = queued_dependants(conn, job_id)
+    if dependants:
+        raise ValueError(
+            f"job {job_id} is a dependency of queued job(s) {', '.join(str(i) for i in dependants)}; "
+            "remove or cancel those first (or `qur cancel` this one, which skips them)"
+        )
     conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+    conn.execute("DELETE FROM job_deps WHERE job_id = ? OR dep_id = ?", (job_id, job_id))
     remaining = [i for i in _queued_ids_ordered(conn, job["channel"], bool(job["is_priority"])) if i != job_id]
     _reindex_queue(conn, remaining)
     conn.commit()
 
 
-def cancel_queued(conn: sqlite3.Connection, job_id: int) -> None:
-    """Cancel a job that has not started: it stays in history as
-    `cancelled` (unlike remove_from_queue, which deletes it). Works on both
-    the normal and the priority lane."""
+def _end_queued(conn: sqlite3.Connection, job_id: int, status: str, note: str) -> None:
+    """Move a job that has not started straight to a terminal state (kept in
+    history), closing the gap it leaves in the queue. Works on both lanes."""
     job = get_job(conn, job_id)
     if job is None:
         raise ValueError(f"job {job_id} does not exist")
@@ -457,7 +672,116 @@ def cancel_queued(conn: sqlite3.Connection, job_id: int) -> None:
     remaining = [i for i in _queued_ids_ordered(conn, job["channel"], bool(job["is_priority"])) if i != job_id]
     _reindex_queue(conn, remaining)
     conn.commit()
-    mark_finished(conn, job_id, status="cancelled", note="cancelled while queued")
+    mark_finished(conn, job_id, status=status, note=note)
+
+
+def cancel_queued(conn: sqlite3.Connection, job_id: int) -> None:
+    """Cancel a job that has not started: it stays in history as
+    `cancelled` (unlike remove_from_queue, which deletes it). Works on both
+    the normal and the priority lane."""
+    _end_queued(conn, job_id, "cancelled", "cancelled while queued")
+
+
+def skip_queued(conn: sqlite3.Connection, job_id: int, note: str) -> None:
+    """A queued job that can no longer run (a dependency failed): it stays in
+    history as `skipped` with `note` saying why."""
+    _end_queued(conn, job_id, "skipped", note)
+
+
+# ---------------------------------------------------------------------------
+# Dependencies
+# ---------------------------------------------------------------------------
+
+
+def queued_dependants(conn: sqlite3.Connection, job_id: int) -> list[int]:
+    """Ids of still-queued jobs that depend on `job_id` (either mode), ascending."""
+    rows = conn.execute(
+        """
+        SELECT d.job_id FROM job_deps d JOIN jobs w ON w.id = d.job_id
+        WHERE d.dep_id = ? AND w.status = 'queued' ORDER BY d.job_id
+        """,
+        (job_id,),
+    ).fetchall()
+    return [r["job_id"] for r in rows]
+
+
+def dep_info(conn: sqlite3.Connection, job_id: int) -> dict[str, list[int]]:
+    """A job's dependencies for display: `depends_on` (--depends-on ids),
+    `after_any` (--after-any ids) and `waiting_on` (those of either kind that
+    have not ended yet)."""
+    rows = conn.execute(
+        """
+        SELECT d.dep_id, d.mode, j.status AS dep_status
+        FROM job_deps d LEFT JOIN jobs j ON j.id = d.dep_id
+        WHERE d.job_id = ? ORDER BY d.dep_id
+        """,
+        (job_id,),
+    ).fetchall()
+    return {
+        "depends_on": [r["dep_id"] for r in rows if r["mode"] == "success"],
+        "after_any": [r["dep_id"] for r in rows if r["mode"] == "any"],
+        "waiting_on": [r["dep_id"] for r in rows if r["dep_status"] in ACTIVE_STATUSES],
+    }
+
+
+def dep_verdict(conn: sqlite3.Connection, job_id: int) -> tuple[str, int | None]:
+    """Whether a job's dependencies let it run: ("ready", None) if it has none
+    or they all ended as required; ("waiting", id) if one has not ended yet;
+    ("failed", id) if a `--depends-on` job ended in anything but `done`;
+    ("removed", id) if a dependency's row no longer exists. "failed" and
+    "removed" win over "waiting": the job can never run."""
+    rows = conn.execute(
+        """
+        SELECT d.dep_id, d.mode, j.status AS dep_status
+        FROM job_deps d LEFT JOIN jobs j ON j.id = d.dep_id
+        WHERE d.job_id = ? ORDER BY d.dep_id
+        """,
+        (job_id,),
+    ).fetchall()
+    waiting: int | None = None
+    for r in rows:
+        st = r["dep_status"]
+        if st is None:
+            return "removed", r["dep_id"]
+        if st in TERMINAL_STATUSES:
+            if r["mode"] == "success" and st != "done":
+                return "failed", r["dep_id"]
+        elif waiting is None:
+            waiting = r["dep_id"]
+    return ("waiting", waiting) if waiting is not None else ("ready", None)
+
+
+def skip_dependants(conn: sqlite3.Connection, job_id: int) -> tuple[list[int], set[int]]:
+    """`job_id` just reached a terminal state. Skip every still-queued job that
+    needs it to have succeeded (`--depends-on`, and it did not end `done`), and
+    cascade: a skipped job is itself a failed dependency of whatever needed it.
+    Returns (ids skipped, channels holding any queued job that depends on a job
+    touched here -- their queue head may be free to start now)."""
+    skipped: list[int] = []
+    channels: set[int] = set()
+    todo = [job_id]
+    while todo:
+        dep_id = todo.pop()
+        dep = get_job(conn, dep_id)
+        if dep is None:
+            continue
+        rows = conn.execute("SELECT job_id, mode FROM job_deps WHERE dep_id = ? ORDER BY job_id", (dep_id,)).fetchall()
+        for r in rows:
+            waiter = get_job(conn, r["job_id"])
+            if waiter is None or waiter["status"] != "queued":
+                continue
+            channels.add(waiter["channel"])
+            if r["mode"] == "success" and dep["status"] != "done":
+                skip_queued(conn, waiter["id"], f"dependency {dep_id} failed")
+                skipped.append(waiter["id"])
+                todo.append(waiter["id"])
+    return skipped, channels
+
+
+def list_active(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Every job marked running or frozen (stopped), on any channel."""
+    rows = conn.execute("SELECT * FROM jobs WHERE status IN ('running', 'stopped') ORDER BY id").fetchall()
+    return [_row_to_dict(r) for r in rows]
 
 
 def reorder_before(conn: sqlite3.Connection, job_id: int, before_id: int) -> None:
@@ -485,13 +809,22 @@ def _reorder(
     idx = ids.index(target_id)
     ids.insert(idx + 1 if after else idx, job_id)
     _reindex_queue(conn, ids)
+    if not job["is_priority"]:
+        # moving a job can put it ahead of something it waits for (or behind something
+        # that waits for it): that would hold its channel forever. Every new edge
+        # touches the moved job, so a cycle through it is the only way this can happen.
+        loop = _find_deadlock(conn, job_id)
+        if loop:
+            conn.rollback()
+            raise ValueError("this would deadlock: " + _describe_loop(loop))
     conn.commit()
 
 
 def requeue(conn: sqlite3.Connection, job_id: int, *, log_path: str, auto: bool = False) -> int:
-    """Re-enqueue a done/failed/cancelled job with its original argv/cwd/env/
-    timeout/channel/max_retries, appended to the end of its channel's
-    queue. Returns the new job's id.
+    """Re-enqueue a finished job (any terminal state) with its original argv/
+    cwd/env/timeout/channel/max_retries/on_fail, appended to the end of its
+    channel's queue. Dependencies and a start time are NOT copied: the copy
+    runs when it reaches the front. Returns the new job's id.
 
     `auto=False` is a manual requeue: origin 'requeue', fresh retry count
     (attempt 0). `auto=True` is the daemon retrying a failure: origin
@@ -499,7 +832,7 @@ def requeue(conn: sqlite3.Connection, job_id: int, *, log_path: str, auto: bool 
     job = get_job(conn, job_id)
     if job is None:
         raise ValueError(f"job {job_id} does not exist")
-    if job["status"] not in ("done", "failed", "cancelled"):
+    if job["status"] not in TERMINAL_STATUSES:
         raise ValueError(
             f"job {job_id} has status {job['status']!r}; "
             "only finished jobs can be requeued"
@@ -514,6 +847,7 @@ def requeue(conn: sqlite3.Connection, job_id: int, *, log_path: str, auto: bool 
         env_extra=json.loads(job["env_extra"]) if job["env_extra"] else None,
         timeout_secs=job["timeout_secs"],
         max_retries=job["max_retries"],
+        on_fail=job["on_fail"],
         attempt=job["attempt"] + 1 if auto else 0,
         parent_id=job_id,
         origin="retry" if auto else "requeue",

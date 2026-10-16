@@ -830,3 +830,289 @@ def test_recent_requeue_ignores_auto_retries_and_other_jobs(conn):
     assert db.recent_requeue(conn, a, 30) is None
     db.requeue(conn, b, log_path="/tmp/y.log")
     assert db.recent_requeue(conn, a, 30) is None
+
+
+# ---------------------------------------------------------------------------
+# B5: interrupted status
+# ---------------------------------------------------------------------------
+
+def test_mark_finished_accepts_interrupted_and_it_shows_in_backlog(conn):
+    a = _mk(conn, "a")
+    db.mark_running(conn, a, pid=1, pgid=1)
+    db.mark_finished(conn, a, status="interrupted", note="daemon stopped")
+    job = db.get_job(conn, a)
+    assert job["status"] == "interrupted" and job["note"] == "daemon stopped"
+    assert [j["id"] for j in db.get_backlog(conn)] == [a]
+    assert db.get_running(conn) is None
+
+
+def test_interrupted_job_can_be_requeued_and_cleared(conn):
+    a = _mk(conn, "a", timeout_secs=30)
+    db.mark_running(conn, a, pid=1, pgid=1)
+    db.mark_finished(conn, a, status="interrupted", note="daemon stopped")
+    new_id = db.requeue(conn, a, log_path="/tmp/a2.log")
+    assert db.get_job(conn, new_id)["status"] == "queued"
+    assert db.get_job(conn, new_id)["timeout_secs"] == 30
+    assert db.clear_backlog(conn) == 1  # the interrupted row is history like any other
+    assert db.get_job(conn, a) is None
+
+
+# ---------------------------------------------------------------------------
+# F2: dependencies
+# ---------------------------------------------------------------------------
+
+def _finish(conn, job_id, status="done", exit_code=0):
+    db.mark_running(conn, job_id, pid=1, pgid=1)
+    db.mark_finished(conn, job_id, status=status, exit_code=exit_code)
+
+
+def test_enqueue_stores_dependencies_and_dep_info_reports_them(conn):
+    a, b = _mk(conn, "a"), _mk(conn, "b")
+    c = _mk(conn, "c", deps={a: "success", b: "any"})
+    info = db.dep_info(conn, c)
+    assert info == {"depends_on": [a], "after_any": [b], "waiting_on": [a, b]}
+    _finish(conn, a)
+    assert db.dep_info(conn, c)["waiting_on"] == [b]  # a has ended; b has not
+    assert db.dep_info(conn, a) == {"depends_on": [], "after_any": [], "waiting_on": []}
+
+
+def test_enqueue_rejects_unknown_dependency_and_writes_nothing(conn):
+    _mk(conn, "a")
+    with pytest.raises(ValueError, match="does not exist"):
+        _mk(conn, "b", deps={999: "success"})
+    assert len(db.get_queue(conn)) == 1
+    assert conn.execute("SELECT COUNT(*) FROM job_deps").fetchone()[0] == 0
+
+
+def test_enqueue_rejects_bad_dependency_mode_and_priority_with_deps(conn):
+    a = _mk(conn, "a")
+    with pytest.raises(ValueError, match="mode"):
+        _mk(conn, "b", deps={a: "sometimes"})
+    with pytest.raises(ValueError, match="--now"):
+        _mk(conn, "c", deps={a: "success"}, is_priority=True)
+
+
+def test_enqueue_rejects_dependency_on_a_job_queued_behind_it(conn):
+    a, b = _mk(conn, "a"), _mk(conn, "b")
+    with pytest.raises(ValueError, match="behind"):
+        _mk(conn, "c", before=a, deps={b: "success"})  # c would sit ahead of b, waiting for it
+    assert [j["id"] for j in db.get_queue(conn)] == [a, b]  # rolled back: the queue is untouched
+    assert conn.execute("SELECT COUNT(*) FROM job_deps").fetchone()[0] == 0
+
+
+def test_enqueue_dependency_on_an_earlier_job_in_the_same_channel_is_fine(conn):
+    a = _mk(conn, "a")
+    b = _mk(conn, "b", deps={a: "success"})
+    assert [j["id"] for j in db.get_queue(conn)] == [a, b]
+
+
+def test_enqueue_rejects_a_cycle_through_other_channels(conn):
+    a = _mk(conn, "a")                                   # ch1: a
+    b = _mk(conn, "b", channel=2, deps={a: "success"})   # ch2: b waits for a
+    with pytest.raises(ValueError, match="deadlock"):
+        # c goes in front of a on ch1 and waits for b: c -> b -> a -> c
+        _mk(conn, "c", before=a, deps={b: "any"})
+    assert [j["id"] for j in db.get_queue(conn)] == [a]
+    assert [j["id"] for j in db.get_queue(conn, channel=2)] == [b]
+
+
+def test_reorder_that_would_deadlock_is_rejected_and_changes_nothing(conn):
+    a = _mk(conn, "a")
+    b = _mk(conn, "b", deps={a: "success"})
+    with pytest.raises(ValueError, match="deadlock"):
+        db.reorder_before(conn, b, a)  # b would sit ahead of the job it waits for
+    assert [j["id"] for j in db.get_queue(conn)] == [a, b]
+    assert [j["position"] for j in db.get_queue(conn)] == [0, 1]
+
+
+def test_dep_verdict_ready_waiting_failed_removed(conn):
+    a, b = _mk(conn, "a"), _mk(conn, "b", channel=2)
+    plain = _mk(conn, "plain")
+    assert db.dep_verdict(conn, plain) == ("ready", None)
+    c = _mk(conn, "c", channel=3, deps={a: "success", b: "any"})
+    assert db.dep_verdict(conn, c) == ("waiting", a)
+    _finish(conn, a)
+    assert db.dep_verdict(conn, c) == ("waiting", b)
+    _finish(conn, b, status="failed", exit_code=1)
+    assert db.dep_verdict(conn, c) == ("ready", None)  # `any` is satisfied by a failure
+
+    x = _mk(conn, "x")
+    y = _mk(conn, "y", channel=4, deps={x: "success"})
+    _finish(conn, x, status="failed", exit_code=1)
+    assert db.dep_verdict(conn, y) == ("failed", x)
+    conn.execute("DELETE FROM jobs WHERE id = ?", (x,))
+    assert db.dep_verdict(conn, y) == ("removed", x)
+
+
+@pytest.mark.parametrize("status", ["failed", "cancelled", "skipped", "interrupted"])
+def test_depends_on_needs_done_every_other_end_fails_it(conn, status):
+    a = _mk(conn, "a")
+    b = _mk(conn, "b", channel=2, deps={a: "success"})
+    db.mark_running(conn, a, pid=1, pgid=1)
+    db.mark_finished(conn, a, status=status)
+    assert db.dep_verdict(conn, b) == ("failed", a)
+
+
+def test_skip_dependants_skips_and_cascades(conn):
+    a = _mk(conn, "a")
+    b = _mk(conn, "b", deps={a: "success"})
+    c = _mk(conn, "c", deps={b: "success"})
+    d = _mk(conn, "d", deps={a: "any"})
+    e = _mk(conn, "e")
+    _finish(conn, a, status="failed", exit_code=1)
+    skipped, channels = db.skip_dependants(conn, a)
+    assert skipped == [b, c]
+    assert channels == {1}
+    assert db.get_job(conn, b)["status"] == "skipped"
+    assert db.get_job(conn, b)["note"] == f"dependency {a} failed"
+    assert db.get_job(conn, c)["note"] == f"dependency {b} failed"
+    assert db.get_job(conn, d)["status"] == "queued"  # --after-any: any end is fine
+    assert [j["id"] for j in db.get_queue(conn)] == [d, e]  # the gap is closed
+    assert [j["position"] for j in db.get_queue(conn)] == [0, 1]
+
+
+def test_skip_dependants_leaves_a_satisfied_dependant_alone(conn):
+    a = _mk(conn, "a")
+    b = _mk(conn, "b", channel=2, deps={a: "success"})
+    _finish(conn, a)
+    assert db.skip_dependants(conn, a) == ([], {2})
+    assert db.get_job(conn, b)["status"] == "queued"
+
+
+def test_remove_from_queue_refuses_a_job_others_depend_on(conn):
+    a = _mk(conn, "a")
+    b = _mk(conn, "b", deps={a: "success"})
+    c = _mk(conn, "c", deps={a: "any"})
+    with pytest.raises(ValueError) as exc:
+        db.remove_from_queue(conn, a)
+    assert str(b) in str(exc.value) and str(c) in str(exc.value)
+    assert db.get_job(conn, a)["status"] == "queued"
+    db.remove_from_queue(conn, c)  # nothing depends on c: fine, and its dependency rows go with it
+    assert conn.execute("SELECT COUNT(*) FROM job_deps WHERE job_id = ?", (c,)).fetchone()[0] == 0
+    db.remove_from_queue(conn, b)
+    db.remove_from_queue(conn, a)
+
+
+def test_queued_dependants_lists_only_queued_ones(conn):
+    a = _mk(conn, "a")
+    b = _mk(conn, "b", channel=2, deps={a: "success"})
+    c = _mk(conn, "c", channel=3, deps={a: "any"})
+    _finish(conn, c, status="done")  # c can't have started before a, but the query only looks at status
+    assert db.queued_dependants(conn, a) == [b]
+
+
+def test_finished_dependency_of_a_queued_job_is_never_pruned_or_cleared(conn):
+    a = _mk(conn, "a")
+    b = _mk(conn, "b", channel=2, deps={a: "success"})
+    _finish(conn, a)
+    for i in range(12):  # more history than the 10 kept per channel
+        x = _mk(conn, f"x{i}")
+        _finish(conn, x)
+    assert db.get_job(conn, a) is not None  # pruned history would have lost a
+    db.clear_backlog(conn)
+    assert db.get_job(conn, a) is not None
+    assert db.dep_verdict(conn, b) == ("ready", None)
+    _finish(conn, b)
+    db.clear_backlog(conn)
+    assert db.get_job(conn, a) is None
+    assert conn.execute("SELECT COUNT(*) FROM job_deps").fetchone()[0] == 0
+
+
+def test_requeue_does_not_copy_dependencies(conn):
+    a = _mk(conn, "a")
+    b = _mk(conn, "b", channel=2, deps={a: "success"})
+    _finish(conn, a)
+    _finish(conn, b)
+    new_id = db.requeue(conn, b, log_path="/tmp/b2.log")
+    assert db.dep_info(conn, new_id) == {"depends_on": [], "after_any": [], "waiting_on": []}
+
+
+def test_init_db_migrates_a_pre_interrupted_database_and_keeps_ids(tmp_path):
+    """The `jobs` table of a DB from before dependencies has a CHECK without
+    `interrupted`/`skipped` and no `not_before`/`on_fail`: it is rebuilt in one
+    transaction, rows and the id counter survive, and a second run is a no-op."""
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    raw = sqlite3.connect(path)
+    raw.executescript(
+        """
+        CREATE TABLE jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel INTEGER NOT NULL DEFAULT 1,
+            status TEXT NOT NULL CHECK (status IN
+                ('queued','running','stopped','done','failed','cancelled')),
+            position INTEGER, raw_cmd TEXT NOT NULL, resolved_cmd TEXT NOT NULL,
+            cwd TEXT NOT NULL, env_extra TEXT, pid INTEGER, pgid INTEGER,
+            enqueued_at TEXT NOT NULL, started_at TEXT, finished_at TEXT,
+            exit_code INTEGER, log_path TEXT NOT NULL, note TEXT,
+            timeout_secs INTEGER, is_priority INTEGER NOT NULL DEFAULT 0,
+            max_retries INTEGER NOT NULL DEFAULT 0, attempt INTEGER NOT NULL DEFAULT 0,
+            parent_id INTEGER, origin TEXT
+        );
+        INSERT INTO jobs (status, position, raw_cmd, resolved_cmd, cwd, enqueued_at, log_path)
+        VALUES ('queued', 0, '["a"]', '["/usr/bin/a"]', '/tmp', '2026-01-01T00:00:00+00:00', '/tmp/1.log');
+        INSERT INTO jobs (status, raw_cmd, resolved_cmd, cwd, enqueued_at, log_path, finished_at)
+        VALUES ('done', '["b"]', '["/usr/bin/b"]', '/tmp', '2026-01-01T00:00:00+00:00', '/tmp/2.log', '2026-01-01T00:00:01+00:00');
+        DELETE FROM jobs WHERE id = 2;
+        """
+    )
+    raw.commit()
+    raw.close()
+
+    c = db.connect(path)
+    db.init_db(c)
+    db.init_db(c)  # second run: nothing to do
+    assert db.get_job(c, 1)["raw_cmd"] == '["a"]'
+    assert db.get_job(c, 1)["on_fail"] == "continue" and db.get_job(c, 1)["not_before"] is None
+    new_id = _mk(c, "n")
+    assert new_id == 3  # id 2 was used before, so AUTOINCREMENT must not hand it out again
+    db.mark_running(c, new_id, pid=1, pgid=1)
+    db.mark_finished(c, new_id, status="interrupted", note="daemon stopped")  # the new CHECK allows it
+    dep = _mk(c, "dep", deps={1: "success"})
+    assert db.dep_info(c, dep)["depends_on"] == [1]
+    c.close()
+
+
+# ---------------------------------------------------------------------------
+# F6: --on-fail
+# ---------------------------------------------------------------------------
+
+def test_on_fail_defaults_to_continue_and_is_stored(conn):
+    a = _mk(conn, "a")
+    b = _mk(conn, "b", on_fail="pause")
+    assert db.get_job(conn, a)["on_fail"] == "continue"
+    assert db.get_job(conn, b)["on_fail"] == "pause"
+
+
+def test_on_fail_rejects_unknown_mode_and_writes_nothing(conn):
+    with pytest.raises(ValueError, match="on_fail"):
+        _mk(conn, "a", on_fail="stop")
+    assert db.get_queue(conn) == []
+
+
+def test_requeue_keeps_on_fail(conn):
+    a = _mk(conn, "a", on_fail="pause")
+    _finish(conn, a, status="failed", exit_code=1)
+    new_id = db.requeue(conn, a, log_path="/tmp/a2.log")
+    assert db.get_job(conn, new_id)["on_fail"] == "pause"
+
+
+# ---------------------------------------------------------------------------
+# F7: not_before (delayed start)
+# ---------------------------------------------------------------------------
+
+def test_enqueue_stores_not_before_and_requeue_does_not_copy_it(conn):
+    a = _mk(conn, "a", not_before="2030-01-01T12:00:00+00:00")
+    assert db.get_job(conn, a)["not_before"] == "2030-01-01T12:00:00+00:00"
+    assert db.get_queue(conn)[0]["not_before"] == "2030-01-01T12:00:00+00:00"
+    assert db.get_job(conn, _mk(conn, "b"))["not_before"] is None
+    db.cancel_queued(conn, a)
+    new_id = db.requeue(conn, a, log_path="/tmp/a2.log")
+    assert db.get_job(conn, new_id)["not_before"] is None
+
+
+def test_enqueue_rejects_not_before_on_the_priority_lane(conn):
+    with pytest.raises(ValueError):
+        _mk(conn, "a", is_priority=True, not_before="2030-01-01T12:00:00+00:00")
+    assert db.get_queue(conn, is_priority=True) == []

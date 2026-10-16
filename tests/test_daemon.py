@@ -747,7 +747,7 @@ async def test_before_id_from_different_channel_errors(daemon):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_startup_recovery_marks_stale_running_job_failed(tmp_path):
+async def test_startup_recovery_marks_stale_running_job_interrupted(tmp_path):
     db_path = tmp_path / "queuer.db"
 
     # simulate a previous daemon instance that crashed mid-job
@@ -773,8 +773,8 @@ async def test_startup_recovery_marks_stale_running_job_failed(tmp_path):
 
         resp = await send(d.socket_path, "show", id=job_id)
         assert resp["ok"]
-        assert resp["data"]["status"] == "failed"
-        assert resp["data"]["note"] == "interrupted by daemon restart"
+        assert resp["data"]["status"] == "interrupted"
+        assert resp["data"]["note"] == "daemon stopped"
     finally:
         task.cancel()
         try:
@@ -846,10 +846,10 @@ async def test_startup_recovery_covers_every_channel(tmp_path):
 
         resp1 = await send(d.socket_path, "show", id=job1)
         resp2 = await send(d.socket_path, "show", id=job2)
-        assert resp1["data"]["status"] == "failed"
-        assert resp1["data"]["note"] == "interrupted by daemon restart"
-        assert resp2["data"]["status"] == "failed"
-        assert resp2["data"]["note"] == "interrupted by daemon restart"
+        assert resp1["data"]["status"] == "interrupted"
+        assert resp1["data"]["note"] == "daemon stopped"
+        assert resp2["data"]["status"] == "interrupted"
+        assert resp2["data"]["note"] == "daemon stopped"
     finally:
         task.cancel()
         try:
@@ -1387,8 +1387,8 @@ async def test_notifies_for_job_interrupted_by_daemon_restart(tmp_path, monkeypa
     task = asyncio.create_task(d.serve())
     try:
         await wait_msgs(msgs, 1)
-        assert f"failed · job {job_id}" in msgs[0]["text"]
-        assert "interrupted by daemon restart" in msgs[0]["text"]
+        assert f"interrupted (daemon stopped) · job {job_id}" in msgs[0]["text"]
+        assert "failed" not in msgs[0]["text"]
     finally:
         task.cancel()
         try:
@@ -2507,3 +2507,947 @@ async def test_too_many_connections_get_a_clean_error_and_the_count_recovers(dae
     assert (await send(daemon.socket_path, "status"))["ok"]
     await asyncio.sleep(0.1)
     assert daemon._clients == 0  # every finished connection gave its slot back
+
+
+# ---------------------------------------------------------------------------
+# B5: a daemon stop records running jobs as "interrupted", never "failed"
+# ---------------------------------------------------------------------------
+
+def _make_daemon(tmp_path, **kw) -> Daemon:
+    return Daemon(db_path=tmp_path / "queuer.db", socket_path=tmp_path / "queuer.sock", log_dir=tmp_path / "logs", **kw)
+
+
+async def _start(d: Daemon) -> "asyncio.Task":
+    d.socket_path.unlink(missing_ok=True)  # an earlier daemon of the same test may have left its socket file
+    task = asyncio.create_task(d.serve())
+    for _ in range(100):
+        if d.socket_path.exists():
+            break
+        await asyncio.sleep(0.02)
+    return task
+
+
+def _alive(pid: int) -> bool:
+    """Running, not just a zombie nobody has reaped yet (a container's PID 1 may not reap)."""
+    try:
+        os.kill(pid, 0)
+        state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+    except (ProcessLookupError, FileNotFoundError):
+        return False
+    return state != "Z"
+
+
+@pytest.mark.asyncio
+async def test_clean_stop_marks_running_job_interrupted_kills_it_and_keeps_the_queue(tmp_path):
+    d = _make_daemon(tmp_path)
+    task = await _start(d)
+    running = (await send(d.socket_path, "add", argv=["sleep", "60"], cwd=CWD))["data"]["id"]
+    waiting = (await send(d.socket_path, "add", argv=["true"], cwd=CWD))["data"]["id"]
+    job = await wait_for_status(d.socket_path, running, {"running"})
+
+    d._stopping.set()  # what the SIGTERM handler does
+    await asyncio.wait_for(task, timeout=15)  # serve() returns by itself: no exception, no cancel
+
+    conn = db_module.connect(d.db_path)
+    try:
+        rec = db_module.get_job(conn, running)
+        assert rec["status"] == "interrupted"
+        assert rec["note"] == "daemon stopped"
+        assert rec["finished_at"] is not None
+        assert db_module.get_job(conn, waiting)["status"] == "queued"  # the next job did NOT start
+    finally:
+        conn.close()
+    assert not _alive(job["pid"])
+
+
+@pytest.mark.asyncio
+async def test_real_sigterm_stops_the_daemon_gracefully(tmp_path):
+    d = _make_daemon(tmp_path)
+    task = await _start(d)
+    job_id = (await send(d.socket_path, "add", argv=["sleep", "60"], cwd=CWD))["data"]["id"]
+    job = await wait_for_status(d.socket_path, job_id, {"running"})
+
+    os.kill(os.getpid(), signal.SIGTERM)  # handler installed by serve(); must not kill the test run
+    await asyncio.wait_for(task, timeout=15)
+
+    conn = db_module.connect(d.db_path)
+    try:
+        assert db_module.get_job(conn, job_id)["status"] == "interrupted"
+    finally:
+        conn.close()
+    assert not _alive(job["pid"])
+
+
+@pytest.mark.asyncio
+async def test_interrupted_job_is_not_retried_and_does_not_use_up_retries(tmp_path):
+    d = _make_daemon(tmp_path)
+    task = await _start(d)
+    job_id = (await send(d.socket_path, "add", argv=["sleep", "60"], cwd=CWD, max_retries=3))["data"]["id"]
+    await wait_for_status(d.socket_path, job_id, {"running"})
+    d._stopping.set()
+    await asyncio.wait_for(task, timeout=15)
+
+    conn = db_module.connect(d.db_path)
+    try:
+        rows = conn.execute("SELECT id, status, attempt FROM jobs").fetchall()
+    finally:
+        conn.close()
+    assert [(r["id"], r["status"], r["attempt"]) for r in rows] == [(job_id, "interrupted", 0)]  # no retry row
+
+
+@pytest.mark.asyncio
+async def test_clean_stop_kills_a_backgrounded_child_that_ignores_sigterm(tmp_path, monkeypatch):
+    monkeypatch.setattr("queuer.daemon.DEFAULT_GRACE_SECS", 0.3)
+    d = _make_daemon(tmp_path)
+    task = await _start(d)
+    marker = tmp_path / "child.pid"
+    script = f"trap '' TERM; sleep 60 & echo $! > {marker}; wait"
+    job_id = (await send(d.socket_path, "add", argv=["sh", "-c", script], cwd=CWD))["data"]["id"]
+    await wait_for_status(d.socket_path, job_id, {"running"})
+    for _ in range(100):
+        if marker.exists() and marker.read_text().strip():
+            break
+        await asyncio.sleep(0.02)
+    child = int(marker.read_text())
+
+    d._stopping.set()
+    await asyncio.wait_for(task, timeout=15)
+
+    conn = db_module.connect(d.db_path)
+    try:
+        assert db_module.get_job(conn, job_id)["status"] == "interrupted"
+    finally:
+        conn.close()
+    await asyncio.sleep(0.1)
+    assert not _alive(child)  # SIGKILLed after the grace period, not left holding the log pipe
+
+
+@pytest.mark.asyncio
+async def test_clean_stop_interrupts_a_frozen_job_and_the_priority_job(tmp_path):
+    d = _make_daemon(tmp_path)
+    task = await _start(d)
+    slow = (await send(d.socket_path, "add", argv=["sleep", "60"], cwd=CWD))["data"]["id"]
+    await wait_for_status(d.socket_path, slow, {"running"})
+    prio = (await send(d.socket_path, "add", argv=["sleep", "60"], cwd=CWD, now=True))["data"]["id"]
+    await wait_for_status(d.socket_path, slow, {"stopped"})
+    await wait_for_status(d.socket_path, prio, {"running"})
+
+    d._stopping.set()
+    await asyncio.wait_for(task, timeout=15)
+
+    conn = db_module.connect(d.db_path)
+    try:
+        assert db_module.get_job(conn, slow)["status"] == "interrupted"
+        assert db_module.get_job(conn, prio)["status"] == "interrupted"
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_clean_stop_sends_the_telegram_message_before_the_daemon_exits(tmp_path, monkeypatch):
+    msgs: list = []
+    monkeypatch.setattr(notify, "_api", lambda token, method, params=None, timeout=0: msgs.append(params))
+    notify_path = tmp_path / "notify.json"
+    notify.save({"qur_id": "a3f9", "token": TG_TOKEN, "chat_ids": [111], "listen": False}, notify_path)
+    d = _make_daemon(tmp_path, notify_path=notify_path)
+    task = await _start(d)
+    job_id = (await send(d.socket_path, "add", argv=["sleep", "60"], cwd=CWD))["data"]["id"]
+    await wait_for_status(d.socket_path, job_id, {"running"})
+
+    d._stopping.set()
+    await asyncio.wait_for(task, timeout=15)
+
+    assert len(msgs) == 1  # already delivered when serve() returned, no sleeping needed
+    assert f"interrupted (daemon stopped) · job {job_id}" in msgs[0]["text"]
+    assert "failed" not in msgs[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_stopping_daemon_starts_no_new_job(tmp_path):
+    d = _make_daemon(tmp_path)
+    task = await _start(d)
+    first = (await send(d.socket_path, "add", argv=["sleep", "60"], cwd=CWD))["data"]["id"]
+    await wait_for_status(d.socket_path, first, {"running"})
+    second = (await send(d.socket_path, "add", argv=["true"], cwd=CWD))["data"]["id"]
+    d._stopping.set()
+    d._wake_worker(1)  # even a wake-up (new job, resume, ...) must not start the next job
+    await asyncio.wait_for(task, timeout=15)
+
+    conn = db_module.connect(d.db_path)
+    try:
+        assert db_module.get_job(conn, second)["status"] == "queued"
+        assert db_module.get_job(conn, second)["started_at"] is None
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_restart_continues_with_the_next_queued_job(tmp_path):
+    d = _make_daemon(tmp_path)
+    task = await _start(d)
+    first = (await send(d.socket_path, "add", argv=["sleep", "60"], cwd=CWD))["data"]["id"]
+    second = (await send(d.socket_path, "add", argv=["true"], cwd=CWD))["data"]["id"]
+    await wait_for_status(d.socket_path, first, {"running"})
+    d._stopping.set()
+    await asyncio.wait_for(task, timeout=15)
+
+    d2 = _make_daemon(tmp_path)  # "systemctl restart": same db, new daemon
+    task2 = await _start(d2)
+    try:
+        assert (await wait_for_status(d2.socket_path, second, {"done"}))["status"] == "done"
+        assert (await send(d2.socket_path, "show", id=first))["data"]["status"] == "interrupted"
+    finally:
+        task2.cancel()
+        try:
+            await task2
+        except asyncio.CancelledError:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_requeue_works_on_an_interrupted_job(tmp_path):
+    d = _make_daemon(tmp_path)
+    task = await _start(d)
+    job_id = (await send(d.socket_path, "add", argv=["sleep", "60"], cwd=CWD))["data"]["id"]
+    await wait_for_status(d.socket_path, job_id, {"running"})
+    d._stopping.set()
+    await asyncio.wait_for(task, timeout=15)
+
+    d2 = _make_daemon(tmp_path)
+    task2 = await _start(d2)
+    try:
+        resp = await send(d2.socket_path, "requeue", id=job_id)
+        assert resp["ok"], resp
+        new = (await send(d2.socket_path, "show", id=resp["data"]["id"]))["data"]
+        assert new["status"] in ("queued", "running")
+        assert new["parent_id"] == job_id
+        await send(d2.socket_path, "cancel", id=new["id"])
+        await wait_for_status(d2.socket_path, new["id"], {"cancelled"})
+    finally:
+        task2.cancel()
+        try:
+            await task2
+        except asyncio.CancelledError:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_startup_recovery_marks_a_frozen_job_interrupted_too(tmp_path):
+    conn = db_module.connect(tmp_path / "queuer.db")
+    db_module.init_db(conn)
+    job_id = db_module.enqueue(
+        conn, raw_cmd=["sleep", "999"], resolved_cmd=["/bin/sleep", "999"], cwd=CWD,
+        log_path=str(tmp_path / "logs" / "1.log"),
+    )
+    db_module.mark_running(conn, job_id, pid=999999, pgid=999999)
+    db_module.mark_stopped(conn, job_id)  # frozen by --now when the old daemon died
+    conn.close()
+
+    d = _make_daemon(tmp_path)
+    task = await _start(d)
+    try:
+        resp = await send(d.socket_path, "show", id=job_id)
+        assert resp["data"]["status"] == "interrupted"
+        assert resp["data"]["note"] == "daemon stopped"
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_job_cancelled_by_the_user_stays_cancelled(daemon):
+    job_id = (await send(daemon.socket_path, "add", argv=["sleep", "60"], cwd=CWD))["data"]["id"]
+    await wait_for_status(daemon.socket_path, job_id, {"running"})
+    await send(daemon.socket_path, "cancel", id=job_id)
+    assert (await wait_for_status(daemon.socket_path, job_id, {"cancelled", "interrupted", "failed"}))["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_job_killed_by_signal_is_failed_when_no_stop_is_happening(daemon):
+    # exit code -15 on its own (someone ran `kill`): the daemon is not stopping, so it IS a failure
+    job_id = (await send(daemon.socket_path, "add", argv=["sh", "-c", "kill -TERM $$"], cwd=CWD))["data"]["id"]
+    job = await wait_for_status(daemon.socket_path, job_id, {"failed", "interrupted"}, timeout=10)
+    assert job["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_cut_short_by_stop_rules(tmp_path, monkeypatch):
+    monkeypatch.setattr("queuer.daemon.STOP_RACE_SECS", 0.3)
+    d = _make_daemon(tmp_path)
+    assert await d._cut_short_by_stop(0) is False  # finished by itself
+    assert await d._cut_short_by_stop(1) is False  # an ordinary failure, no stop
+    assert await d._cut_short_by_stop(-15) is False  # signal death, but no stop arrives within the window
+
+    asyncio.get_running_loop().call_later(0.05, d._stopping.set)  # our own SIGTERM lands a moment later
+    assert await d._cut_short_by_stop(-15) is True
+    assert await d._cut_short_by_stop(143) is True
+    assert await d._cut_short_by_stop(1) is True  # stopping: any non-zero exit is the stop's doing
+    assert await d._cut_short_by_stop(0) is False  # but a clean exit 0 stays done
+
+
+# ---------------------------------------------------------------------------
+# F2: dependencies (--depends-on / --after-any)
+# ---------------------------------------------------------------------------
+
+async def _add(daemon, argv, **kw) -> int:
+    resp = await send(daemon.socket_path, "add", argv=argv, cwd=CWD, **kw)
+    assert resp["ok"], resp
+    return resp["data"]["id"]
+
+
+@pytest.mark.asyncio
+async def test_depends_on_runs_after_the_dependency_succeeds(daemon):
+    a = await _add(daemon, ["sleep", "0.5"])
+    b = await _add(daemon, ["echo", "b"], depends_on=[a])
+    await asyncio.sleep(0.2)
+    assert (await send(daemon.socket_path, "show", id=b))["data"]["status"] == "queued"
+    assert (await wait_for_status(daemon.socket_path, b, {"done", "failed", "skipped"}))["status"] == "done"
+    ja = (await send(daemon.socket_path, "show", id=a))["data"]
+    jb = (await send(daemon.socket_path, "show", id=b))["data"]
+    assert ja["finished_at"] <= jb["started_at"]
+
+
+@pytest.mark.asyncio
+async def test_depends_on_failed_job_is_skipped_and_the_queue_moves_on(daemon):
+    a = await _add(daemon, ["false"])
+    b = await _add(daemon, ["echo", "b"], depends_on=[a])
+    c = await _add(daemon, ["echo", "c"])
+    jb = await wait_for_status(daemon.socket_path, b, {"skipped", "done"})
+    assert jb["status"] == "skipped" and jb["note"] == f"dependency {a} failed"
+    assert jb["started_at"] is None
+    assert (await wait_for_status(daemon.socket_path, c, {"done", "failed"}))["status"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_skips_cascade_to_dependants_on_other_channels_too(daemon):
+    a = await _add(daemon, ["false"])
+    b = await _add(daemon, ["echo", "b"], depends_on=[a], channel=2)
+    c = await _add(daemon, ["echo", "c"], depends_on=[b], channel=3)
+    d = await _add(daemon, ["echo", "d"], after_any=[b], channel=4)
+    jc = await wait_for_status(daemon.socket_path, c, {"skipped", "done"})
+    assert jc["status"] == "skipped" and jc["note"] == f"dependency {b} failed"
+    assert (await wait_for_status(daemon.socket_path, d, {"done", "skipped"}))["status"] == "done"  # b ended: that is enough
+
+
+@pytest.mark.asyncio
+async def test_after_any_runs_whatever_the_outcome(daemon):
+    a = await _add(daemon, ["false"])
+    b = await _add(daemon, ["echo", "b"], after_any=[a])
+    assert (await wait_for_status(daemon.socket_path, b, {"done", "skipped"}))["status"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_depends_on_cancelled_job_skips_the_dependant(daemon):
+    a = await _add(daemon, ["sleep", "30"])
+    b = await _add(daemon, ["echo", "b"], depends_on=[a], channel=2)
+    await wait_for_status(daemon.socket_path, a, {"running"})
+    await send(daemon.socket_path, "cancel", id=a)
+    jb = await wait_for_status(daemon.socket_path, b, {"skipped", "done"})
+    assert jb["status"] == "skipped" and jb["note"] == f"dependency {a} failed"
+
+
+@pytest.mark.asyncio
+async def test_all_listed_dependencies_must_succeed(daemon):
+    a = await _add(daemon, ["true"])
+    b = await _add(daemon, ["false"], channel=2)
+    c = await _add(daemon, ["echo", "c"], depends_on=[a, b], channel=3)
+    assert (await wait_for_status(daemon.socket_path, c, {"skipped", "done"}))["status"] == "skipped"
+
+
+@pytest.mark.asyncio
+async def test_waiting_job_blocks_the_jobs_behind_it_strict_fifo(daemon):
+    a = await _add(daemon, ["sleep", "1"], channel=2)
+    b = await _add(daemon, ["echo", "b"], depends_on=[a], channel=1)
+    c = await _add(daemon, ["echo", "c"], channel=1)
+    await asyncio.sleep(0.4)
+    chan = _ch((await send(daemon.socket_path, "list"))["data"], 1)
+    assert chan["running"] is None  # nothing jumped ahead of the waiting job
+    assert [j["id"] for j in chan["queue"]] == [b, c]
+    assert chan["queue"][0]["waiting_on"] == [a] and chan["queue"][0]["depends_on"] == [a]
+    assert chan["queue"][1]["waiting_on"] == []
+    # a dependency finishing on ANOTHER channel wakes this one at once (not at the 30 s recheck)
+    jb = await wait_for_status(daemon.socket_path, b, {"done", "failed", "skipped"})
+    jc = await wait_for_status(daemon.socket_path, c, {"done", "failed"})
+    assert jb["status"] == "done" and jc["status"] == "done"
+    assert jb["finished_at"] <= jc["started_at"]
+
+
+@pytest.mark.asyncio
+async def test_add_rejects_unknown_dependency_and_bad_arguments(daemon):
+    for kw, text in (
+        ({"depends_on": [999]}, "does not exist"),
+        ({"after_any": [999]}, "does not exist"),
+        ({"depends_on": "5"}, "list of job ids"),
+        ({"depends_on": [0]}, "list of job ids"),
+        ({"after_any": [True]}, "list of job ids"),
+        ({"depends_on": list(range(1, 1002))}, "too many"),
+    ):
+        resp = await send(daemon.socket_path, "add", argv=["true"], cwd=CWD, **kw)
+        assert resp["ok"] is False and text in resp["error"], (kw, resp)
+    a = await _add(daemon, ["true"])
+    resp = await send(daemon.socket_path, "add", argv=["true"], cwd=CWD, now=True, depends_on=[a])
+    assert resp["ok"] is False and "--now" in resp["error"]
+
+
+@pytest.mark.asyncio
+async def test_add_rejects_a_dependency_that_could_never_run(daemon):
+    a = await _add(daemon, ["sleep", "5"])  # running
+    b = await _add(daemon, ["echo", "b"])   # queued behind a
+    resp = await send(daemon.socket_path, "add", argv=["true"], cwd=CWD, before=b, depends_on=[b])
+    assert resp["ok"] is False and "behind" in resp["error"]
+    resp = await send(daemon.socket_path, "add", argv=["true"], cwd=CWD, before=b, channel=1, after_any=[b])
+    assert resp["ok"] is False and "behind" in resp["error"]
+    chan = _ch((await send(daemon.socket_path, "list"))["data"], 1)
+    assert [j["id"] for j in chan["queue"]] == [b]  # nothing was added
+    assert chan["running"]["id"] == a
+
+
+@pytest.mark.asyncio
+async def test_add_with_an_already_failed_dependency_is_skipped_at_once(daemon):
+    a = await _add(daemon, ["false"])
+    await wait_for_status(daemon.socket_path, a, {"failed"})
+    resp = await send(daemon.socket_path, "add", argv=["echo", "x"], cwd=CWD, depends_on=[a])
+    assert resp["ok"] and resp["data"]["skipped"] == f"dependency {a} failed"
+    job = (await send(daemon.socket_path, "show", id=resp["data"]["id"]))["data"]
+    assert job["status"] == "skipped" and job["started_at"] is None
+    # a plain add carries no "skipped" key
+    assert "skipped" not in (await send(daemon.socket_path, "add", argv=["true"], cwd=CWD))["data"]
+
+
+@pytest.mark.asyncio
+async def test_add_with_an_already_finished_dependency_just_runs(daemon):
+    a = await _add(daemon, ["true"])
+    await wait_for_status(daemon.socket_path, a, {"done"})
+    b = await _add(daemon, ["echo", "b"], depends_on=[a])
+    assert (await wait_for_status(daemon.socket_path, b, {"done", "skipped"}))["status"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_id_in_both_lists_needs_success(daemon):
+    a = await _add(daemon, ["false"])
+    b = await _add(daemon, ["echo", "b"], depends_on=[a], after_any=[a])
+    assert (await wait_for_status(daemon.socket_path, b, {"skipped", "done"}))["status"] == "skipped"
+
+
+@pytest.mark.asyncio
+async def test_rm_of_a_job_others_depend_on_is_refused(daemon):
+    await _add(daemon, ["sleep", "30"])
+    a = await _add(daemon, ["echo", "a"])
+    b = await _add(daemon, ["echo", "b"], depends_on=[a])
+    resp = await send(daemon.socket_path, "rm", id=a)
+    assert resp["ok"] is False and str(b) in resp["error"]
+    assert (await send(daemon.socket_path, "show", id=a))["data"]["status"] == "queued"
+    assert (await send(daemon.socket_path, "rm", id=b))["ok"]
+    assert (await send(daemon.socket_path, "rm", id=a))["ok"]
+
+
+@pytest.mark.asyncio
+async def test_cancelling_a_queued_dependency_skips_its_dependants(daemon):
+    await _add(daemon, ["sleep", "30"])
+    a = await _add(daemon, ["echo", "a"])
+    b = await _add(daemon, ["echo", "b"], depends_on=[a])
+    c = await _add(daemon, ["echo", "c"], after_any=[a], channel=2)
+    await send(daemon.socket_path, "cancel", id=a)
+    jb = await wait_for_status(daemon.socket_path, b, {"skipped"})
+    assert jb["note"] == f"dependency {a} failed"
+    assert (await wait_for_status(daemon.socket_path, c, {"done"}))["status"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_removing_a_waiting_head_wakes_the_channel(daemon):
+    a = await _add(daemon, ["sleep", "30"], channel=2)
+    b = await _add(daemon, ["echo", "b"], depends_on=[a], channel=1)
+    c = await _add(daemon, ["echo", "c"], channel=1)
+    await asyncio.sleep(0.2)
+    assert (await send(daemon.socket_path, "show", id=c))["data"]["status"] == "queued"  # held behind b
+    assert (await send(daemon.socket_path, "rm", id=b))["ok"]
+    assert (await wait_for_status(daemon.socket_path, c, {"done", "failed"}))["status"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_show_reports_dependencies(daemon):
+    a = await _add(daemon, ["sleep", "30"])
+    b = await _add(daemon, ["sleep", "30"], channel=2)
+    c = await _add(daemon, ["true"], channel=3, depends_on=[a], after_any=[b])
+    job = (await send(daemon.socket_path, "show", id=c))["data"]
+    assert (job["depends_on"], job["after_any"], job["waiting_on"]) == ([a], [b], [a, b])
+    plain = (await send(daemon.socket_path, "show", id=a))["data"]
+    assert plain["depends_on"] == [] and plain["waiting_on"] == []
+
+
+@pytest.mark.asyncio
+async def test_job_left_running_by_a_dead_daemon_skips_its_dependants_after_restart(tmp_path):
+    # the dependency was running when the old daemon died: the next daemon marks it
+    # interrupted, and a job that needed it to succeed is skipped, not run
+    d = _make_daemon(tmp_path)
+    conn = db_module.connect(d.db_path)
+    db_module.init_db(conn)
+    a = db_module.enqueue(conn, raw_cmd=["x"], resolved_cmd=["/bin/true"], cwd=CWD, log_path="pending")
+    b = db_module.enqueue(conn, raw_cmd=["x"], resolved_cmd=["/bin/true"], cwd=CWD, log_path=str(tmp_path / "b.log"),
+                          channel=2, deps={a: "success"})
+    c = db_module.enqueue(conn, raw_cmd=["x"], resolved_cmd=["/bin/true"], cwd=CWD, log_path=str(tmp_path / "c.log"),
+                          channel=3, deps={a: "any"})
+    db_module.mark_running(conn, a, pid=1, pgid=1)
+    conn.close()
+    task = await _start(d)
+    try:
+        jb = await wait_for_status(d.socket_path, b, {"skipped", "done"})
+        assert jb["status"] == "skipped" and jb["note"] == f"dependency {a} failed"
+        assert (await wait_for_status(d.socket_path, a, {"interrupted"}))["status"] == "interrupted"
+        assert (await wait_for_status(d.socket_path, c, {"done", "failed"}))["status"] == "done"
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_clean_stop_skips_dependants_of_the_interrupted_job_but_not_unrelated_ones(tmp_path):
+    d = _make_daemon(tmp_path)
+    task = await _start(d)
+    a = (await send(d.socket_path, "add", argv=["sleep", "60"], cwd=CWD))["data"]["id"]
+    b = (await send(d.socket_path, "add", argv=["true"], cwd=CWD, channel=2, depends_on=[a]))["data"]["id"]
+    c = (await send(d.socket_path, "add", argv=["true"], cwd=CWD, channel=3, after_any=[a]))["data"]["id"]
+    e = (await send(d.socket_path, "add", argv=["true"], cwd=CWD, channel=1))["data"]["id"]
+    await wait_for_status(d.socket_path, a, {"running"})
+    d._stopping.set()
+    await asyncio.wait_for(task, timeout=15)
+
+    conn = db_module.connect(d.db_path)
+    try:
+        assert db_module.get_job(conn, a)["status"] == "interrupted"
+        assert db_module.get_job(conn, b)["status"] == "skipped"
+        assert db_module.get_job(conn, b)["note"] == f"dependency {a} failed"
+        assert db_module.get_job(conn, c)["status"] == "queued"  # --after-any: it runs on the next start
+        assert db_module.get_job(conn, e)["status"] == "queued"
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# F3: sweeps (`add` with `jobs`)
+# ---------------------------------------------------------------------------
+
+def _spec(argv, index=None, raw=None):
+    return {"argv": argv, "raw_argv": raw or argv, "index": index}
+
+
+@pytest.mark.asyncio
+async def test_sweep_creates_one_job_per_entry_in_order_with_qur_index(daemon):
+    jobs = [_spec(["sh", "-c", "echo idx=$QUR_INDEX"], index=i) for i in (3, 4, 5)]
+    resp = await send(daemon.socket_path, "add", jobs=jobs, cwd=CWD, channel=2)
+    assert resp["ok"], resp
+    ids = resp["data"]["ids"]
+    assert resp["data"]["id"] == ids[0] and ids == list(range(ids[0], ids[0] + 3)) and resp["data"]["channel"] == 2
+    for job_id, n in zip(ids, (3, 4, 5)):
+        job = await wait_for_status(daemon.socket_path, job_id, {"done", "failed"})
+        assert job["status"] == "done" and job["channel"] == 2
+        assert Path(job["log_path"]).read_text() == f"idx={n}\n"
+    done = [(await send(daemon.socket_path, "show", id=i))["data"] for i in ids]
+    assert done[0]["finished_at"] <= done[1]["started_at"] <= done[2]["started_at"]  # in order, one at a time
+
+
+@pytest.mark.asyncio
+async def test_sweep_each_job_keeps_its_own_raw_command(daemon):
+    jobs = [_spec(["echo", v], index=n, raw=["echo", v]) for n, v in enumerate(["a", "b"], 1)]
+    ids = (await send(daemon.socket_path, "add", jobs=jobs, cwd=CWD))["data"]["ids"]
+    raws = [json.loads((await send(daemon.socket_path, "show", id=i))["data"]["raw_cmd"]) for i in ids]
+    assert raws == [["echo", "a"], ["echo", "b"]]
+
+
+@pytest.mark.asyncio
+async def test_sweep_without_index_sets_no_qur_index(daemon):
+    ids = (await send(daemon.socket_path, "add", jobs=[_spec(["true"])], cwd=CWD))["data"]["ids"]
+    job = (await send(daemon.socket_path, "show", id=ids[0]))["data"]
+    assert job["env_extra"] is None
+
+
+@pytest.mark.asyncio
+async def test_sweep_is_all_or_nothing(daemon):
+    jobs = [_spec(["true"], 1), _spec(["/nonexistent/prog"], 2), _spec(["true"], 3)]
+    resp = await send(daemon.socket_path, "add", jobs=jobs, cwd=CWD)
+    assert resp["ok"] is False and "not found" in resp["error"]
+    assert (await send(daemon.socket_path, "list"))["data"]["channels"] == {}  # nothing was created
+
+
+@pytest.mark.asyncio
+async def test_sweep_rejected_by_the_database_leaves_no_partial_jobs(daemon):
+    a = await _add(daemon, ["sleep", "30"])
+    resp = await send(daemon.socket_path, "add", jobs=[_spec(["true"], 1), _spec(["true"], 2)], cwd=CWD,
+                      depends_on=[999])
+    assert resp["ok"] is False and "does not exist" in resp["error"]
+    chan = _ch((await send(daemon.socket_path, "list"))["data"], 1)
+    assert chan["running"]["id"] == a and chan["queue"] == []
+
+
+@pytest.mark.asyncio
+async def test_sweep_argument_validation(daemon):
+    for jobs, text in (
+        ([], "non-empty"), ("x", "non-empty"), ([1], "non-empty"),
+        ([_spec(["true"], index=-1)], "index"), ([_spec(["true"], index="1")], "index"),
+        ([_spec(["true"])] * 1001, "too many"),
+        ([{"argv": []}], "empty command"),
+    ):
+        resp = await send(daemon.socket_path, "add", jobs=jobs, cwd=CWD)
+        assert resp["ok"] is False and text in resp["error"], (jobs[:1], resp)
+
+
+@pytest.mark.asyncio
+async def test_sweep_of_the_cap_is_accepted(daemon):
+    resp = await send(daemon.socket_path, "add", jobs=[_spec(["true"], i) for i in range(1000)], cwd=CWD, channel=9)
+    assert resp["ok"] and len(resp["data"]["ids"]) == 1000
+    await send(daemon.socket_path, "pause", channel=9)
+
+
+@pytest.mark.asyncio
+async def test_sweep_dependency_applies_to_every_job(daemon):
+    a = await _add(daemon, ["sleep", "0.5"], channel=2)
+    resp = await send(daemon.socket_path, "add", jobs=[_spec(["true"], 1), _spec(["true"], 2)], cwd=CWD, depends_on=[a])
+    ids = resp["data"]["ids"]
+    await asyncio.sleep(0.2)
+    chan = _ch((await send(daemon.socket_path, "list"))["data"], 1)
+    assert [j["id"] for j in chan["queue"]] == ids and all(j["depends_on"] == [a] for j in chan["queue"])
+    for i in ids:
+        assert (await wait_for_status(daemon.socket_path, i, {"done", "skipped"}))["status"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_sweep_with_a_failed_dependency_is_skipped_as_a_whole(daemon):
+    a = await _add(daemon, ["false"])
+    await wait_for_status(daemon.socket_path, a, {"failed"})
+    resp = await send(daemon.socket_path, "add", jobs=[_spec(["true"], 1), _spec(["true"], 2)], cwd=CWD, depends_on=[a])
+    assert resp["ok"] and resp["data"]["skipped"] == f"dependency {a} failed"
+    for i in resp["data"]["ids"]:
+        assert (await send(daemon.socket_path, "show", id=i))["data"]["status"] == "skipped"
+
+
+@pytest.mark.asyncio
+async def test_sweep_after_keeps_the_order_and_before_too(daemon):
+    await _add(daemon, ["sleep", "30"])
+    x = await _add(daemon, ["true"])
+    y = await _add(daemon, ["true"])
+    r = await send(daemon.socket_path, "add", jobs=[_spec(["true"], 1), _spec(["true"], 2)], cwd=CWD, after=x)
+    ids_after = r["data"]["ids"]
+    r = await send(daemon.socket_path, "add", jobs=[_spec(["true"], 1), _spec(["true"], 2)], cwd=CWD, before=y)
+    ids_before = r["data"]["ids"]
+    chan = _ch((await send(daemon.socket_path, "list"))["data"], 1)
+    assert [j["id"] for j in chan["queue"]] == [x, *ids_after, *ids_before, y]
+
+
+@pytest.mark.asyncio
+async def test_single_add_is_unchanged_by_the_sweep_support(daemon):
+    resp = await send(daemon.socket_path, "add", argv=["true"], cwd=CWD)
+    assert set(resp["data"]) == {"id", "channel"}
+
+
+# ---------------------------------------------------------------------------
+# F6: --on-fail pause|continue
+# ---------------------------------------------------------------------------
+
+async def _paused(daemon, channel: int = 1) -> bool:
+    return _ch((await send(daemon.socket_path, "list"))["data"], channel)["paused"]
+
+
+@pytest.mark.asyncio
+async def test_on_fail_pause_pauses_the_channel_and_keeps_the_rest_queued(daemon):
+    a = await _add(daemon, ["false"], on_fail="pause")
+    b = await _add(daemon, ["echo", "b"])
+    await wait_for_status(daemon.socket_path, a, {"failed"})
+    await asyncio.sleep(0.3)
+    assert await _paused(daemon) is True
+    assert (await send(daemon.socket_path, "show", id=b))["data"]["status"] == "queued"
+    await send(daemon.socket_path, "resume")
+    assert (await wait_for_status(daemon.socket_path, b, {"done", "failed"}))["status"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_on_fail_pause_only_pauses_its_own_channel(daemon):
+    a = await _add(daemon, ["false"], on_fail="pause", channel=1)
+    c = await _add(daemon, ["echo", "c"], channel=2)
+    await wait_for_status(daemon.socket_path, a, {"failed"})
+    assert (await wait_for_status(daemon.socket_path, c, {"done"}))["status"] == "done"
+    assert await _paused(daemon, 1) is True and await _paused(daemon, 2) is False
+
+
+@pytest.mark.asyncio
+async def test_default_and_continue_do_not_pause(daemon):
+    a = await _add(daemon, ["false"])
+    b = await _add(daemon, ["false"], on_fail="continue")
+    c = await _add(daemon, ["echo", "c"])
+    assert (await wait_for_status(daemon.socket_path, c, {"done", "failed"}))["status"] == "done"
+    assert await _paused(daemon) is False
+    assert (await send(daemon.socket_path, "show", id=a))["data"]["on_fail"] == "continue"
+    assert (await send(daemon.socket_path, "show", id=b))["data"]["on_fail"] == "continue"
+
+
+@pytest.mark.asyncio
+async def test_on_fail_pause_ignores_success_cancel_and_skip(daemon):
+    ok = await _add(daemon, ["true"], on_fail="pause")
+    await wait_for_status(daemon.socket_path, ok, {"done"})
+    long = await _add(daemon, ["sleep", "30"], on_fail="pause")
+    await wait_for_status(daemon.socket_path, long, {"running"})
+    await send(daemon.socket_path, "cancel", id=long)
+    await wait_for_status(daemon.socket_path, long, {"cancelled"})
+    await asyncio.sleep(0.3)
+    assert await _paused(daemon) is False
+    bad = await _add(daemon, ["false"], channel=2)
+    skipped = await _add(daemon, ["true"], channel=3, depends_on=[bad], on_fail="pause")
+    await wait_for_status(daemon.socket_path, skipped, {"skipped"})
+    await asyncio.sleep(0.2)
+    assert await _paused(daemon, 3) is False
+
+
+@pytest.mark.asyncio
+async def test_on_fail_pause_after_timeout_pauses(daemon):
+    a = await _add(daemon, ["sleep", "30"], timeout_secs=1, on_fail="pause")
+    job = await wait_for_status(daemon.socket_path, a, {"failed"}, timeout=10)
+    assert "timed out" in job["note"]
+    await asyncio.sleep(0.3)
+    assert await _paused(daemon) is True
+
+
+@pytest.mark.asyncio
+async def test_on_fail_pause_waits_for_the_final_failure_when_retrying(daemon):
+    a = await _add(daemon, ["false"], on_fail="pause", max_retries=1)
+    retry = a + 1
+    await wait_for_status(daemon.socket_path, retry, {"failed"})
+    await asyncio.sleep(0.3)
+    assert await _paused(daemon) is True
+    assert (await send(daemon.socket_path, "show", id=retry))["data"]["on_fail"] == "pause"  # the copy keeps it
+    assert (await send(daemon.socket_path, "show", id=retry + 1))["ok"] is False  # and no third attempt
+
+
+@pytest.mark.asyncio
+async def test_on_fail_is_validated_and_survives_requeue(daemon):
+    for bad in ("stop", 5, ["pause"]):
+        resp = await send(daemon.socket_path, "add", argv=["true"], cwd=CWD, on_fail=bad)
+        assert resp["ok"] is False and "on_fail" in resp["error"], bad
+    a = await _add(daemon, ["false"], on_fail="pause")
+    await wait_for_status(daemon.socket_path, a, {"failed"})
+    new_id = (await send(daemon.socket_path, "requeue", id=a))["data"]["id"]
+    assert (await send(daemon.socket_path, "show", id=new_id))["data"]["on_fail"] == "pause"
+
+
+@pytest.mark.asyncio
+async def test_on_fail_applies_to_every_job_of_a_sweep(daemon):
+    resp = await send(daemon.socket_path, "add", jobs=[_spec(["false"], 1), _spec(["true"], 2)], cwd=CWD, on_fail="pause")
+    first, second = resp["data"]["ids"]
+    await wait_for_status(daemon.socket_path, first, {"failed"})
+    await asyncio.sleep(0.3)
+    assert await _paused(daemon) is True
+    assert (await send(daemon.socket_path, "show", id=second))["data"]["on_fail"] == "pause"
+    assert (await send(daemon.socket_path, "show", id=second))["data"]["status"] == "queued"
+
+
+@pytest.mark.asyncio
+async def test_on_fail_pause_sends_a_telegram_message(daemon, sent):
+    job_id = await _add(daemon, ["false"], on_fail="pause")
+    await wait_msgs(sent, 2)
+    texts = [m["text"] for m in sent]
+    assert any(f"failed · job {job_id}" in t for t in texts)
+    assert any(f"channel 1 paused after job {job_id} failed" in t for t in texts)
+
+
+@pytest.mark.asyncio
+async def test_continue_failure_sends_no_pause_message(daemon, sent):
+    await _add(daemon, ["false"])
+    await wait_msgs(sent, 1)
+    await asyncio.sleep(0.3)
+    assert len(sent) == 1 and "paused" not in sent[0]["text"]
+
+
+# ---------------------------------------------------------------------------
+# F7: delayed start (--delay / --at -> not_before)
+# ---------------------------------------------------------------------------
+
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+
+def _in(secs: float) -> str:
+    return (datetime.now(timezone.utc) + timedelta(seconds=secs)).isoformat()
+
+
+@pytest.mark.asyncio
+async def test_delayed_job_waits_for_its_time_then_runs(daemon):
+    started = time.monotonic()
+    a = await _add(daemon, ["echo", "later"], not_before=_in(1.0))
+    await asyncio.sleep(0.4)
+    assert (await send(daemon.socket_path, "show", id=a))["data"]["status"] == "queued"
+    assert (await wait_for_status(daemon.socket_path, a, {"done", "failed"}))["status"] == "done"
+    assert time.monotonic() - started >= 0.95
+
+
+@pytest.mark.asyncio
+async def test_delayed_job_starts_at_not_before_not_at_the_idle_recheck(daemon, monkeypatch):
+    # the recheck is far longer than the delay: only a computed sleep can start it on time
+    monkeypatch.setattr("queuer.daemon.IDLE_POLL_SECS", 30)
+    a = await _add(daemon, ["echo", "x"], not_before=_in(0.8))
+    job = await wait_for_status(daemon.socket_path, a, {"done", "failed"}, timeout=5)
+    started = datetime.fromisoformat(job["started_at"])
+    assert datetime.fromisoformat(job["not_before"]) <= started <= datetime.fromisoformat(job["not_before"]) + timedelta(seconds=1.5)
+
+
+@pytest.mark.asyncio
+async def test_a_delayed_head_blocks_the_jobs_behind_it_strict_fifo(daemon):
+    a = await _add(daemon, ["echo", "a"], not_before=_in(1.0))
+    b = await _add(daemon, ["echo", "b"])
+    await asyncio.sleep(0.4)
+    assert (await send(daemon.socket_path, "show", id=b))["data"]["status"] == "queued"
+    ja = await wait_for_status(daemon.socket_path, a, {"done"})
+    jb = await wait_for_status(daemon.socket_path, b, {"done"})
+    assert ja["finished_at"] <= jb["started_at"]
+
+
+@pytest.mark.asyncio
+async def test_a_delayed_job_does_not_block_another_channel(daemon):
+    a = await _add(daemon, ["echo", "a"], not_before=_in(30), channel=1)
+    b = await _add(daemon, ["echo", "b"], channel=2)
+    assert (await wait_for_status(daemon.socket_path, b, {"done"}))["status"] == "done"
+    assert (await send(daemon.socket_path, "show", id=a))["data"]["status"] == "queued"
+
+
+@pytest.mark.asyncio
+async def test_a_not_before_in_the_past_runs_at_once(daemon):
+    a = await _add(daemon, ["echo", "a"], not_before=_in(-60))
+    assert (await wait_for_status(daemon.socket_path, a, {"done", "failed"}))["status"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_cancelling_a_delayed_head_frees_the_channel_at_once(daemon):
+    a = await _add(daemon, ["echo", "a"], not_before=_in(60))
+    b = await _add(daemon, ["echo", "b"])
+    await asyncio.sleep(0.2)
+    assert (await send(daemon.socket_path, "cancel", id=a))["ok"]
+    assert (await send(daemon.socket_path, "show", id=a))["data"]["status"] == "cancelled"
+    assert (await wait_for_status(daemon.socket_path, b, {"done", "failed"}))["status"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_removing_a_delayed_head_frees_the_channel_at_once(daemon):
+    a = await _add(daemon, ["echo", "a"], not_before=_in(60))
+    b = await _add(daemon, ["echo", "b"])
+    await asyncio.sleep(0.2)
+    assert (await send(daemon.socket_path, "rm", id=a))["ok"]
+    assert (await wait_for_status(daemon.socket_path, b, {"done", "failed"}))["status"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_delay_and_dependency_both_have_to_be_met(daemon):
+    dep = await _add(daemon, ["sleep", "1.2"])
+    a = await _add(daemon, ["echo", "a"], depends_on=[dep], not_before=_in(0.3), channel=2)
+    await asyncio.sleep(0.6)  # its time has come but the dependency has not ended
+    assert (await send(daemon.socket_path, "show", id=a))["data"]["status"] == "queued"
+    ja = await wait_for_status(daemon.socket_path, a, {"done", "failed", "skipped"})
+    jd = await wait_for_status(daemon.socket_path, dep, {"done"})
+    assert ja["status"] == "done" and ja["started_at"] >= jd["finished_at"]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_dependency_skips_a_delayed_job_without_waiting_for_its_time(daemon):
+    dep = await _add(daemon, ["false"])
+    a = await _add(daemon, ["echo", "a"], depends_on=[dep], not_before=_in(60), channel=2)
+    assert (await wait_for_status(daemon.socket_path, a, {"skipped"}, timeout=5))["status"] == "skipped"
+
+
+@pytest.mark.asyncio
+async def test_a_paused_channel_does_not_start_a_delayed_job_when_its_time_comes(daemon):
+    await send(daemon.socket_path, "pause")
+    a = await _add(daemon, ["echo", "a"], not_before=_in(0.3))
+    await asyncio.sleep(0.8)
+    assert (await send(daemon.socket_path, "show", id=a))["data"]["status"] == "queued"
+    await send(daemon.socket_path, "resume")
+    assert (await wait_for_status(daemon.socket_path, a, {"done"}))["status"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_timeout_counts_run_time_not_the_delay(daemon):
+    a = await _add(daemon, ["sleep", "0.3"], not_before=_in(1.0), timeout_secs=1)
+    assert (await wait_for_status(daemon.socket_path, a, {"done", "failed"}, timeout=6))["status"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_not_before_is_stored_as_utc_and_shown_by_show_and_list(daemon):
+    local = datetime.now(timezone(timedelta(hours=5, minutes=30))) + timedelta(hours=1)
+    a = await _add(daemon, ["echo", "a"], not_before=local.isoformat(), channel=3)
+    job = (await send(daemon.socket_path, "show", id=a))["data"]
+    assert job["not_before"] == local.astimezone(timezone.utc).isoformat()
+    queue = _ch((await send(daemon.socket_path, "list"))["data"], 3)["queue"]
+    assert queue[0]["not_before"] == job["not_before"]
+
+
+@pytest.mark.asyncio
+async def test_delayed_start_survives_a_daemon_restart(tmp_path):
+    d = _make_daemon(tmp_path)
+    task = await _start(d)
+    a = (await send(d.socket_path, "add", argv=["echo", "a"], cwd=CWD, not_before=_in(1.5)))["data"]["id"]
+    await asyncio.sleep(0.2)
+    d._stopping.set()
+    await asyncio.wait_for(task, timeout=15)
+    stored_nb = None
+    conn = db_module.connect(d.db_path)
+    try:
+        job = db_module.get_job(conn, a)
+        assert job is not None and job["status"] == "queued"
+        stored_nb = job["not_before"]
+    finally:
+        conn.close()
+    assert stored_nb
+
+    d2 = _make_daemon(tmp_path)  # "systemctl restart": same db, new daemon
+    task2 = await _start(d2)
+    try:
+        assert (await send(d2.socket_path, "show", id=a))["data"]["status"] == "queued"
+        done = await wait_for_status(d2.socket_path, a, {"done", "failed"})
+        assert done["status"] == "done"
+        assert datetime.fromisoformat(done["started_at"]) >= datetime.fromisoformat(stored_nb)
+    finally:
+        task2.cancel()
+        try:
+            await task2
+        except asyncio.CancelledError:
+            pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", [5, "tomorrow", "2026-10-16T10:00:00", ["x"], True])
+async def test_add_rejects_a_bad_not_before(daemon, bad):
+    resp = await send(daemon.socket_path, "add", argv=["echo", "a"], cwd=CWD, not_before=bad)
+    assert resp["ok"] is False and "not_before" in resp["error"]
+    assert (await send(daemon.socket_path, "list"))["data"]["channels"] == {}
+
+
+@pytest.mark.asyncio
+async def test_add_rejects_not_before_with_now(daemon):
+    resp = await send(daemon.socket_path, "add", argv=["echo", "a"], cwd=CWD, now=True, not_before=_in(60))
+    assert resp["ok"] is False and "--now" in resp["error"]
+
+
+@pytest.mark.asyncio
+async def test_not_before_applies_to_every_job_of_a_sweep(daemon):
+    nb = _in(60)
+    resp = await send(daemon.socket_path, "add", jobs=[_spec(["echo", "1"], 1), _spec(["echo", "2"], 2)], cwd=CWD, not_before=nb)
+    for job_id in resp["data"]["ids"]:
+        assert (await send(daemon.socket_path, "show", id=job_id))["data"]["not_before"] == datetime.fromisoformat(nb).astimezone(timezone.utc).isoformat()
+
+
+@pytest.mark.asyncio
+async def test_requeue_does_not_copy_the_start_time(daemon):
+    a = await _add(daemon, ["echo", "a"], not_before=_in(0.3))
+    await wait_for_status(daemon.socket_path, a, {"done"})
+    new_id = (await send(daemon.socket_path, "requeue", id=a))["data"]["id"]
+    assert (await send(daemon.socket_path, "show", id=new_id))["data"]["not_before"] is None
+    assert (await wait_for_status(daemon.socket_path, new_id, {"done"}))["status"] == "done"
+
+
+def test_secs_until_handles_missing_past_future_and_garbage():
+    assert Daemon._secs_until(None) == 0.0 and Daemon._secs_until("") == 0.0
+    assert Daemon._secs_until("not a time") == 0.0
+    assert Daemon._secs_until(_in(-5)) < 0
+    assert 8 < Daemon._secs_until(_in(10)) <= 10
+    naive_future = (datetime.now(timezone.utc) + timedelta(seconds=10)).replace(tzinfo=None).isoformat()
+    assert 8 < Daemon._secs_until(naive_future) <= 10  # a stored naive value is read as UTC

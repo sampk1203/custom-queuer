@@ -2,6 +2,7 @@ import shlex
 import shutil
 from pathlib import Path
 
+import click
 import pytest
 
 import json
@@ -1146,3 +1147,354 @@ def test_before_after_help_says_position_only():
     for name in ("before", "after"):
         assert "position only" in helps[name] and "does not" in helps[name]
     assert "keeps its memory" in helps["now"]
+
+
+# ---------------------------------------------------------------------------
+# B5: interrupted status in clean-logs
+# ---------------------------------------------------------------------------
+
+def test_clean_logs_deletes_old_interrupted_logs_but_not_running_ones(tmp_path, monkeypatch):
+    import os, time
+    from queuer import db
+
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    dbp = tmp_path / "state" / "queuer.db"
+    conn = db.connect(dbp)
+    db.init_db(conn)
+    ids = {}
+    for name in ("interrupted", "running"):
+        job_id = db.enqueue(
+            conn, raw_cmd=["x"], resolved_cmd=["/bin/x"], cwd="/tmp", log_path=str(log_dir / f"{name}.log")
+        )
+        db.mark_running(conn, job_id, pid=1, pgid=1)
+        if name == "interrupted":
+            db.mark_finished(conn, job_id, status="interrupted", note="daemon stopped")
+            conn.execute("UPDATE jobs SET finished_at = '2020-01-01T00:00:00+00:00' WHERE id = ?", (job_id,))
+            conn.commit()
+        ids[name] = job_id
+    conn.close()
+    past = time.time() - 40 * 86400
+    for name, job_id in ids.items():
+        f = log_dir / f"{job_id}.log"
+        f.write_text(name)
+        os.utime(f, (past, past))
+    monkeypatch.setenv("QUEUER_LOG_DIR", str(log_dir))
+    monkeypatch.setenv("QUEUER_DB_PATH", str(dbp))
+    res = CliRunner().invoke(app, ["clean-logs", "--days", "30"])
+    assert res.exit_code == 0, res.output
+    assert not (log_dir / f"{ids['interrupted']}.log").exists()
+    assert (log_dir / f"{ids['running']}.log").exists()
+
+
+# ---------------------------------------------------------------------------
+# F2: --depends-on / --after-any
+# ---------------------------------------------------------------------------
+
+from queuer.cli import _fmt_ids, _parse_job_ids  # noqa: E402
+
+
+def test_parse_job_ids_lists_ranges_and_repeats():
+    assert _parse_job_ids(["12"], "--depends-on") == [12]
+    assert _parse_job_ids(["31-33"], "--depends-on") == [31, 32, 33]
+    assert _parse_job_ids(["5,31-33", "40", "32"], "--depends-on") == [5, 31, 32, 33, 40]
+    assert _parse_job_ids(None, "--depends-on") == []
+
+
+@pytest.mark.parametrize("bad", ["abc", "1,,2", "", "0", "5-3", "1-", "-3", "1-5-9", "1-1001"])
+def test_parse_job_ids_rejects_junk_with_a_clear_message(bad, capsys):
+    import typer
+
+    with pytest.raises(typer.Exit):
+        _parse_job_ids([bad], "--depends-on")
+    assert "--depends-on" in capsys.readouterr().err
+
+
+def test_fmt_ids_collapses_runs():
+    assert _fmt_ids([31, 32, 33, 40]) == "31-33, 40"
+    assert _fmt_ids([5]) == "5" and _fmt_ids([5, 6]) == "5, 6" and _fmt_ids([]) == ""
+
+
+def test_add_sends_dependencies_and_reports_them(monkeypatch):
+    calls = _capture_send(monkeypatch, {"id": 9, "channel": 1})
+    res = runner.invoke(app, ["add", "--depends-on", "31-33", "--depends-on", "40", "--after-any", "35,36", "--", "true"])
+    assert res.exit_code == 0, res.output
+    kw = calls[0][1]
+    assert kw["depends_on"] == [31, 32, 33, 40] and kw["after_any"] == [35, 36]
+    assert "31-33, 40" in res.output and "35, 36" in res.output
+
+
+def test_add_without_dependencies_sends_empty_lists(monkeypatch):
+    calls = _capture_send(monkeypatch, {"id": 9, "channel": 1})
+    assert runner.invoke(app, ["add", "--", "true"]).exit_code == 0
+    assert calls[0][1]["depends_on"] == [] and calls[0][1]["after_any"] == []
+
+
+def test_add_reports_an_immediate_skip(monkeypatch):
+    _capture_send(monkeypatch, {"id": 9, "channel": 1, "skipped": "dependency 4 failed"})
+    res = runner.invoke(app, ["add", "--depends-on", "4", "--", "true"])
+    assert res.exit_code == 0 and "dependency 4 failed" in res.output
+
+
+def test_add_rejects_bad_ids_and_now_with_dependencies_without_calling_the_daemon(monkeypatch):
+    calls = _capture_send(monkeypatch, {"id": 9, "channel": 1})
+    assert runner.invoke(app, ["add", "--depends-on", "x", "--", "true"]).exit_code == 1
+    res = runner.invoke(app, ["add", "--now", "--after-any", "3", "--", "true"])
+    assert res.exit_code == 1 and "--now" in res.output
+    assert calls == []
+
+
+def test_list_shows_waits_on_column_only_when_needed(monkeypatch):
+    waiting = _job(2, depends_on=[1], after_any=[], waiting_on=[1])
+    plain = _job(3, depends_on=[], after_any=[], waiting_on=[])
+    listing = {"channels": {"1": _chan([waiting, plain])}}
+    monkeypatch.setattr(client, "send", lambda cmd, **kw: listing)
+    out = runner.invoke(app, ["list"], env={"COLUMNS": "200"}).output
+    assert "Waits on" in out
+    listing = {"channels": {"1": _chan([plain])}}
+    assert "Waits on" not in runner.invoke(app, ["list"], env={"COLUMNS": "200"}).output
+
+
+def test_show_displays_dependencies(monkeypatch):
+    job = _job(5, depends_on=[1, 2], after_any=[3], waiting_on=[2])
+    monkeypatch.setattr(client, "send", lambda cmd, **kw: job)
+    out = runner.invoke(app, ["show", "5"], env={"COLUMNS": "200"}).output
+    assert "depends on" in out and "after any" in out and "waiting on" in out
+
+
+# ---------------------------------------------------------------------------
+# F3: --each / --array sweeps
+# ---------------------------------------------------------------------------
+
+from queuer.cli import _expand_each  # noqa: E402
+
+
+def test_expand_each_splits_values_up_to_the_next_flag_or_double_dash():
+    assert _expand_each(["--each", "a", "b", "c", "--", "run", "{}"]) == [
+        "--each", "a", "--each", "b", "--each", "c", "--", "run", "{}",
+    ]
+    assert _expand_each(["--each", "1", "--channel", "2", "--each", "x", "--", "r", "{}"]) == [
+        "--each", "1", "--channel", "2", "--each", "x", "--", "r", "{}",
+    ]
+    # the command after `--` is never touched, even if it says --each
+    assert _expand_each(["--", "tool", "--each", "x"]) == ["--", "tool", "--each", "x"]
+    with pytest.raises(click.UsageError):
+        _expand_each(["--each", "--", "c"])
+
+
+def test_add_each_makes_one_job_per_value_in_order(monkeypatch):
+    calls = _capture_send(monkeypatch, {"id": 10, "channel": 1, "ids": [10, 11, 12]})
+    res = runner.invoke(app, ["add", "--each", "a", "b", "c", "--", "echo", "x-{}", "--n={}"])
+    assert res.exit_code == 0, res.output
+    jobs = calls[0][1]["jobs"]
+    assert [j["raw_argv"] for j in jobs] == [["echo", "x-a", "--n=a"], ["echo", "x-b", "--n=b"], ["echo", "x-c", "--n=c"]]
+    assert [j["index"] for j in jobs] == [1, 2, 3]
+    assert "argv" not in calls[0][1]
+    assert "added jobs 10-12" in res.output
+
+
+def test_add_each_quotes_values_only_where_a_shell_will_read_them(monkeypatch):
+    calls = _capture_send(monkeypatch, {"id": 1, "channel": 1, "ids": [1, 2]})
+    res = runner.invoke(app, ["add", "--each", "a b", "x;y", "--", "echo {} | wc -c"])
+    assert res.exit_code == 0, res.output
+    assert [j["raw_argv"] for j in calls[0][1]["jobs"]] == [["echo 'a b' | wc -c"], ["echo 'x;y' | wc -c"]]
+    assert calls[0][1]["jobs"][0]["argv"][:2] == ["bash", "-c"]
+    calls.clear()
+    runner.invoke(app, ["add", "--each", "a b", "--", "echo", "{}"])
+    assert calls[0][1]["jobs"][0]["raw_argv"] == ["echo", "a b"]  # separate words: no quoting needed
+
+
+def test_add_each_without_placeholder_or_values_is_an_error(monkeypatch):
+    calls = _capture_send(monkeypatch, {"id": 1, "channel": 1})
+    res = runner.invoke(app, ["add", "--each", "a", "b", "--", "echo", "hi"])
+    assert res.exit_code == 1 and "{}" in res.output
+    assert runner.invoke(app, ["add", "--each", "--", "echo", "{}"]).exit_code != 0
+    assert calls == []
+
+
+def test_add_array_sets_index_and_keeps_the_command(monkeypatch):
+    calls = _capture_send(monkeypatch, {"id": 5, "channel": 2, "ids": [5, 6, 7]})
+    res = runner.invoke(app, ["add", "--array", "3-5", "--channel", "2", "--depends-on", "1", "--", "echo", "{}"])
+    assert res.exit_code == 0, res.output
+    kw = calls[0][1]
+    assert [j["index"] for j in kw["jobs"]] == [3, 4, 5]
+    assert all(j["raw_argv"] == ["echo", "{}"] for j in kw["jobs"])  # {} is only for --each
+    assert kw["channel"] == 2 and kw["depends_on"] == [1]
+    assert "added jobs 5-7" in res.output
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [["--array", "5"], ["--array", "5-3"], ["--array", "a-b"], ["--array", "1-1001"],
+     ["--array", "1-2", "--each", "x"], ["--each"] + [str(i) for i in range(1001)]],
+)
+def test_add_sweep_errors_are_clear_and_nothing_is_sent(monkeypatch, flags):
+    calls = _capture_send(monkeypatch, {"id": 1, "channel": 1})
+    res = runner.invoke(app, ["add", *flags, "--", "echo", "{}"])
+    assert res.exit_code == 1 and "Error" in res.output
+    assert calls == []
+
+
+def test_add_sweep_of_one_prints_a_plain_job_id(monkeypatch):
+    _capture_send(monkeypatch, {"id": 8, "channel": 1, "ids": [8]})
+    res = runner.invoke(app, ["add", "--array", "4-4", "--", "echo"])
+    assert res.exit_code == 0 and "added jobs 8" in res.output
+
+
+# ---------------------------------------------------------------------------
+# F6: --on-fail
+# ---------------------------------------------------------------------------
+
+def test_add_sends_on_fail_default_and_pause(monkeypatch):
+    calls = _capture_send(monkeypatch, {"id": 9, "channel": 1})
+    assert runner.invoke(app, ["add", "--", "true"]).exit_code == 0
+    assert calls[0][1]["on_fail"] == "continue"
+    res = runner.invoke(app, ["add", "--on-fail", "pause", "--", "true"])
+    assert res.exit_code == 0, res.output
+    assert calls[1][1]["on_fail"] == "pause" and "paused" in res.output
+
+
+def test_add_rejects_an_unknown_on_fail_without_calling_the_daemon(monkeypatch):
+    calls = _capture_send(monkeypatch, {"id": 9, "channel": 1})
+    res = runner.invoke(app, ["add", "--on-fail", "stop", "--", "true"])
+    assert res.exit_code == 1 and "pause" in res.output and "continue" in res.output
+    assert calls == []
+
+
+def test_show_displays_on_fail_only_when_it_is_pause(monkeypatch):
+    monkeypatch.setattr(client, "send", lambda cmd, **kw: _job(5, on_fail="pause"))
+    assert "on fail" in runner.invoke(app, ["show", "5"], env={"COLUMNS": "200"}).output
+    monkeypatch.setattr(client, "send", lambda cmd, **kw: _job(5, on_fail="continue"))
+    assert "on fail" not in runner.invoke(app, ["show", "5"], env={"COLUMNS": "200"}).output
+
+
+# ---------------------------------------------------------------------------
+# F7: --delay / --at
+# ---------------------------------------------------------------------------
+
+from queuer.cli import parse_at, parse_delay  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    "text, secs",
+    [("30s", 30), ("30m", 1800), ("2h", 7200), ("1d", 86400), ("1h30m", 5400), (" 90S ", 90), ("1d2h3m4s", 93784)],
+)
+def test_parse_delay_accepts_units_and_chains(text, secs):
+    assert parse_delay(text) == timedelta(seconds=secs)
+
+
+@pytest.mark.parametrize("text", ["", "30", "m", "1.5h", "-5m", "5 min", "1w", "30m5", "0s", "0m0s"])
+def test_parse_delay_rejects_junk_and_zero(text):
+    with pytest.raises(ValueError):
+        parse_delay(text)
+
+
+def test_parse_delay_rejects_an_absurdly_long_delay():
+    with pytest.raises(ValueError):
+        parse_delay("99999999999999d")
+
+
+def _local_now(*parts):
+    return datetime(*parts).astimezone()
+
+
+def test_parse_at_clock_time_today_when_still_ahead():
+    now = _local_now(2026, 10, 16, 21, 0)
+    assert parse_at("22:00", now) == _local_now(2026, 10, 16, 22, 0)
+    assert parse_at("9:05", _local_now(2026, 10, 16, 8, 0)) == _local_now(2026, 10, 16, 9, 5)
+
+
+def test_parse_at_clock_time_tomorrow_when_passed_or_equal():
+    now = _local_now(2026, 10, 16, 21, 0)
+    assert parse_at("06:30", now) == _local_now(2026, 10, 17, 6, 30)
+    assert parse_at("21:00", now) == _local_now(2026, 10, 17, 21, 0)  # "now" is not the future
+    assert parse_at("08:00", _local_now(2026, 12, 31, 23, 0)) == _local_now(2027, 1, 1, 8, 0)  # year roll
+
+
+def test_parse_at_full_date_time():
+    now = _local_now(2026, 10, 16, 21, 0)
+    assert parse_at("2026-12-01 06:30", now) == _local_now(2026, 12, 1, 6, 30)
+    assert parse_at("2026-12-01T06:30", now) == _local_now(2026, 12, 1, 6, 30)
+
+
+@pytest.mark.parametrize("text", ["", "25:00", "12:60", "noon", "22", "22:00:00 pm", "2026-13-01 10:00", "2026-02-30 10:00", "2026-12-01"])
+def test_parse_at_rejects_junk(text):
+    with pytest.raises(ValueError):
+        parse_at(text, _local_now(2026, 10, 16, 21, 0))
+
+
+def test_parse_at_rejects_a_date_in_the_past():
+    with pytest.raises(ValueError, match="past"):
+        parse_at("2026-10-16 20:59", _local_now(2026, 10, 16, 21, 0))
+
+
+def test_add_delay_sends_an_absolute_utc_not_before(monkeypatch):
+    calls = _capture_send(monkeypatch, {"id": 3, "channel": 1})
+    before = datetime.now(timezone.utc)
+    res = runner.invoke(app, ["add", "--delay", "30m", "--", "true"])
+    after = datetime.now(timezone.utc)
+    assert res.exit_code == 0, res.output
+    sent = datetime.fromisoformat(calls[0][1]["not_before"])
+    assert sent.utcoffset() == timedelta(0)
+    assert before + timedelta(minutes=30) <= sent <= after + timedelta(minutes=30)
+    assert "starts no earlier than" in res.output
+
+
+def test_add_at_sends_not_before_and_none_without_the_flags(monkeypatch):
+    calls = _capture_send(monkeypatch, {"id": 3, "channel": 1})
+    assert runner.invoke(app, ["add", "--", "true"]).exit_code == 0
+    assert calls[0][1]["not_before"] is None and "starts no earlier" not in runner.invoke(app, ["add", "--", "true"]).output
+    res = runner.invoke(app, ["add", "--at", "22:00", "--", "true"])
+    assert res.exit_code == 0, res.output
+    when = datetime.fromisoformat(calls[-1][1]["not_before"]).astimezone()
+    assert (when.hour, when.minute) == (22, 0) and when > datetime.now(timezone.utc)
+    assert when - datetime.now(timezone.utc) <= timedelta(hours=24, minutes=1)
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--delay", "5m", "--at", "22:00"],
+        ["--delay", "soon"],
+        ["--delay", "0m"],
+        ["--at", "25:99"],
+        ["--at", "2001-01-01 10:00"],
+        ["--now", "--delay", "5m"],
+        ["--now", "--at", "22:00"],
+    ],
+)
+def test_add_rejects_bad_delay_flags_without_calling_the_daemon(monkeypatch, extra):
+    calls = _capture_send(monkeypatch, {"id": 3, "channel": 1})
+    res = runner.invoke(app, ["add", *extra, "--", "true"])
+    assert res.exit_code == 1 and calls == []
+
+
+def test_add_delay_applies_to_every_job_of_a_sweep(monkeypatch):
+    calls = _capture_send(monkeypatch, {"id": 3, "channel": 1, "ids": [3, 4]})
+    res = runner.invoke(app, ["add", "--delay", "1h", "--array", "1-2", "--", "echo"])
+    assert res.exit_code == 0, res.output
+    assert calls[0][1]["not_before"] and len(calls[0][1]["jobs"]) == 2
+
+
+def test_list_shows_a_starts_at_column_only_for_future_start_times(monkeypatch):
+    future = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
+    past = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    chan = {"running": None, "frozen": None, "paused": False, "priority_queue": [], "backlog": [],
+            "queue": [_job(1, not_before=future), _job(2)]}
+    monkeypatch.setattr(client, "send", lambda cmd, **kw: {"channels": {"1": chan}})
+    out = runner.invoke(app, ["list"], env={"COLUMNS": "200"}).output
+    assert "Starts at" in out
+    chan["queue"] = [_job(1, not_before=past), _job(2)]
+    out = runner.invoke(app, ["list"], env={"COLUMNS": "200"}).output
+    assert "Starts at" not in out
+
+
+def test_show_displays_not_before(monkeypatch):
+    future = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
+    monkeypatch.setattr(client, "send", lambda cmd, **kw: _job(5, not_before=future))
+    out = runner.invoke(app, ["show", "5"], env={"COLUMNS": "200"}).output
+    assert "not before" in out and "still waiting" in out
+    monkeypatch.setattr(client, "send", lambda cmd, **kw: _job(5, status="done", not_before=future))
+    assert "still waiting" not in runner.invoke(app, ["show", "5"], env={"COLUMNS": "200"}).output
+    monkeypatch.setattr(client, "send", lambda cmd, **kw: _job(5))
+    assert "not before" not in runner.invoke(app, ["show", "5"], env={"COLUMNS": "200"}).output
