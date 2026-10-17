@@ -15,6 +15,11 @@ TOKEN = "123456789:AAH-test_token-0123456789abcdefghijk"
 CFG = {"qur_id": "a3f9", "token": TOKEN, "chat_ids": [111, 222]}
 
 
+@pytest.fixture(autouse=True)
+def _fresh_load_cache(monkeypatch):
+    monkeypatch.setattr(notify, "_load_cache", None)
+
+
 # ---------------------------------------------------------------------------
 # config file
 # ---------------------------------------------------------------------------
@@ -55,6 +60,36 @@ def test_load_missing_returns_none(tmp_path):
 def test_load_rejects_bad_files(tmp_path, bad):
     path = tmp_path / "notify.json"
     path.write_text(bad)
+    assert notify.load(path) is None
+
+
+def test_load_reloads_when_the_file_changes(tmp_path):
+    """5.todo item 8: load() caches the parsed config by (path, mtime, size, inode),
+    like redact.extra_patterns -- it must still pick up a changed file, not just
+    the first parse."""
+    path = tmp_path / "notify.json"
+    notify.save(CFG, path)
+    assert notify.load(path) == {"qur_id": "a3f9", "bots": [{"token": TOKEN, "chat_ids": [111, 222]}]}
+    notify.save({"qur_id": "a3f9", "token": TOKEN, "chat_ids": [333]}, path)
+    assert notify.load(path) == {"qur_id": "a3f9", "bots": [{"token": TOKEN, "chat_ids": [333]}]}
+
+
+def test_load_does_not_reparse_an_unchanged_file(tmp_path, monkeypatch):
+    path = tmp_path / "notify.json"
+    notify.save(CFG, path)
+    assert notify.load(path) is not None
+    calls = []
+    monkeypatch.setattr(notify.json, "loads", lambda s: calls.append(1) or json.loads(s))
+    for _ in range(5):
+        notify.load(path)
+    assert calls == []  # the cached result was returned every time, no re-parse
+
+
+def test_load_of_a_deleted_file_is_not_served_from_the_cache(tmp_path):
+    path = tmp_path / "notify.json"
+    notify.save(CFG, path)
+    assert notify.load(path) is not None
+    path.unlink()
     assert notify.load(path) is None
 
 

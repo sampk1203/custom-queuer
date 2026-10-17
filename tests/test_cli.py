@@ -1288,10 +1288,35 @@ def test_add_each_makes_one_job_per_value_in_order(monkeypatch):
     res = runner.invoke(app, ["add", "--each", "a", "b", "c", "--", "echo", "x-{}", "--n={}"])
     assert res.exit_code == 0, res.output
     jobs = calls[0][1]["jobs"]
-    assert [j["raw_argv"] for j in jobs] == [["echo", "x-a", "--n=a"], ["echo", "x-b", "--n=b"], ["echo", "x-c", "--n=c"]]
+    assert [j.get("raw_argv", j["argv"]) for j in jobs] == [
+        ["echo", "x-a", "--n=a"], ["echo", "x-b", "--n=b"], ["echo", "x-c", "--n=c"],
+    ]
     assert [j["index"] for j in jobs] == [1, 2, 3]
     assert "argv" not in calls[0][1]
     assert "added jobs 10-12" in res.output
+
+
+def test_add_array_request_size_does_not_grow_with_the_range(monkeypatch):
+    small = _capture_send(monkeypatch, {"id": 1, "channel": 1, "ids": [1, 2]})
+    runner.invoke(app, ["add", "--array", "1-2", "--", "echo", "{}"])
+    small_req = json.dumps(small[0][1])
+    small.clear()
+    runner.invoke(app, ["add", "--array", "1-1000", "--", "echo", "{}"])
+    assert small[0][1]["array"] == [1, 1000]
+    assert len(json.dumps(small[0][1])) - len(small_req) < 10  # only the range digits differ
+
+
+def test_add_each_leaves_out_raw_argv_when_it_equals_argv(monkeypatch):
+    calls = _capture_send(monkeypatch, {"id": 1, "channel": 1, "ids": [1, 2]})
+    # no interpreter pinning, so argv is exactly the typed words (the real one may rewrite the command)
+    monkeypatch.setattr(cli_mod, "_resolve_interpreter", lambda argv: argv)
+    runner.invoke(app, ["add", "--each", "a", "b", "--", "echo", "{}"])
+    jobs = calls[0][1]["jobs"]
+    assert all("raw_argv" not in j for j in jobs) and [j["argv"][-1] for j in jobs] == ["a", "b"]
+    calls.clear()
+    monkeypatch.setattr(cli_mod, "_resolve_interpreter", lambda argv: ["pinned", *argv])
+    runner.invoke(app, ["add", "--each", "a", "--", "echo", "{}"])  # argv differs from the typed words: raw_argv is sent
+    assert calls[0][1]["jobs"][0]["raw_argv"] == ["echo", "a"] and calls[0][1]["jobs"][0]["argv"] == ["pinned", "echo", "a"]
 
 
 def test_add_each_quotes_values_only_where_a_shell_will_read_them(monkeypatch):
@@ -1302,7 +1327,8 @@ def test_add_each_quotes_values_only_where_a_shell_will_read_them(monkeypatch):
     assert calls[0][1]["jobs"][0]["argv"][:2] == ["bash", "-c"]
     calls.clear()
     runner.invoke(app, ["add", "--each", "a b", "--", "echo", "{}"])
-    assert calls[0][1]["jobs"][0]["raw_argv"] == ["echo", "a b"]  # separate words: no quoting needed
+    job = calls[0][1]["jobs"][0]
+    assert job.get("raw_argv", job["argv"]) == ["echo", "a b"]  # separate words: no quoting needed
 
 
 def test_add_each_without_placeholder_or_values_is_an_error(monkeypatch):
@@ -1318,8 +1344,10 @@ def test_add_array_sets_index_and_keeps_the_command(monkeypatch):
     res = runner.invoke(app, ["add", "--array", "3-5", "--channel", "2", "--depends-on", "1", "--", "echo", "{}"])
     assert res.exit_code == 0, res.output
     kw = calls[0][1]
-    assert [j["index"] for j in kw["jobs"]] == [3, 4, 5]
-    assert all(j["raw_argv"] == ["echo", "{}"] for j in kw["jobs"])  # {} is only for --each
+    # the command is sent ONCE with the range; the daemon makes one job per number (5.todo item 12)
+    assert kw["array"] == [3, 5] and "jobs" not in kw
+    assert kw["raw_argv"] == ["echo", "{}"] or "raw_argv" not in kw  # {} is only for --each: never substituted
+    assert kw["argv"][-1] == "{}"
     assert kw["channel"] == 2 and kw["depends_on"] == [1]
     assert "added jobs 5-7" in res.output
 
@@ -1474,7 +1502,7 @@ def test_add_delay_applies_to_every_job_of_a_sweep(monkeypatch):
     calls = _capture_send(monkeypatch, {"id": 3, "channel": 1, "ids": [3, 4]})
     res = runner.invoke(app, ["add", "--delay", "1h", "--array", "1-2", "--", "echo"])
     assert res.exit_code == 0, res.output
-    assert calls[0][1]["not_before"] and len(calls[0][1]["jobs"]) == 2
+    assert calls[0][1]["not_before"] and calls[0][1]["array"] == [1, 2]
 
 
 def test_list_shows_a_starts_at_column_only_for_future_start_times(monkeypatch):
@@ -1511,7 +1539,11 @@ def clean_env(monkeypatch):
     import os
 
     for name in list(os.environ):
-        if name.startswith(("LC_", "QUEUER_ENV")) or name in (
+        # 5.todo M4: the default passthrough now matches whole families (CUDA_*, OMP_*, CONDA_*, ...),
+        # so a conda or CUDA shell must not leak into these tests either
+        if name.startswith((
+            "LC_", "QUEUER_ENV", "CUDA_", "OMP_", "MKL_", "OPENBLAS_", "NCCL_", "OMPI_", "UCX_", "CONDA_",
+        )) or name in (
             "CUDA_VISIBLE_DEVICES", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
             "LD_LIBRARY_PATH", "LANG", "TERM", "TZ",
         ):
@@ -1781,15 +1813,18 @@ def _ended(job_id, status="done", exit_code=0, **kw):
 
 
 class _WaitEnv:
-    """Scripted daemon for `qur wait`: `jobs[id]` is a list of replies to successive `show`
-    calls (the last one repeats; None = the job does not exist (any more)); `lists` are
-    successive `list` replies. Time is fake: each sleep advances the clock."""
+    """Scripted daemon for `qur wait`: `jobs[id]` is a list of replies, one per time that job is
+    asked about (by `show`, or inside a batch `states` request; the last one repeats; None = the
+    job does not exist (any more)); `lists` are
+    successive `channel_status` replies (see `_chan_status`), for `wait --channel`. Time
+    is fake: each sleep advances the clock."""
 
     def __init__(self, monkeypatch, jobs=None, lists=None):
         self.jobs = {k: list(v) for k, v in (jobs or {}).items()}
         self.lists = list(lists or [])
         self.sleeps = []
         self.shows = []
+        self.states_calls = []
         self.now = 1000.0
         self.down = False
         monkeypatch.setattr(client, "send", self._send)
@@ -1811,13 +1846,27 @@ class _WaitEnv:
             if item is None:
                 raise client.DaemonError(f"job {kw['id']} does not exist")
             return item
-        if cmd == "list":
+        if cmd == "states":
+            self.states_calls.append(list(kw["ids"]))
+            found, missing = [], []
+            for job_id in kw["ids"]:
+                self.shows.append(job_id)
+                seq = self.jobs.get(job_id)
+                item = None if seq is None else (seq.pop(0) if len(seq) > 1 else seq[0])
+                if item is None:
+                    missing.append(job_id)
+                else:
+                    found.append(item)
+            return {"jobs": found, "missing": missing}
+        if cmd == "channel_status":
             return self.lists.pop(0) if len(self.lists) > 1 else self.lists[0]
         raise AssertionError(cmd)
 
 
-def _idle_chan(**kw):
-    return {**_chan(), **kw}
+def _chan_status(channel=1, running=0, frozen=0, queued=0, priority_queued=0, paused=False):
+    """A `channel_status` reply, as `wait --channel` now polls instead of the full `list`."""
+    return {"channel": channel, "paused": paused, "running": running, "frozen": frozen,
+            "queued": queued, "priority_queued": priority_queued}
 
 
 def test_wait_done_exits_0_and_says_so(monkeypatch):
@@ -1968,6 +2017,27 @@ def test_wait_follows_an_auto_retry_to_the_last_attempt(monkeypatch):
     assert data["jobs"][0]["id"] == 5 and 9 in env.shows
 
 
+def test_wait_polls_every_job_with_one_states_request(monkeypatch):
+    env = _WaitEnv(monkeypatch, {
+        1: [_ended(1)],
+        2: [_job(2, status="running"), _ended(2)],
+        3: [_job(3, status="queued"), _job(3, status="queued"), _ended(3)],
+    })
+    res = runner.invoke(app, ["wait", "1-3"])
+    assert res.exit_code == 0
+    # one request per poll, asking only about the jobs that have not finished yet
+    assert env.states_calls == [[1, 2, 3], [2, 3], [3]]
+
+
+def test_wait_asks_about_a_retry_in_a_second_request_in_the_same_poll(monkeypatch):
+    failed = _ended(5, status="failed", exit_code=1, max_retries=1, attempt=0, note="auto-retry 1/1 queued as job 9")
+    env = _WaitEnv(monkeypatch, {5: [failed], 6: [_job(6, status="running"), _ended(6)], 9: [_ended(9)]})
+    res = runner.invoke(app, ["wait", "5", "6"])
+    assert res.exit_code == 0
+    assert env.states_calls == [[5, 6], [9], [6]]  # the retry (9) at once; only 6 is polled again after the sleep
+    assert len(env.sleeps) == 1
+
+
 def test_wait_reports_a_failure_when_the_retries_are_used_up(monkeypatch):
     last = _ended(9, status="failed", exit_code=1, max_retries=1, attempt=1, note="final")
     _WaitEnv(monkeypatch, {5: [_ended(5, status="failed", exit_code=1, max_retries=1, attempt=0,
@@ -1977,36 +2047,36 @@ def test_wait_reports_a_failure_when_the_retries_are_used_up(monkeypatch):
 
 
 def test_wait_channel_until_idle(monkeypatch):
-    busy = {"channels": {"2": _idle_chan(running=_job(1, channel=2, status="running"))}}
-    queued = {"channels": {"2": _idle_chan(queue=[_job(2, channel=2)])}}
-    idle = {"channels": {"2": _idle_chan()}}
+    busy = _chan_status(channel=2, running=1)
+    queued = _chan_status(channel=2, queued=1)
+    idle = _chan_status(channel=2)
     env = _WaitEnv(monkeypatch, lists=[busy, queued, idle])
     res = runner.invoke(app, ["wait", "--channel", "2"])
     assert res.exit_code == 0 and "channel 2: idle" in res.output and len(env.sleeps) == 2
 
 
 def test_wait_channel_other_channels_do_not_matter_and_unknown_channel_is_idle(monkeypatch):
-    data = {"channels": {"1": _idle_chan(running=_job(1, status="running")), "2": _idle_chan()}}
-    env = _WaitEnv(monkeypatch, lists=[data])
+    # the daemon is only ever asked about the one channel given, so its reply is idle either way
+    env = _WaitEnv(monkeypatch, lists=[_chan_status(channel=2)])
     assert runner.invoke(app, ["wait", "--channel", "2"]).exit_code == 0
     assert runner.invoke(app, ["wait", "--channel", "7"]).exit_code == 0
     assert env.sleeps == []
 
 
 def test_wait_channel_timeout_and_json(monkeypatch):
-    busy = {"channels": {"1": _idle_chan(running=_job(1, status="running"))}}
+    busy = _chan_status(channel=1, running=1)
     _WaitEnv(monkeypatch, lists=[busy])
     res = runner.invoke(app, ["wait", "--channel", "1", "--timeout", "3s", "--json"])
     assert res.exit_code == 124
     assert json.loads(res.stdout) == {"channel": 1, "idle": False, "timed_out": True, "exit_code": 124}
-    idle = {"channels": {"1": _idle_chan()}}
+    idle = _chan_status(channel=1)
     _WaitEnv(monkeypatch, lists=[idle])
     res = runner.invoke(app, ["wait", "--channel", "1", "--json"])
     assert res.exit_code == 0 and json.loads(res.stdout)["idle"] is True
 
 
 def test_wait_channel_paused_with_queued_jobs_hints_once(monkeypatch):
-    paused = {"channels": {"1": _idle_chan(queue=[_job(1)], paused=True)}}
+    paused = _chan_status(channel=1, queued=1, paused=True)
     _WaitEnv(monkeypatch, lists=[paused])
     res = runner.invoke(app, ["wait", "--channel", "1", "--timeout", "5s"])
     assert res.exit_code == 124 and res.stderr.count("is paused") == 1
@@ -2186,7 +2256,7 @@ def test_add_dry_run_sweep_lists_the_first_jobs_and_the_position_range(monkeypat
     calls = _capture_send(monkeypatch, _dry_reply(jobs=jobs, queued_before=0, running_id=None))
     res = runner.invoke(app, ["add", "--dry-run", "--array", "1-8", "--", "echo", "x"], env={"COLUMNS": "200"})
     assert res.exit_code == 0, res.output
-    assert len(calls[0][1]["jobs"]) == 8 and calls[0][1]["dry_run"] is True
+    assert calls[0][1]["array"] == [1, 8] and calls[0][1]["dry_run"] is True
     out = res.output
     assert "would add 8 jobs on channel 1" in out and "queue positions: 1-8 (0 queued ahead; the channel is idle)" in out
     assert "QUR_INDEX=1: raw command: echo 1" in out and "QUR_INDEX=5:" in out and "QUR_INDEX=6:" not in out
@@ -2739,6 +2809,27 @@ def test_history_csv_quotes_commas_and_neutralises_formulas(monkeypatch):
     assert parsed[1][11] == "'=HYPERLINK(1)"  # a leading = would run as a formula in a spreadsheet
 
 
+def test_history_csv_keeps_negative_exit_codes_numeric(monkeypatch):
+    """L1: -9 / -15 (killed by a signal) must not get the formula apostrophe; text columns still do."""
+    import csv as csv_mod
+    import io
+
+    rows = [_job(1, status="failed", exit_code=-9, finished_at="2026-10-14T10:00:00+00:00",
+                 raw_cmd=json.dumps(["-rf"]), cwd="@home", note="+1 retry")]
+    _capture_send(monkeypatch, {"jobs": rows})
+    parsed = list(csv_mod.reader(io.StringIO(runner.invoke(app, ["history", "--csv"]).output)))
+    assert parsed[1][10] == "-9"
+    assert parsed[1][3] == "'-rf" and parsed[1][4] == "'@home" and parsed[1][11] == "'+1 retry"
+
+
+def test_csv_cell_guard_can_be_switched_off_for_numbers():
+    from queuer import cli
+
+    assert cli._csv_cell(-15, guard=False) == "-15"
+    assert cli._csv_cell("-15") == "'-15"
+    assert cli._csv_cell(None, guard=False) == ""
+
+
 def test_history_csv_full_uses_resolved_commands_and_sends_filters(monkeypatch):
     calls = _capture_send(monkeypatch, {"jobs": _history_rows()})
     res = runner.invoke(app, ["history", "--csv", "--full", "--status", "done", "--channel", "1"])
@@ -3010,3 +3101,53 @@ def test_edit_sends_the_stop_settings_and_an_empty_string_clears_them(monkeypatc
     assert _requests(calls)[0] == {"id": 5, "stop_signal": "SIGUSR1", "stop_grace": 45}
     assert runner.invoke(app, ["edit", "5", "--stop-signal", "", "--stop-grace", ""]).exit_code == 0
     assert _requests(calls)[1] == {"id": 5, "stop_signal": None, "stop_grace": None}
+
+
+# ---------------------------------------------------------------------------
+# 5.todo L6 (qur logs asks the daemon where the log is) and L8 (clean-logs --days >= 0)
+# ---------------------------------------------------------------------------
+
+
+def test_logs_uses_the_path_the_daemon_reports(tmp_path, monkeypatch):
+    shell_dir, daemon_dir = tmp_path / "shell-logs", tmp_path / "daemon-logs"
+    shell_dir.mkdir()
+    daemon_dir.mkdir()
+    (daemon_dir / "4.log").write_text("from the daemon's folder\n")
+    monkeypatch.setenv("QUEUER_LOG_DIR", str(shell_dir))
+    calls = _capture_send(monkeypatch, _job(4, log_path=str(daemon_dir / "4.log")))
+    res = CliRunner().invoke(app, ["logs", "4"])
+    assert res.exit_code == 0, res.output
+    assert res.output == "from the daemon's folder\n" and calls == [("show", {"id": 4})]
+
+
+@pytest.mark.parametrize("stored", ["pending", "relative/4.log", "/somewhere/else.log", "/x/5.log", None, 7])
+def test_logs_ignores_a_stored_path_that_is_not_an_id_log(tmp_path, monkeypatch, stored):
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "4.log").write_text("default folder\n")
+    monkeypatch.setenv("QUEUER_LOG_DIR", str(log_dir))
+    _capture_send(monkeypatch, _job(4, log_path=stored))
+    res = CliRunner().invoke(app, ["logs", "4"])
+    assert res.exit_code == 0 and res.output == "default folder\n"
+
+
+@pytest.mark.parametrize("exc", [client.DaemonNotRunning("down"), client.DaemonError("job 4 does not exist")])
+def test_logs_falls_back_to_the_default_folder_without_the_daemon(tmp_path, monkeypatch, exc):
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "4.log").write_text("default folder\n")
+    monkeypatch.setenv("QUEUER_LOG_DIR", str(log_dir))
+
+    def fake(cmd, **kw):
+        raise exc
+
+    monkeypatch.setattr(client, "send", fake)
+    res = CliRunner().invoke(app, ["logs", "4"])
+    assert res.exit_code == 0 and res.output == "default folder\n"
+
+
+def test_clean_logs_refuses_negative_days(tmp_path, monkeypatch):
+    monkeypatch.setenv("QUEUER_LOG_DIR", str(tmp_path / "logs"))
+    res = CliRunner().invoke(app, ["clean-logs", "--days", "-1"])
+    assert res.exit_code != 0 and "-1" in res.output
+    assert not (tmp_path / "logs").exists()

@@ -161,23 +161,46 @@ def warn_once(msg: str) -> None:
         print(f"[queuer] {msg}", file=sys.stderr)
 
 
+_load_cache: tuple[tuple[str, int, int, int], dict[str, Any] | None] | None = None
+
+
 def load(path: Path | None = None) -> dict[str, Any] | None:
     """The saved config (canonical layout), or None if missing, unreadable
     or incomplete. A file that exists but cannot be used is reported once on stderr
-    (never its content: it holds the bot token)."""
+    (never its content: it holds the bot token). 5.todo item 8: re-parsed only when
+    the file's mtime/size/inode change (same technique as `redact.extra_patterns`) --
+    the daemon's Telegram supervisor and its per-bot pollers call this every few
+    seconds, and a `stat` is far cheaper than a `read_text` + `json.loads` of the
+    same unchanged file."""
+    global _load_cache
     path = path or default_path()
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        _load_cache = None
+        return None
+    except OSError as e:
+        warn_once(f"cannot use {path}: {type(e).__name__}; treating Telegram as not configured")
+        _load_cache = None
+        return None
+    key = (str(path), st.st_mtime_ns, st.st_size, st.st_ino)
+    if _load_cache is not None and _load_cache[0] == key:
+        return _load_cache[1]
     try:
         raw = json.loads(path.read_text())
     except FileNotFoundError:
+        _load_cache = None
         return None
     except (OSError, ValueError) as e:
         # a malformed file raises json.JSONDecodeError, a ValueError subclass: name the family
         kind = "ValueError" if isinstance(e, ValueError) else type(e).__name__
         warn_once(f"cannot use {path}: {kind}; treating Telegram as not configured")
+        _load_cache = (key, None)
         return None
     cfg = normalize(raw)
     if cfg is None:
         warn_once(f"{path} is incomplete or invalid; treating Telegram as not configured")
+    _load_cache = (key, cfg)
     return cfg
 
 

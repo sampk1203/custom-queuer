@@ -86,3 +86,67 @@ def test_unit_template_and_doctor_check_the_same_settings():
         "WantedBy=default.target",
     }
     assert _unit_template_lines() == expected
+
+
+# --- 5.todo M3: OOMPolicy=continue -------------------------------------------------------
+
+
+def test_unit_sets_oom_policy_continue_outside_the_hardening_block():
+    """One OOM-killed job must not stop the whole service, whatever QUEUER_HARDEN says."""
+    text = _text()
+    hardening = text.split("<< 'EOT'\n", 1)[1].split("\nEOT", 1)[0]
+    unit = text.split('cat > "$SERVICE_FILE" << EOF\n', 1)[1].split("\nEOF", 1)[0]
+    assert "OOMPolicy=continue" in unit
+    assert "OOMPolicy" not in hardening  # level `none` writes it too
+    assert selfcheck.UNIT_SETTINGS["OOMPolicy"] == "continue"
+
+
+def test_unit_heredoc_comments_cannot_expand():
+    """The unit heredoc is unquoted: a stray $ or backtick in a comment would be expanded."""
+    unit = _text().split('cat > "$SERVICE_FILE" << EOF\n', 1)[1].split("\nEOF", 1)[0]
+    for line in unit.splitlines():
+        if line.startswith("#"):
+            assert "`" not in line and "$" not in line
+
+
+# --- 5.todo M2: never kill a running job without asking ---------------------------------
+
+
+def test_install_asks_before_stopping_the_daemon():
+    text = _text()
+    ask_at = text.index('confirm_stop_jobs "Re-installing"')
+    stop_at = text.index("systemctl --user stop queuerd")
+    assert ask_at < stop_at
+    assert text.index("uv run pytest -v") < ask_at  # after the tests, before the service is touched
+
+
+def test_uninstall_asks_before_stopping_the_daemon():
+    text = _text()
+    ask_at = text.index('confirm_stop_jobs "Uninstalling"')
+    assert text.index('ask "Proceed? [y/N] "') < ask_at < text.index("systemctl --user disable --now queuerd")
+
+
+def test_running_jobs_come_from_the_daemon_and_the_default_answer_is_no():
+    text = _text()
+    assert 'status --json' in text
+    body = text.split("confirm_stop_jobs() {", 1)[1].split("\n}\n", 1)[0]
+    assert 'ask "Kill them and continue? [y/N] "' in body
+    assert 'ASSUME_YES" = "yes"' in body  # --yes skips the question
+    # anything but y / yes cancels with a non-zero exit (so a script with no terminal never kills a job)
+    assert "y|Y|yes|YES) ;;" in body and "exit 1" in body
+
+
+def test_no_blanket_pkill_of_every_queuerd():
+    """`pkill -x queuerd` also took out a dev copy; a process the service does not manage is
+    now listed and stopped only after its own yes (or --yes)."""
+    text = _text()
+    code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+    assert "pkill" not in code
+    body = text.split("stop_stray_queuerd() {", 1)[1].split("\n}\n", 1)[0]
+    assert 'ask "Stop it? [y/N] "' in body and 'ASSUME_YES" != yes' in body
+
+
+def test_usage_lines_agree_and_yes_is_documented_for_install():
+    text = _text()
+    assert text.count("Usage: $0 [install|uninstall] [--skip-tests] [--yes]") == 2
+    assert "./install.sh install --yes" in text  # in the header comment

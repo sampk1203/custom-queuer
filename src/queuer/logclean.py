@@ -41,6 +41,10 @@ def plan(
     cutoff = now - max_age_days * 86400 if max_age_days is not None else None
     sizes: dict[Path, int] = {}
     deletable: list[tuple[float, Path]] = []  # (age timestamp, file)
+    # one query for every job's status/finished_at, instead of one db.get_job per log file
+    jobs: dict[int, sqlite3.Row] = {
+        row["id"]: row for row in conn.execute("SELECT id, status, finished_at FROM jobs").fetchall()
+    }
     for log_file in log_dir.glob("*.log"):
         try:
             job_id = int(log_file.stem)
@@ -48,7 +52,7 @@ def plan(
         except (ValueError, OSError):
             continue  # not a job log (or gone meanwhile): leave it alone
         sizes[log_file] = st.st_size
-        job = db.get_job(conn, job_id)
+        job = jobs.get(job_id)
         if job is None:
             deletable.append((st.st_mtime, log_file))
         elif job["status"] in db.TERMINAL_STATUSES and job["finished_at"]:

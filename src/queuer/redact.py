@@ -7,7 +7,9 @@ is never redacted: you see your own data.
 Built-in patterns (all replaced by `***`):
 
   * `NAME=VALUE` where NAME ends in key/token/secret/password/passwd/passphrase, or has a
-    segment that is secret/password/passwd/passphrase (`SECRET_KEY_BASE`, `db.password`).
+    whole segment (split on `_ . -`) that is secret/password/passwd/passphrase/pass/pwd/
+    cred(s)/credential(s)/auth/cookie(s)/session (`SECRET_KEY_BASE`, `db.password`,
+    `MYSQL_PWD`, `DB_PASS`, `AWS_CREDENTIALS`, `API_AUTH`, `SESSION_COOKIE`).
     Deliberately NOT "contains": `--tokenizer=gpt2`, `max_tokens=100`, `token_count=5`
     and `keyboard=us` are normal and stay readable.
   * `--password=VAL`, `--password VAL`, `--api-key VAL`, `--access-token=VAL` (same name rule)
@@ -48,7 +50,8 @@ _NAME_CHARS = r"[A-Za-z0-9_.-]"
 # a name that looks like it holds a secret (matched case-insensitively)
 _NAME_CORE = (
     r"(?:" + _NAME_CHARS + r"*(?:key|token|secret|passw(?:or)?d|passphrase)"
-    r"|(?:[A-Za-z0-9]+[_.-])*(?:secret|passw(?:or)?d|passphrase)(?:[_.-][A-Za-z0-9]+)*)"
+    r"|(?:[A-Za-z0-9]+[_.-])*(?:secret|passw(?:or)?d|passphrase"
+    r"|pass|pwd|creds?|credentials?|auth|cookies?|session)(?:[_.-][A-Za-z0-9]+)*)"
     r"(?![A-Za-z0-9_.-])"
 )
 # a quoted value, or an unquoted one up to whitespace / a quote / a shell separator (`;&|<>`)

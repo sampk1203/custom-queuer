@@ -233,3 +233,27 @@ def test_only_the_first_100_patterns_are_used(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("QUEUER_REDACT_PATH", str(p))
     assert len(redact.extra_patterns()) == redact.MAX_EXTRA_PATTERNS
     assert "first 100 patterns" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("MYSQL_PWD=hunter2 mysql", f"MYSQL_PWD={M} mysql"),
+    ("DB_PASS=abc run", f"DB_PASS={M} run"),
+    ("AWS_CREDENTIALS=/home/a/creds", f"AWS_CREDENTIALS={M}"),
+    ("API_AUTH=xyz", f"API_AUTH={M}"),
+    ("SESSION_COOKIE=abc123", f"SESSION_COOKIE={M}"),
+    ("db.creds=abc", f"db.creds={M}"),
+    ("run --pwd hunter2 --lr 1", f"run --pwd {M} --lr 1"),
+    ("run --auth=abc", f"run --auth={M}"),
+])
+def test_whole_segment_secret_names_are_masked(text, expected):
+    """5.todo M6"""
+    assert redact.redact_text(text) == expected
+
+
+@pytest.mark.parametrize("text", [
+    "QUR_ENV_PASSTHROUGH=CUDA_VISIBLE_DEVICES", "QUEUER_ENV_PASSTHROUGH=A,B", "author=me", "AUTHORITY=x",
+    "compass=north", "passenger=3", "PWDX=1", "sessions_per_gpu=2 x", "--passthrough=1",
+])
+def test_look_alike_names_are_not_masked(text):
+    assert redact.redact_text(text) == text
+

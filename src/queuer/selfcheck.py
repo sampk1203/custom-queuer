@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import pwd
+import re
 import shutil
 import sqlite3
 import stat
@@ -27,26 +28,31 @@ from pathlib import Path
 from typing import Any
 
 from queuer import client, db, notify, redact
-from queuer.daemon import (
+from queuer.paths import (
+    FAIL,
+    OK,
+    UNIT_NAME,
+    WARN,
     _default_db_path,
     _default_log_dir,
     _default_socket_path,
     _fallback_socket_dir,
 )
 
-OK = "OK"
-WARN = "WARN"
-FAIL = "FAIL"
-
-UNIT_NAME = "queuerd"
 DISK_FAIL_BYTES = 100 * 1024 * 1024  # less than this free where the logs go: FAIL
 DISK_WARN_BYTES = 1024 * 1024 * 1024  # less than this: WARN
 SUBPROCESS_TIMEOUT_SECS = 10
 LINGER_DIR = Path("/var/lib/systemd/linger")
+MOUNTINFO = Path("/proc/self/mountinfo")
+
+# 5.todo M8: SQLite WAL needs working shared memory and file locks. These filesystems are the
+# network / cluster ones where that is not guaranteed (a home directory on a cluster is the usual case).
+NETWORK_FS_TYPES = frozenset({"nfs", "nfs4", "cifs", "smb3", "smbfs", "afs", "9p", "ncpfs", "lustre", "gpfs", "beegfs", "ceph", "glusterfs", "orangefs", "panfs"})
 
 # What install.sh writes into the unit (F36). Keep these in step with `write_unit` and
 # `hardening_lines` there; tests/test_install_sh.py fails when they drift apart.
-UNIT_SETTINGS = {"Type": "simple", "Restart": "on-failure", "RestartSec": "2", "TimeoutStopSec": "30"}
+# OOMPolicy=continue (5.todo M3): one OOM-killed job must not make systemd stop the whole unit.
+UNIT_SETTINGS = {"Type": "simple", "Restart": "on-failure", "RestartSec": "2", "TimeoutStopSec": "30", "OOMPolicy": "continue"}
 HARDENING_SETTINGS = {
     "UMask": "0077",
     "NoNewPrivileges": "yes",
@@ -82,6 +88,14 @@ def _run(argv: list[str]) -> tuple[int, str] | None:
     except (OSError, subprocess.TimeoutExpired):
         return None
     return res.returncode, (res.stdout or "").strip()
+
+
+def _read_mountinfo() -> str | None:
+    """Text of /proc/self/mountinfo, or None when it cannot be read (not Linux, no /proc)."""
+    try:
+        return MOUNTINFO.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
 
 
 def _writable(path: Path) -> bool:
@@ -235,6 +249,60 @@ def check_logs(fix: bool) -> list[Check]:
     else:
         out.append(Check("disk space", OK, text))
     return out
+
+
+def _unescape_mount_field(field: str) -> str:
+    """mountinfo writes space, tab, newline and backslash in a path as \\NNN (octal)."""
+    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), field)
+
+
+def _mount_for(path: str, mountinfo: str) -> tuple[str, str] | None:
+    """(mount point, filesystem type) of the mount that holds `path` (an absolute, resolved
+    path): the longest mount point that is a prefix of it, the later line when mounts are
+    stacked on the same point. None when no line parses."""
+    best: tuple[str, str] | None = None
+    for line in mountinfo.splitlines():
+        parts = line.split()
+        try:
+            sep = parts.index("-", 6)  # fields 7+ are optional tags, then "-", fstype, source, options
+            mount_point = _unescape_mount_field(parts[4])
+            fs_type = parts[sep + 1]
+        except (ValueError, IndexError):
+            continue
+        prefix = mount_point.rstrip("/")
+        if path != mount_point and not path.startswith(prefix + "/"):
+            continue
+        if best is None or len(mount_point) >= len(best[0]):
+            best = (mount_point, fs_type)
+    return best
+
+
+def _is_risky_fs(fs_type: str) -> bool:
+    """Network / cluster filesystems and FUSE mounts (not `fuseblk`, a local block device)."""
+    return fs_type in NETWORK_FS_TYPES or fs_type == "fuse" or fs_type.startswith("fuse.")
+
+
+def check_db_filesystem() -> Check:
+    """5.todo M8: the database runs in WAL mode, which is unsafe on NFS/CIFS and some FUSE
+    mounts (cluster home directories). Read only: looks at /proc/self/mountinfo, opens nothing."""
+    name = "db filesystem"
+    db_dir = _default_db_path().parent
+    where = _nearest_existing(db_dir).resolve()  # the folder may not exist yet; symlinks resolved
+    text = _read_mountinfo()
+    if text is None:
+        return Check(name, WARN, f"cannot read {MOUNTINFO}, so the filesystem of {db_dir} is unknown", "run `findmnt -T <db folder>`; it should not be nfs, cifs or fuse")
+    found = _mount_for(str(where), text)
+    if found is None:
+        return Check(name, WARN, f"cannot find the mount that holds {db_dir}", "run `findmnt -T <db folder>`; it should not be nfs, cifs or fuse")
+    mount_point, fs_type = found
+    if _is_risky_fs(fs_type):
+        return Check(
+            name,
+            WARN,
+            f"{db_dir} is on {fs_type} (mounted at {mount_point}); SQLite WAL needs working shared memory and file locks, which network and FUSE filesystems may not give",
+            "set QUEUER_DB_PATH to a folder on a local disk, then restart the daemon (see the README, `doctor`)",
+        )
+    return Check(name, OK, f"{db_dir} is on {fs_type} (a local filesystem)")
 
 
 # ---------------------------------------------------------------------------
@@ -433,6 +501,7 @@ def run_checks(fix: bool = False) -> list[Check]:
     checks += check_config(fix)
     checks += check_database(fix)
     checks.append(check_schema())
+    checks.append(check_db_filesystem())
     checks += check_logs(fix)
     checks.append(check_linger())
     checks += check_unit()

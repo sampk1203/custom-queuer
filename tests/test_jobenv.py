@@ -86,3 +86,48 @@ def test_describe_copes_with_nothing_and_garbage():
     assert jobenv.describe(None) == [] and jobenv.describe("") == []
     assert jobenv.describe("not json") == [] and jobenv.describe("[1]") == []
     assert jobenv.describe({"A": "1"}) == ["A=1"]
+
+
+def test_default_passthrough_covers_the_families_md_and_gpu_tools_read():
+    """5.todo M4: CUDA_HOME, OMP_PLACES / OMP_PROC_BIND, NCCL_*, OMPI_*, UCX_*, CONDA_*, MKL_* ..."""
+    wanted = {
+        "CUDA_HOME": "/usr/local/cuda", "CUDA_VISIBLE_DEVICES": "0", "OMP_PLACES": "cores", "OMP_PROC_BIND": "close",
+        "OMP_NUM_THREADS": "4", "MKL_DYNAMIC": "FALSE", "OPENBLAS_CORETYPE": "Haswell", "NCCL_DEBUG": "INFO",
+        "OMPI_MCA_btl": "self,vader", "UCX_TLS": "sm,cuda", "CONDA_PREFIX": "/opt/conda", "CONDA_DEFAULT_ENV": "md",
+    }
+    unrelated = {"AWS_SECRET_ACCESS_KEY": "s", "GITHUB_TOKEN": "t", "SSH_AUTH_SOCK": "/s", "OMPX": "1", "CUDAX": "1", "MYCONDA_X": "1"}
+    assert jobenv.collect_passthrough({**wanted, **unrelated}) == wanted
+
+
+def test_base_environment_has_path_home_and_the_four_names_when_set():
+    env = jobenv.base_environment({
+        "PATH": "/bin", "HOME": "/home/a", "USER": "a", "LOGNAME": "a", "SHELL": "/bin/bash", "TMPDIR": "/t",
+        "AWS_SECRET_ACCESS_KEY": "s", "LANG": "C",
+    })
+    assert env == {"PATH": "/bin", "HOME": "/home/a", "USER": "a", "LOGNAME": "a", "SHELL": "/bin/bash", "TMPDIR": "/t"}
+
+
+def test_base_environment_never_invents_or_passes_bad_values():
+    assert jobenv.base_environment({}) == {"PATH": "", "HOME": ""}  # as before: PATH and HOME are always there
+    assert jobenv.base_environment({"PATH": "/bin", "HOME": "/h", "USER": "a\0b", "SHELL": ""}) == {"PATH": "/bin", "HOME": "/h", "SHELL": ""}
+
+
+def test_job_environment_layers_over_the_base_so_env_can_override_user():
+    env = jobenv.base_environment({"PATH": "/bin", "HOME": "/h", "USER": "daemon-user"})
+    env.update(jobenv.job_environment({"USER": "bob"}))
+    assert env["USER"] == "bob" and env["PYTHONUNBUFFERED"] == "1"
+
+
+@pytest.mark.parametrize("name", ["MYSQL_PWD", "DB_PASS", "AWS_CREDENTIALS", "API_AUTH", "SESSION_COOKIE", "db.creds", "my-pass", "PWD", "git_credential"])
+def test_whole_segment_secret_names_are_hidden(name):
+    """5.todo M6"""
+    assert jobenv.is_secret_name(name)
+    assert jobenv.describe({name: "hunter2"}) == [f"{name}=***"]
+
+
+@pytest.mark.parametrize("name", ["QUR_ENV_PASSTHROUGH", "QUEUER_ENV_PASSTHROUGH", "AUTHOR", "PASSENGER", "COMPASS", "MY_SETTING", "PWDX", "TOKENIZER"])
+def test_look_alike_names_stay_readable(name):
+    if name == "TOKENIZER":  # contains TOKEN: the old substring rule (unchanged) still hides it
+        assert jobenv.is_secret_name(name)
+    else:
+        assert not jobenv.is_secret_name(name)

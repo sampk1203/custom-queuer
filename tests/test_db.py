@@ -23,6 +23,12 @@ def _mk(conn, name="job", channel=1, **kw):
     return db.enqueue(conn, **defaults)
 
 
+def _ascending(queue: list[dict]) -> bool:
+    """Positions only have to order a lane: strictly increasing, not 0..n-1."""
+    positions = [j["position"] for j in queue]
+    return all(x is not None for x in positions) and all(a < b for a, b in zip(positions, positions[1:]))
+
+
 # ---------------------------------------------------------------------------
 # original suite (channel defaults to 1, behavior unchanged)
 # ---------------------------------------------------------------------------
@@ -31,7 +37,7 @@ def test_enqueue_append_order(conn):
     a, b, c = _mk(conn, "a"), _mk(conn, "b"), _mk(conn, "c")
     queue = db.get_queue(conn)
     assert [j["id"] for j in queue] == [a, b, c]
-    assert [j["position"] for j in queue] == [0, 1, 2]
+    assert [j["position"] for j in queue] == [0, db.POSITION_STEP, 2 * db.POSITION_STEP]
 
 
 def test_enqueue_before(conn):
@@ -59,7 +65,7 @@ def test_ids_stable_after_removal(conn):
     db.remove_from_queue(conn, b)
     queue = db.get_queue(conn)
     assert [j["id"] for j in queue] == [a, c]
-    assert [j["position"] for j in queue] == [0, 1]
+    assert _ascending(queue)  # nothing is renumbered: the gap just stays
 
 
 def test_remove_running_job_raises(conn):
@@ -76,7 +82,7 @@ def test_mark_running_removes_from_queue(conn):
     assert db.get_running(conn)["id"] == a
     queue = db.get_queue(conn)
     assert [j["id"] for j in queue] == [b]
-    assert queue[0]["position"] == 0
+    assert queue[0]["position"] == db.POSITION_STEP  # b keeps its position: starting a job renumbers nothing
 
 
 def test_reorder_before(conn):
@@ -237,11 +243,11 @@ def test_multiple_reorders_produce_consistent_final_order(conn):
     queue = db.get_queue(conn)
     ids = [j["id"] for j in queue]
     assert ids == [d, b, e, a, c]
-    # positions must be contiguous 0..n-1 regardless of how much reordering happened
-    assert [j["position"] for j in queue] == list(range(5))
+    # positions only have to be strictly increasing, however much reordering happened
+    assert _ascending(queue)
 
 
-def test_positions_stay_contiguous_after_interleaved_removals_and_adds(conn):
+def test_positions_stay_ordered_after_interleaved_removals_and_adds(conn):
     a, b, c = _mk(conn, "a"), _mk(conn, "b"), _mk(conn, "c")
     db.remove_from_queue(conn, b)
     d = _mk(conn, "d")
@@ -250,7 +256,7 @@ def test_positions_stay_contiguous_after_interleaved_removals_and_adds(conn):
 
     queue = db.get_queue(conn)
     assert [j["id"] for j in queue] == [c, e, d]
-    assert [j["position"] for j in queue] == [0, 1, 2]
+    assert _ascending(queue)
 
 
 # ---------------------------------------------------------------------------
@@ -334,11 +340,11 @@ def test_mark_running_only_reindexes_its_own_channel(conn):
 
     ch1_queue = db.get_queue(conn, channel=1)
     assert [j["id"] for j in ch1_queue] == [b1]
-    assert ch1_queue[0]["position"] == 0
+    assert ch1_queue[0]["position"] == db.POSITION_STEP  # b1 keeps its position
 
     ch2_queue = db.get_queue(conn, channel=2)
     assert [j["id"] for j in ch2_queue] == [a2]
-    assert ch2_queue[0]["position"] == 0  # untouched by channel 1's reindex
+    assert ch2_queue[0]["position"] == 0  # untouched by channel 1's start
 
 
 def test_backlog_isolated_between_channels(conn):
@@ -380,7 +386,7 @@ def test_remove_from_queue_only_reindexes_its_own_channel(conn):
     assert [j["id"] for j in db.get_queue(conn, channel=1)] == [b1]
     ch2_queue = db.get_queue(conn, channel=2)
     assert [j["id"] for j in ch2_queue] == [a2, b2]
-    assert [j["position"] for j in ch2_queue] == [0, 1]  # untouched
+    assert [j["position"] for j in ch2_queue] == [0, db.POSITION_STEP]  # untouched
 
 
 # ---------------------------------------------------------------------------
@@ -485,7 +491,7 @@ def test_priority_lane_has_its_own_position_sequence(conn):
     p2 = _mk(conn, "p2", is_priority=True)
     queue = db.get_queue(conn, is_priority=True)
     assert [j["id"] for j in queue] == [p1, p2]
-    assert [j["position"] for j in queue] == [0, 1]
+    assert [j["position"] for j in queue] == [0, db.POSITION_STEP]
 
 
 def test_priority_lane_scoped_per_channel(conn):
@@ -529,9 +535,72 @@ def test_mark_running_reindexes_only_its_own_priority_partition(conn):
     db.mark_running(conn, a1, pid=1, pgid=1)
     # normal queue reindexed (a1 gone), priority lane untouched
     assert [j["id"] for j in db.get_queue(conn)] == [a2]
-    assert [j["position"] for j in db.get_queue(conn)] == [0]
+    assert [j["position"] for j in db.get_queue(conn)] == [db.POSITION_STEP]
     assert [j["id"] for j in db.get_queue(conn, is_priority=True)] == [p1]
     assert [j["position"] for j in db.get_queue(conn, is_priority=True)] == [0]
+
+
+def test_dep_info_bulk_matches_dep_info_per_job(conn):
+    a = _mk(conn, "a")
+    b = _mk(conn, "b")
+    c = _mk(conn, "c", deps={a: "success", b: "any"})
+    d = _mk(conn, "d")  # no deps at all
+    bulk = db.dep_info_bulk(conn, [c, d])
+    assert bulk[c] == db.dep_info(conn, c)
+    assert bulk[d] == db.dep_info(conn, d) == {"depends_on": [], "after_any": [], "waiting_on": []}
+
+
+def test_dep_info_bulk_empty_list(conn):
+    assert db.dep_info_bulk(conn, []) == {}
+
+
+def test_get_channel_counts(conn):
+    _mk(conn, "a", channel=1)
+    _mk(conn, "b", channel=1)
+    _mk(conn, "p", channel=1, is_priority=True)
+    r = _mk(conn, "r", channel=1)
+    db.mark_running(conn, r, pid=1, pgid=1)
+    assert db.get_channel_counts(conn, 1) == {"running": 1, "frozen": 0, "queued": 2, "priority_queued": 1}
+    assert db.get_channel_counts(conn, 2) == {"running": 0, "frozen": 0, "queued": 0, "priority_queued": 0}
+
+
+def test_get_states_returns_state_columns_for_existing_ids_only(conn):
+    a, b = _mk(conn, "a"), _mk(conn, "b", channel=2)
+    db.mark_running(conn, a, pid=1, pgid=1)
+    db.mark_finished(conn, a, status="failed", exit_code=3, note="boom")
+    states = db.get_states(conn, [b, a, 12345])
+    assert set(states) == {a, b}
+    assert set(states[a]) == set(db.STATE_COLUMNS)
+    assert states[a]["status"] == "failed" and states[a]["exit_code"] == 3 and states[a]["note"] == "boom"
+    assert states[b]["status"] == "queued" and states[b]["channel"] == 2
+    assert db.get_states(conn, []) == {}
+
+
+def test_get_states_handles_more_ids_than_one_query_chunk(conn):
+    ids = [_mk(conn, f"j{i}") for i in range(db._STATE_CHUNK + 20)]
+    states = db.get_states(conn, ids + [10**9])
+    assert set(states) == set(ids)
+
+
+def test_get_queue_head_matches_get_queue_first(conn):
+    a, b, c = _mk(conn, "a"), _mk(conn, "b"), _mk(conn, "c")
+    assert db.get_queue_head(conn)["id"] == a
+    db.remove_from_queue(conn, a)
+    assert db.get_queue_head(conn)["id"] == b
+    assert [j["id"] for j in db.get_queue(conn)] == [b, c]
+
+
+def test_get_queue_head_empty_queue_is_none(conn):
+    assert db.get_queue_head(conn) is None
+
+
+def test_get_queue_head_scoped_by_channel_and_priority(conn):
+    a1 = _mk(conn, "a1", channel=1)
+    _mk(conn, "a2", channel=2)
+    p1 = _mk(conn, "p1", channel=1, is_priority=True)
+    assert db.get_queue_head(conn, channel=1)["id"] == a1
+    assert db.get_queue_head(conn, channel=1, is_priority=True)["id"] == p1
+    assert db.get_queue_head(conn, channel=3) is None
 
 
 def test_stopped_status_survives_schema_migration(tmp_path):
@@ -778,10 +847,11 @@ def test_cancel_queued_keeps_job_in_history_as_cancelled(conn):
     assert b in [j["id"] for j in db.get_backlog(conn)]
 
 
-def test_cancel_queued_reindexes_remaining_queue(conn):
+def test_cancel_queued_keeps_the_order_of_the_remaining_queue(conn):
     a, b, c = _mk(conn, "a"), _mk(conn, "b"), _mk(conn, "c")
     db.cancel_queued(conn, a)
-    assert [(j["id"], j["position"]) for j in db.get_queue(conn)] == [(b, 0), (c, 1)]
+    queue = db.get_queue(conn)
+    assert [j["id"] for j in queue] == [b, c] and _ascending(queue)
 
 
 def test_cancel_queued_only_touches_its_own_lane_and_channel(conn):
@@ -790,7 +860,7 @@ def test_cancel_queued_only_touches_its_own_lane_and_channel(conn):
     p1 = _mk(conn, "p1", channel=1, is_priority=True)
     p2 = _mk(conn, "p2", channel=1, is_priority=True)
     db.cancel_queued(conn, p1)
-    assert [(j["id"], j["position"]) for j in db.get_queue(conn, 1, is_priority=True)] == [(p2, 0)]
+    assert [(j["id"], j["position"]) for j in db.get_queue(conn, 1, is_priority=True)] == [(p2, db.POSITION_STEP)]
     assert [j["id"] for j in db.get_queue(conn, 1)] == [a]
     assert [j["id"] for j in db.get_queue(conn, 2)] == [b]
 
@@ -961,7 +1031,7 @@ def test_reorder_that_would_deadlock_is_rejected_and_changes_nothing(conn):
     with pytest.raises(ValueError, match="deadlock"):
         db.reorder_before(conn, b, a)  # b would sit ahead of the job it waits for
     assert [j["id"] for j in db.get_queue(conn)] == [a, b]
-    assert [j["position"] for j in db.get_queue(conn)] == [0, 1]
+    assert [j["position"] for j in db.get_queue(conn)] == [0, db.POSITION_STEP]  # unchanged by the rejected move
 
 
 def test_dep_verdict_ready_waiting_failed_removed(conn):
@@ -1006,8 +1076,8 @@ def test_skip_dependants_skips_and_cascades(conn):
     assert db.get_job(conn, b)["note"] == f"dependency {a} failed"
     assert db.get_job(conn, c)["note"] == f"dependency {b} failed"
     assert db.get_job(conn, d)["status"] == "queued"  # --after-any: any end is fine
-    assert [j["id"] for j in db.get_queue(conn)] == [d, e]  # the gap is closed
-    assert [j["position"] for j in db.get_queue(conn)] == [0, 1]
+    assert [j["id"] for j in db.get_queue(conn)] == [d, e]
+    assert _ascending(db.get_queue(conn))
 
 
 def test_skip_dependants_leaves_a_satisfied_dependant_alone(conn):
@@ -1562,6 +1632,21 @@ def test_edit_lock_of_a_dead_process_is_stale_and_cleared(conn):
     db.take_edit_lock(conn, a, 1)  # free for anyone now
 
 
+@pytest.mark.parametrize("pid", [2**31, 2**40, 2**62])
+def test_pid_alive_is_false_for_a_pid_past_the_c_int_range(pid):
+    # H2: os.kill raises OverflowError (not OSError) for these
+    assert db._pid_alive(pid) is False
+
+
+def test_edit_lock_of_a_huge_holder_pid_is_stale_not_a_crash(conn):
+    a = _mk(conn, "a")
+    db.take_edit_lock(conn, a, os.getpid())
+    conn.execute("UPDATE edit_locks SET holder_pid = ?", (2**40,))
+    conn.commit()
+    assert db.live_edit_lock(conn, a) is None
+    assert _lock_row(conn, a) is None
+
+
 def test_expired_edit_lock_is_stale_and_cleared(conn):
     a = _mk(conn, "a")
     db.take_edit_lock(conn, a, os.getpid())
@@ -1648,8 +1733,9 @@ def test_edit_job_moves_to_the_end_of_another_channel(conn):
     x = _mk(conn, "x", channel=2)
     db.edit_job(conn, a, updates={}, channel=2)
     assert [j["id"] for j in db.get_queue(conn, 1)] == [b, c]
-    assert [j["position"] for j in db.get_queue(conn, 1)] == [0, 1]
+    assert _ascending(db.get_queue(conn, 1))
     assert [j["id"] for j in db.get_queue(conn, 2)] == [x, a]
+    assert _ascending(db.get_queue(conn, 2))
     assert db.get_job(conn, a)["channel"] == 2
     db.edit_job(conn, b, updates={}, channel=7)  # a brand-new channel is registered
     assert 7 in db.list_channels(conn)
@@ -2059,3 +2145,176 @@ def test_migration_7_adds_the_stop_columns_to_a_version_6_database(tmp_path):
     job = db.get_job(c, jid)
     assert job["stop_signal"] is None and job["stop_grace_secs"] is None
     c.close()
+
+
+# ---------------------------------------------------------------------------
+# 5.todo item 3: index on the jobs table
+# ---------------------------------------------------------------------------
+
+def test_fresh_database_has_the_jobs_indexes(tmp_path):
+    c = db.connect(tmp_path / "idx.db")
+    db.init_db(c)
+    names = {r["name"] for r in c.execute("PRAGMA index_list(jobs)").fetchall()}
+    assert "idx_jobs_queue" in names and "idx_jobs_backlog" in names
+    c.close()
+
+
+def test_migration_8_adds_the_jobs_indexes_to_a_version_7_database(tmp_path):
+    c = db.connect(tmp_path / "idx.db")
+    db.init_db(c)
+    jid = _mk(c, "a")
+    c.execute("DROP INDEX idx_jobs_queue")
+    c.execute("DROP INDEX idx_jobs_backlog")
+    c.execute("UPDATE schema_version SET version = 7")
+    c.commit()
+    db.init_db(c)
+    assert db.get_schema_version(c) == db.SCHEMA_VERSION >= 8
+    names = {r["name"] for r in c.execute("PRAGMA index_list(jobs)").fetchall()}
+    assert "idx_jobs_queue" in names and "idx_jobs_backlog" in names
+    assert db.get_job(c, jid) is not None  # no data touched
+    c.close()
+
+
+def test_init_db_on_a_pre_priority_lane_database_creates_the_indexes_after_migrating(tmp_path):
+    # regression: the index on (channel, status, is_priority, position) used to be in _SCHEMA, which
+    # runs before the migrations, so an old `jobs` table without is_priority failed with
+    # "no such column: is_priority"
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    old = sqlite3.connect(path)
+    old.executescript(
+        """
+        CREATE TABLE jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, channel INTEGER NOT NULL DEFAULT 1,
+            status TEXT NOT NULL CHECK (status IN ('queued','running','done','failed','cancelled')),
+            position INTEGER, raw_cmd TEXT NOT NULL, resolved_cmd TEXT NOT NULL, cwd TEXT NOT NULL,
+            env_extra TEXT, pid INTEGER, pgid INTEGER, enqueued_at TEXT NOT NULL, started_at TEXT,
+            finished_at TEXT, exit_code INTEGER, log_path TEXT NOT NULL, note TEXT, timeout_secs INTEGER
+        );
+        """
+    )
+    old.commit()
+    old.close()
+    c = db.connect(path)
+    db.init_db(c)
+    names = {r["name"] for r in c.execute("PRAGMA index_list(jobs)").fetchall()}
+    assert "idx_jobs_queue" in names and "idx_jobs_backlog" in names
+    assert "is_priority" in {r["name"] for r in c.execute("PRAGMA table_info(jobs)").fetchall()}
+    c.close()
+
+
+# ---------------------------------------------------------------------------
+# queue positions are gapped: no renumbering on append / start / remove / cancel (5.todo item 10)
+# ---------------------------------------------------------------------------
+
+def test_append_start_remove_and_cancel_never_touch_other_positions(conn):
+    ids = [_mk(conn, n) for n in "abcde"]
+    before = {j["id"]: j["position"] for j in db.get_queue(conn)}
+    db.mark_running(conn, ids[0], pid=1, pgid=1)
+    db.remove_from_queue(conn, ids[2])
+    db.cancel_queued(conn, ids[3])
+    after = {j["id"]: j["position"] for j in db.get_queue(conn)}
+    assert after == {ids[1]: before[ids[1]], ids[4]: before[ids[4]]}
+    last = _mk(conn, "f")
+    assert db.get_job(conn, last)["position"] == before[ids[4]] + db.POSITION_STEP
+
+
+def test_append_after_the_queue_drained_starts_again_at_zero(conn):
+    a = _mk(conn, "a")
+    db.mark_running(conn, a, pid=1, pgid=1)
+    assert db.get_job(conn, _mk(conn, "b"))["position"] == 0
+
+
+def test_insert_between_uses_the_gap_without_renumbering(conn):
+    a, b = _mk(conn, "a"), _mk(conn, "b")
+    before = [j["position"] for j in db.get_queue(conn)]
+    c = _mk(conn, "c", before=b)
+    d = _mk(conn, "d", after=a)
+    queue = db.get_queue(conn)
+    assert [j["id"] for j in queue] == [a, d, c, b]
+    assert [queue[0]["position"], queue[3]["position"]] == before and _ascending(queue)
+
+
+def test_insert_before_the_head_and_after_the_tail(conn):
+    a = _mk(conn, "a")
+    first = _mk(conn, "first", before=a)
+    last = _mk(conn, "last", after=a)
+    queue = db.get_queue(conn)
+    assert [j["id"] for j in queue] == [first, a, last] and _ascending(queue)
+    assert [j["id"] for j in db.get_queue(conn, 1)][0] == db.get_queue_head(conn, 1, False)["id"]
+
+
+def test_inserting_into_an_exhausted_gap_renumbers_the_lane_once(conn):
+    a, b = _mk(conn, "a"), _mk(conn, "b")
+    expected = [a, b]
+    # always insert right after `a`: halves the gap each time, so it runs out and renumbers
+    for i in range(db.POSITION_STEP.bit_length() + 3):
+        expected.insert(1, _mk(conn, f"n{i}", after=a))
+    queue = db.get_queue(conn)
+    assert [j["id"] for j in queue] == expected and _ascending(queue)
+
+
+def test_reorder_into_an_exhausted_gap_keeps_the_requested_order(conn):
+    ids = [_mk(conn, n) for n in "abcdef"]
+    a, b = ids[0], ids[1]
+    order = [a, b] + ids[2:]
+    for moved in ids[2:]:
+        db.reorder_after(conn, moved, a)
+        order.remove(moved)
+        order.insert(order.index(a) + 1, moved)
+    for _ in range(db.POSITION_STEP.bit_length() + 2):
+        for moved in [m for m in order if m not in (a, b)]:
+            db.reorder_before(conn, moved, b)
+            order.remove(moved)
+            order.insert(order.index(b), moved)
+    queue = db.get_queue(conn)
+    assert [j["id"] for j in queue] == order and _ascending(queue)
+
+
+def test_inserting_into_a_queue_with_old_contiguous_positions(conn):
+    # a database from before gapped positions: 0, 1, 2 with no room between them
+    a, b, c = _mk(conn, "a"), _mk(conn, "b"), _mk(conn, "c")
+    conn.executemany("UPDATE jobs SET position = ? WHERE id = ?", [(0, a), (1, b), (2, c)])
+    conn.commit()
+    d = _mk(conn, "d", before=b)
+    e = _mk(conn, "e")
+    queue = db.get_queue(conn)
+    assert [j["id"] for j in queue] == [a, d, b, c, e] and _ascending(queue)
+
+
+def test_dependency_behind_check_still_works_with_gapped_positions(conn):
+    a, b = _mk(conn, "a"), _mk(conn, "b")
+    with pytest.raises(ValueError, match="queued behind"):
+        _mk(conn, "x", before=a, deps={b: "success"})
+    assert [j["id"] for j in db.get_queue(conn)] == [a, b]
+
+
+def test_enqueue_can_skip_the_deadlock_search(conn):
+    a = _mk(conn, "a")
+    b = _mk(conn, "b", deps={a: "success"}, check_deadlock=False)
+    assert [j["id"] for j in db.get_queue(conn)] == [a, b]
+
+
+def test_clear_backlog_drops_the_pause_flag_of_a_pruned_channel(conn):
+    """L2: a channel that disappears must not come back paused months later."""
+    _mk(conn, "one", channel=1)  # the default channel has a job
+    a = _mk(conn, "a", channel=5)
+    _finish(conn, a)
+    db.set_paused(conn, True, 5)
+    _mk(conn, "k", channel=6)  # channel 6 still has a job: its flag stays
+    db.set_paused(conn, True, 6)
+    db.set_paused(conn, True, 1)  # the default channel is never pruned
+    db.clear_backlog(conn)
+    assert db.list_channels(conn) == [1, 6]
+    assert db.get_paused(conn, 5) is False
+    assert db.get_state(conn, "paused:5") is None
+    assert db.get_paused(conn, 6) is True and db.get_paused(conn, 1) is True
+    _mk(conn, "again", channel=5)  # the channel is created again
+    assert db.get_paused(conn, 5) is False
+
+
+def test_pausing_a_channel_before_its_first_job_still_works(conn):
+    db.set_paused(conn, True, 9)  # `qur pause -c 9` before any job: not touched by registering the channel
+    _mk(conn, "x", channel=9)
+    assert db.get_paused(conn, 9) is True

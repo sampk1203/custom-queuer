@@ -12,7 +12,7 @@ for any channel that already has rows in the DB, and on first `add` to a
 brand-new channel.
 
 Run standalone for manual testing with: `python -m queuer.daemon`
-Normally launched by the systemd --user unit (Phase 4).
+Normally launched by the systemd --user unit (`install.sh` writes it).
 """
 
 from __future__ import annotations
@@ -33,15 +33,22 @@ import traceback
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 from queuer import db, jobenv, logclean, notify
 from queuer.pathresolve import resolve_command
+from queuer.paths import (
+    DEFAULT_GRACE_SECS,
+    _default_db_path,
+    _default_log_dir,
+    _default_socket_path,
+    _fallback_socket_dir,
+)
 
 MAX_LOG_BYTES = 50 * 1024 * 1024  # 50MB per-job log cap
-DEFAULT_GRACE_SECS = 5
 LISTEN_IDLE_SECS = 5  # recheck config when Telegram listening is off
 LISTEN_GAP_SECS = 0.1  # pause between polls
+MAX_REQUEST_BYTES = 16 * 1024 * 1024  # H4: longest request line; the stream default (64 KiB) refused big sweeps. More gets "request too large"
 CLIENT_READ_TIMEOUT_SECS = 10  # a client must send its request line within this
 LISTEN_RETRY_SECS = 30  # back off after a failed poll (offline, 409, ...)
 IDLE_POLL_SECS = 30  # idle worker safety-net recheck; every real change wakes the worker at once
@@ -63,17 +70,18 @@ HOOK_TIMEOUT_SECS = 300  # F12: a hook still running after this long is killed (
 HOOK_OUTPUT_BYTES = 65536  # F12: most hook output appended to the job's log; the rest is dropped
 POST_JOB_HOOK_ENV = "QUEUER_POST_JOB_HOOK"  # F12: global hook command, set in the daemon's environment
 HOOK_STATUSES = ("done", "failed", "cancelled")  # outcomes that run hooks (not skipped, not interrupted)
+WORKER_ERROR_SECS = 2.0  # H2: a worker whose loop body raised waits this long, then carries on
+MAX_PID = 4194304  # H2: Linux pid_max ceiling; an edit-lock pid outside 1..MAX_PID is refused
 STOP_NOTE = "daemon stopped"  # note of a job the daemon's stop (or a crash/reboot) cut short
-RESOURCE_SAMPLE_SECS = 0.2  # F10: how often /proc is polled for a running job's peak RSS / CPU time
+RESOURCE_SAMPLE_SECS = 0.2  # F10: how often /proc is polled for a running job's peak RSS / CPU time, at first
+RESOURCE_SAMPLE_SLOW_SECS = 1.0  # 5.todo item 9: poll interval once a job has run past RESOURCE_SAMPLE_FAST_FOR_SECS
+RESOURCE_SAMPLE_FAST_FOR_SECS = 5.0  # 5.todo item 9: how long a job is polled at RESOURCE_SAMPLE_SECS before slowing down
+RESOURCE_GROUP_SCAN_SECS = 1.0  # 5.todo M5: how often /proc is scanned for the job's whole process group
+JOB_UMASK_ENV = "QUEUER_JOB_UMASK"  # 5.todo M4: octal umask for jobs; unset = keep the daemon's (the unit's UMask=0077)
 _CLK_TCK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100  # ticks/sec for /proc/<pid>/stat
 # exit codes of a job that died to SIGHUP/SIGINT/SIGKILL/SIGTERM: negative = killed by the signal
 # itself, 128+n = a shell/wrapper that reported it
 _SIGNAL_EXITS = frozenset({-1, -2, -9, -15, 129, 130, 137, 143})
-
-
-def _default_db_path() -> Path:
-    override = os.environ.get("QUEUER_DB_PATH")
-    return Path(override) if override else db.DEFAULT_DB_PATH
 
 
 def _default_keep() -> int:
@@ -104,6 +112,22 @@ def _env_positive_int(name: str) -> int | None:
         value = 0
     if value < 1:
         print(f"[queuerd] ignoring {name}={raw!r} (need a positive integer)", file=sys.stderr)
+        return None
+    return value
+
+
+def _env_job_umask() -> int | None:
+    """5.todo M4: `QUEUER_JOB_UMASK` as an octal number (`022`, `0o027`, `002`), or None to keep
+    the daemon's own umask. A bad value is ignored with a warning rather than stopping the daemon."""
+    raw = os.environ.get(JOB_UMASK_ENV)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        value = int(raw.strip(), 8)
+    except ValueError:
+        value = -1
+    if not 0 <= value <= 0o777:
+        print(f"[queuerd] ignoring {JOB_UMASK_ENV}={raw!r} (need an octal umask such as 022); jobs keep the daemon's umask", file=sys.stderr)
         return None
     return value
 
@@ -170,20 +194,6 @@ def _default_log_clean_secs() -> float:
     return max(LOG_CLEAN_MIN_SECS, hours * 3600)
 
 
-def _default_socket_path() -> Path:
-    override = os.environ.get("QUEUER_SOCKET_PATH")
-    if override:
-        return Path(override)
-    runtime_dir = os.environ.get("XDG_RUNTIME_DIR")  # unset or empty -> private fallback
-    return (Path(runtime_dir) if runtime_dir else _fallback_socket_dir()) / "queuer.sock"
-
-
-def _fallback_socket_dir() -> Path:
-    """Per-user dir used when XDG_RUNTIME_DIR is unset (cron, sudo, ...). Never
-    a bare /tmp: another user could pre-create the socket path there."""
-    return Path("/tmp") / f"queuer-{os.getuid()}"  # nosec B108 - uid-scoped, ownership/mode/symlink checked by the caller
-
-
 def _ensure_private_dir(path: Path) -> None:
     """Create `path` (0700), or accept an existing one only if it is a real
     directory (not a symlink) owned by us; loose modes are tightened. Anything
@@ -197,13 +207,6 @@ def _ensure_private_dir(path: Path) -> None:
         raise RuntimeError(f"refusing to use {path}: not a directory owned by you")
     if st.st_mode & 0o077:
         os.chmod(path, 0o700)
-
-
-def _default_log_dir() -> Path:
-    override = os.environ.get("QUEUER_LOG_DIR")
-    if override:
-        return Path(override)
-    return Path.home() / ".local" / "state" / "queuer" / "logs"
 
 
 class AlreadyRunning(RuntimeError):
@@ -233,6 +236,66 @@ def _tighten_or_warn(path: Path, created: bool, ours_by_default: bool) -> None:
               f"chmod 700 it if it is dedicated to queuer)", file=sys.stderr)
 
 
+def _read_group_usage(pgid: int, proc_root: str = "/proc") -> tuple[int | None, float, float] | None:
+    """5.todo M5: one snapshot of a job's WHOLE process group, for `mpirun -np 8 lmp ...`,
+    `bash -c "..."` and programs that start subprocesses (the launcher alone is a few MB).
+    Scans `proc_root` once: every process whose process-group id (field 5 of its stat) is
+    `pgid` counts. Returns (rss_sum_kb, user_secs, sys_secs), or None when no process of the
+    group is found (it is gone, or /proc is unreadable).
+
+    rss_sum_kb is the SUM of the members' current VmRSS right now (None if no member had a
+    VmRSS line); the caller keeps the maximum over time, which is the peak. Pages that ranks
+    share (shared memory, a mapped library) are counted once per process, so the sum can be
+    higher than the real use. CPU is utime + stime plus cutime + cstime (children the member
+    has already waited for) of every live member: a reaped child moves from its own entry to
+    its parent's cutime, so nothing is counted twice, and the caller keeps the maximum."""
+    try:
+        names = os.listdir(proc_root)
+    except OSError:
+        return None
+    found = False
+    rss_total = 0
+    have_rss = False
+    user_ticks = 0
+    sys_ticks = 0
+    for name in names:
+        if not name.isdigit():
+            continue
+        try:
+            with open(f"{proc_root}/{name}/stat", "rb") as f:
+                stat_line = f.read().decode("utf-8", errors="replace")
+        except OSError:
+            continue  # gone since the listing
+        rparen = stat_line.rfind(")")
+        if rparen == -1:
+            continue
+        fields = stat_line[rparen + 2:].split()
+        try:
+            if int(fields[2]) != pgid:  # field 5 overall: pgrp
+                continue
+            utime, stime = int(fields[11]), int(fields[12])  # fields 14, 15
+            cutime, cstime = int(fields[13]), int(fields[14])  # fields 16, 17
+        except (IndexError, ValueError):
+            continue
+        found = True
+        user_ticks += utime + max(cutime, 0)
+        sys_ticks += stime + max(cstime, 0)
+        try:
+            with open(f"{proc_root}/{name}/status", "rb") as f:
+                for line in f:
+                    if line.startswith(b"VmRSS:"):
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            rss_total += int(parts[1])
+                            have_rss = True
+                        break
+        except (OSError, ValueError):
+            pass  # a zombie has no VmRSS; a vanished process just is not counted
+    if not found:
+        return None
+    return (rss_total if have_rss else None), user_ticks / _CLK_TCK, sys_ticks / _CLK_TCK
+
+
 class Daemon:
     def __init__(
         self,
@@ -245,7 +308,10 @@ class Daemon:
         log_max_mb: int | None = None,
         log_clean_secs: float | None = None,
         post_job_hook: str | None = None,
+        job_umask: int | None = None,
     ) -> None:
+        # 5.todo M4: umask jobs and hooks run with; None keeps the daemon's own (the unit's 0077)
+        self.job_umask: int | None = job_umask if job_umask is not None else _env_job_umask()
         self.keep = keep if keep is not None else _default_keep()  # finished jobs kept per channel
         # F14 automatic log cleaning: off unless an age and/or a size limit is set
         self.log_max_age_days = log_max_age_days if log_max_age_days is not None else _env_positive_int("QUEUER_LOG_MAX_AGE_DAYS")
@@ -270,6 +336,7 @@ class Daemon:
         self._current_proc: dict[int, asyncio.subprocess.Process] = {}
         self._current_job_id: dict[int, int] = {}
         self._worker_tasks: dict[int, asyncio.Task] = {}
+        self._worker_ended = asyncio.Event()  # H2: set when ANY worker task ends (serve() watches workers made later too)
 
         # ids of jobs a user asked to cancel while running. Per job, not per
         # channel: a frozen (--now) job and the priority job that froze it
@@ -297,6 +364,9 @@ class Daemon:
         # The priority worker task runs the priority queue FIFO, then
         # SIGCONTs the frozen job once that queue drains.
         self._frozen: dict[int, tuple[int, asyncio.subprocess.Process]] = {}
+        # 5.todo item 13: one event per channel, set (and dropped) whenever that channel's frozen
+        # slot changes, so a --timeout job's wait sleeps until its deadline instead of polling
+        self._freeze_events: dict[int, asyncio.Event] = {}
         self._priority_worker_tasks: dict[int, asyncio.Task] = {}
 
     # -- setup -----------------------------------------------------------
@@ -316,11 +386,11 @@ class Daemon:
         assert self.conn is not None
         db.clear_edit_locks(self.conn)  # editors were talking to the previous daemon; a lost lock makes their edit fail cleanly
         for channel in db.list_channels(self.conn):
-            for stale in (db.get_running(self.conn, channel), db.get_stopped(self.conn, channel)):
-                if stale is not None:
-                    db.mark_finished(self.conn, stale["id"], status="interrupted", note=STOP_NOTE, keep_backlog=self.keep)
-                    self._settle_dependants(stale["id"])
-                    self._notify_finished(stale["id"])
+            for stale_id in (db.get_running_id(self.conn, channel), db.get_stopped_id(self.conn, channel)):
+                if stale_id is not None:
+                    db.mark_finished(self.conn, stale_id, status="interrupted", note=STOP_NOTE, keep_backlog=self.keep)
+                    self._settle_dependants(stale_id)
+                    self._notify_finished(stale_id)
 
     def _ensure_channel_worker(self, channel: int) -> None:
         """Lazily spawn a channel's worker loop if it isn't running yet (never
@@ -331,42 +401,46 @@ class Daemon:
         if task is not None and not task.done():
             return
         self._wake[channel] = asyncio.Event()
-        self._worker_tasks[channel] = asyncio.create_task(self.worker_loop(channel))
+        task = asyncio.create_task(self.worker_loop(channel))
+        task.add_done_callback(self._worker_done)
+        self._worker_tasks[channel] = task
+
+    def _worker_done(self, task: asyncio.Task[None]) -> None:
+        """H2: a worker task that ended by itself (not cancelled: `_ensure_channel_worker` respawns those)
+        tells serve() so the daemon shuts down cleanly instead of running on with a dead channel."""
+        if not task.cancelled():
+            self._worker_ended.set()
 
     # -- worker loop -------------------------------------------------------
 
     async def worker_loop(self, channel: int) -> None:
+        """H2: one failing step (a locked or full database, ...) never ends the worker: the error
+        is logged (once while it repeats), the worker waits WORKER_ERROR_SECS and tries again."""
         assert self.conn is not None
         wake = self._wake[channel]
+        last_error: str | None = None
         while True:
             wake.clear()
             if self._stopping.is_set():
                 return
-            sleep_for: float = IDLE_POLL_SECS
-            if not db.get_paused(self.conn, channel):
-                queue = db.get_queue(self.conn, channel)
-                if queue:
-                    # strict FIFO: only the head is ever considered. A head that waits on
-                    # an unfinished dependency holds the whole channel (nothing jumps
-                    # ahead); it is woken when that dependency ends (`_settle_dependants`)
-                    verdict, dep_id = db.dep_verdict(self.conn, queue[0]["id"])
-                    if verdict == "ready":
-                        # a delayed head (`--delay` / `--at`) holds the channel until its
-                        # time: sleep exactly that long (a wake event still ends the sleep
-                        # early, e.g. the head was removed or cancelled)
-                        remaining = self._secs_until(queue[0].get("not_before"))
-                        if remaining <= 0 and db.live_edit_lock(self.conn, queue[0]["id"]) is not None:
-                            # `qur edit` has the head open: strict FIFO, the channel waits until the
-                            # edit is applied or abandoned (a stale lock is cleared by the check above)
-                            sleep_for = EDIT_LOCK_RECHECK_SECS
-                        elif remaining <= 0:
-                            await self._run_job_safely(channel, queue[0])
-                            continue
-                        else:
-                            sleep_for = min(remaining, IDLE_POLL_SECS)
-                    elif verdict != "waiting" and dep_id is not None:
-                        self._skip_blocked(queue[0]["id"], verdict, dep_id)
-                        continue
+            try:
+                sleep_for = await self._worker_step(channel)
+                last_error = None
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                message = f"{type(e).__name__}: {e}"
+                if message != last_error:
+                    print(f"[queuerd] channel {channel} worker error (retrying in {WORKER_ERROR_SECS:g}s): {message}", file=sys.stderr)
+                    traceback.print_exc(file=sys.stderr)
+                last_error = message
+                try:
+                    await asyncio.wait_for(self._stopping.wait(), timeout=WORKER_ERROR_SECS)
+                except asyncio.TimeoutError:
+                    pass
+                continue
+            if sleep_for is None:
+                continue  # a job just ran or was skipped: look at the queue again at once
             # idle: wait for something to wake us (new job, resume, retry, dependency
             # finished, ...), with a slow periodic recheck as a safety net. Sleeps are
             # capped at the recheck interval so a clock jump or a suspend cannot make a
@@ -376,6 +450,55 @@ class Daemon:
                 await asyncio.wait_for(wake.wait(), timeout=sleep_for)
             except asyncio.TimeoutError:
                 pass
+
+    async def _worker_step(self, channel: int) -> float | None:
+        """One look at the channel's queue. Returns None to look again at once (a job ran or
+        was skipped), else the seconds the worker may sleep before the next look."""
+        assert self.conn is not None
+        sleep_for: float = IDLE_POLL_SECS
+        if not db.get_paused(self.conn, channel):
+            head = db.get_queue_head(self.conn, channel)
+            if head is not None and self._lane_busy(channel):
+                head = None  # H1: a `--now` job holds the channel; its end wakes this worker
+            if head is not None:
+                # strict FIFO: only the head is ever considered. A head that waits on
+                # an unfinished dependency holds the whole channel (nothing jumps
+                # ahead); it is woken when that dependency ends (`_settle_dependants`)
+                verdict, dep_id = db.dep_verdict(self.conn, head["id"])
+                if verdict == "ready":
+                    # a delayed head (`--delay` / `--at`) holds the channel until its
+                    # time: sleep exactly that long (a wake event still ends the sleep
+                    # early, e.g. the head was removed or cancelled)
+                    remaining = self._secs_until(head.get("not_before"))
+                    if remaining <= 0 and db.live_edit_lock(self.conn, head["id"]) is not None:
+                        # `qur edit` has the head open: strict FIFO, the channel waits until the
+                        # edit is applied or abandoned (a stale lock is cleared by the check above)
+                        sleep_for = EDIT_LOCK_RECHECK_SECS
+                    elif remaining <= 0:
+                        await self._run_job_safely(channel, head)
+                        return None
+                    else:
+                        sleep_for = min(remaining, IDLE_POLL_SECS)
+                elif verdict != "waiting" and dep_id is not None:
+                    self._skip_blocked(head["id"], verdict, dep_id)
+                    return None
+        return sleep_for
+
+    def _lane_busy(self, channel: int) -> bool:
+        """H1: True while a job other than the normal worker's own is running on `channel`,
+        i.e. a `--now` job (or its start-up) holds it, so the normal worker must not start
+        its head: one job at a time per channel. Priority rows left over without a runner
+        (after a daemon restart) get one here."""
+        assert self.conn is not None
+        if self._current_job_id.get(channel) is not None:
+            return True
+        task = self._priority_worker_tasks.get(channel)
+        if task is not None and not task.done():
+            return True
+        if db.get_queue_head(self.conn, channel, is_priority=True) is not None:
+            self._ensure_priority_worker(channel)
+            return True
+        return False
 
     @staticmethod
     def _secs_until(not_before: str | None) -> float:
@@ -430,13 +553,16 @@ class Daemon:
 
     async def _priority_worker_loop(self, channel: int) -> None:
         assert self.conn is not None
-        while not self._stopping.is_set():
-            queue = db.get_queue(self.conn, channel, is_priority=True)
-            if not queue:
-                break
-            await self._run_job_safely(channel, queue[0])
-        if channel in self._frozen and not self._stopping.is_set():
-            await self._resume_frozen(channel)
+        try:
+            while not self._stopping.is_set():
+                head = db.get_queue_head(self.conn, channel, is_priority=True)
+                if head is None:
+                    break
+                await self._run_job_safely(channel, head)
+            if channel in self._frozen and not self._stopping.is_set():
+                await self._resume_frozen(channel)
+        finally:
+            self._wake_worker(channel)  # H1: the normal worker was held back while this lane ran
 
     def _freeze_current_if_normal(self, channel: int) -> None:
         """Called synchronously from `add --now`: if a normal (non-
@@ -462,10 +588,12 @@ class Daemon:
             return
         db.mark_stopped(self.conn, job_id)
         self._frozen[channel] = (job_id, proc)
+        self._freeze_changed(channel)
 
     async def _resume_frozen(self, channel: int) -> None:
         assert self.conn is not None
         job_id, proc = self._frozen.pop(channel)
+        self._freeze_changed(channel)
         try:
             os.killpg(proc.pid, signal.SIGCONT)
         except ProcessLookupError:
@@ -507,7 +635,7 @@ class Daemon:
         argv = json.loads(job["resolved_cmd"])
         cwd = job["cwd"]
         env_extra = json.loads(job["env_extra"]) if job["env_extra"] else {}
-        env = {"PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", "")}
+        env = jobenv.base_environment(os.environ)
         env.update(jobenv.job_environment(env_extra))
         log_path = Path(job["log_path"])
         log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -521,16 +649,23 @@ class Daemon:
                     *argv,
                     cwd=cwd,
                     env=env,
+                    stdin=asyncio.subprocess.DEVNULL,  # L4: a job never reads the daemon's stdin (a terminal, when started by hand)
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,
                     start_new_session=True,  # own process group -> group-kill later
+                    umask=-1 if self.job_umask is None else self.job_umask,  # M4: -1 = keep the daemon's
                 )
             except (OSError, ValueError, TypeError) as e:
                 db.mark_finished(self.conn, job_id, status="failed", note=f"failed to start: {e}", keep_backlog=self.keep)
                 self._after_finish(job_id)
                 return
 
-            db.mark_running(self.conn, job_id, pid=proc.pid, pgid=proc.pid)
+            try:
+                db.mark_running(self.conn, job_id, pid=proc.pid, pgid=proc.pid)
+            except Exception:
+                # L3: the row changed under us (removed/cancelled): the process exists but nothing tracks it
+                await self._kill_group_for_shutdown(proc)
+                raise
         finally:
             self._starting.discard(job_id)
         self._current_proc[channel] = proc
@@ -541,8 +676,10 @@ class Daemon:
         # (see _read_proc_usage -- not os.wait4/RUSAGE_CHILDREN, which asyncio's own
         # child-reaping already forecloses and which can't be diffed cleanly across
         # channels running in parallel anyway).
+        # 5.todo M5: the sampler also scans the job's whole process group (mpirun's ranks, a
+        # shell's children), not just the process queuer started.
         usage: dict[str, Any] = {"rss_kb": None, "cpu_user": None, "cpu_sys": None}
-        usage_task = asyncio.create_task(self._sample_usage(proc.pid, usage))
+        usage_task = asyncio.create_task(self._sample_usage(proc.pid, usage, whole_group=True))
         timeout = job["timeout_secs"]
         if self._stopping.is_set():
             # the stop began while the process was being spawned, so _shutdown did not see it
@@ -612,27 +749,49 @@ class Daemon:
             return False
         return True
 
+    def _freeze_changed(self, channel: int) -> None:
+        """The frozen slot of `channel` was set or cleared: wake any timed job waiting on it."""
+        event = self._freeze_events.pop(channel, None)
+        if event is not None:
+            event.set()
+
     async def _wait_running_time(self, proc: asyncio.subprocess.Process, channel: int, job_id: int, timeout: float) -> int:
         """Wait for `proc`, enforcing `timeout` seconds of RUN time: time spent
         frozen (SIGSTOP by a `--now` job) does not count. Raises
-        asyncio.TimeoutError like wait_for would."""
+        asyncio.TimeoutError like wait_for would.
+
+        5.todo item 13: no polling. The wait sleeps until the process exits, the time
+        that is left runs out, or the channel's frozen slot changes (the only moments run
+        time starts or stops counting); on a change it books the time that ran and
+        re-arms with what is left. While frozen it sleeps with no deadline at all."""
+        loop = asyncio.get_running_loop()
         waiter = asyncio.ensure_future(proc.wait())
         ran = 0.0
-        tick = 0.2
+        pending: set[asyncio.Future[Any]] = {waiter}
         try:
             while True:
-                done, _ = await asyncio.wait({waiter}, timeout=tick)
-                if done:
-                    return waiter.result()
                 frozen = self._frozen.get(channel)
-                if frozen is not None and frozen[0] == job_id:
-                    continue
-                ran += tick
-                if ran >= timeout:
-                    raise asyncio.TimeoutError
+                is_frozen = frozen is not None and frozen[0] == job_id
+                event = self._freeze_events.setdefault(channel, asyncio.Event())
+                change = asyncio.ensure_future(event.wait())
+                pending = {waiter, change}
+                started = loop.time()
+                if is_frozen:
+                    wait_for_secs: float | None = None
+                else:
+                    wait_for_secs = timeout - ran
+                    if wait_for_secs <= 0:
+                        raise asyncio.TimeoutError
+                done, _ = await asyncio.wait(pending, timeout=wait_for_secs, return_when=asyncio.FIRST_COMPLETED)
+                change.cancel()
+                if waiter in done:
+                    return waiter.result()
+                if not is_frozen:
+                    ran += loop.time() - started  # the top of the loop raises once `ran` reaches `timeout`
         finally:
-            if not waiter.done():
-                waiter.cancel()
+            for fut in pending:
+                if not fut.done():
+                    fut.cancel()
 
     def _release(self, channel: int, job_id: int) -> None:
         """Clear a channel's current-job slot, but only if it still points at
@@ -690,7 +849,7 @@ class Daemon:
     @staticmethod
     def _hook_env(kind: str, job: dict[str, Any]) -> dict[str, str]:
         """The job's own environment plus QUR_* facts about how it ended."""
-        env = {"PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", "")}
+        env = jobenv.base_environment(os.environ)
         env.update(jobenv.job_environment(json.loads(job["env_extra"]) if job["env_extra"] else {}))
         duration = ""
         if job["started_at"] and job["finished_at"]:
@@ -743,6 +902,7 @@ class Daemon:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 start_new_session=True,
+                umask=-1 if self.job_umask is None else self.job_umask,
             )
         except (OSError, ValueError) as e:
             self._append_to_log(log_path, f"[queuer] hook {kind} could not start: {e}\n")
@@ -1174,6 +1334,20 @@ class Daemon:
         self._wake_worker(job["channel"])
         return True
 
+    @staticmethod
+    def _keep_old_log(log_path: Path) -> None:
+        """L5: a log that is already there when job <id> starts belongs to an older job with the
+        same id (the database was deleted or reset, ids started at 1 again). Move it to
+        `<id>.log.old` (replacing an older .old) instead of truncating it. A symlink or an empty
+        file is left to the normal open."""
+        try:
+            st = os.lstat(log_path)
+            if stat.S_ISREG(st.st_mode) and st.st_size > 0:
+                os.replace(log_path, f"{log_path}.old")
+                print(f"[queuerd] {log_path} already existed (old database?): kept as {log_path}.old", file=sys.stderr)
+        except OSError:
+            pass  # missing is the normal case; anything else surfaces when the log is opened
+
     async def _pump_log(self, proc: asyncio.subprocess.Process, log_path: Path) -> None:
         """Stream the job's combined stdout/stderr to its log file, capped
         at MAX_LOG_BYTES with a single truncation marker line. If the log
@@ -1182,6 +1356,7 @@ class Daemon:
         written = 0
         truncated = False
         f = None
+        self._keep_old_log(log_path)
         try:
             f = os.fdopen(os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600), "wb")
         except OSError as e:
@@ -1216,23 +1391,60 @@ class Daemon:
                 except OSError as e:
                     print(f"[queuerd] cannot close log {log_path}: {e}", file=sys.stderr)
 
-    async def _sample_usage(self, pid: int, usage: dict[str, Any]) -> None:
-        """F10: poll `pid` (the job's direct process, not its whole tree --
-        see _read_proc_usage) every RESOURCE_SAMPLE_SECS and keep the latest
-        reading in `usage` (shared with the caller). Runs for as long as the
-        job does; the caller cancels it once the job exits. A job that exits
-        before the first poll leaves `usage` at its initial all-None state --
-        there is nothing to report for it."""
+    @staticmethod
+    def _keep_max(usage: dict[str, Any], key: str, value: float | int) -> None:
+        """Store `value` in `usage[key]` unless a larger one is already there (a peak, or a
+        cumulative time that can only grow; a process that exits can make a later sum smaller)."""
+        current = usage[key]
+        if current is None or value > current:
+            usage[key] = value
+
+    async def _sample_usage(self, pid: int, usage: dict[str, Any], whole_group: bool = False) -> None:
+        """F10: poll `pid` (the job's direct process) and keep the best reading in `usage`
+        (shared with the caller). Runs for as long as the job does; the caller cancels it
+        once the job exits. A job that exits before the first poll leaves `usage` at its
+        initial all-None state -- there is nothing to report for it.
+
+        5.todo M5: with `whole_group` (a job is started in its own session, so its process
+        group id is `pid`) the whole process group is sampled too, at most every
+        RESOURCE_GROUP_SCAN_SECS (one scan of /proc, see _read_group_usage): the peak RSS is
+        the largest SUM of the members' RSS seen, and the CPU time includes the children the
+        members have already reaped. Values only ever grow (`_keep_max`), so a rank that
+        exits never lowers a peak or a time already seen. The leader's own reading (VmHWM)
+        still counts, so a leader that is bigger than the sum it was seen in is not lost.
+
+        5.todo item 9: polls every RESOURCE_SAMPLE_SECS (0.2 s) for the first
+        RESOURCE_SAMPLE_FAST_FOR_SECS of the job's life -- long enough to catch
+        a short job's peak RSS/CPU promptly -- then every RESOURCE_SAMPLE_SLOW_SECS
+        (1 s) for the rest of it: five times fewer wakeups for a long-running job.
+        VmHWM is a kernel high-water mark, so the slower cadence loses no peak RSS;
+        CPU time can be under-reported by up to one poll interval at the very end,
+        same as before, just a larger interval once a job has run a while."""
+        elapsed = 0.0
+        last_scan: float | None = None
         try:
             while True:
                 sample = _read_proc_usage(pid)
                 if sample is not None:
                     rss_kb, user_secs, sys_secs = sample
                     if rss_kb is not None:  # a zombie (killed, not yet reaped) has no VmHWM: keep the last peak
-                        usage["rss_kb"] = rss_kb
-                    usage["cpu_user"] = user_secs
-                    usage["cpu_sys"] = sys_secs
-                await asyncio.sleep(RESOURCE_SAMPLE_SECS)
+                        self._keep_max(usage, "rss_kb", rss_kb)
+                    self._keep_max(usage, "cpu_user", user_secs)
+                    self._keep_max(usage, "cpu_sys", sys_secs)
+                if whole_group:
+                    now = time.monotonic()
+                    if last_scan is None or now - last_scan >= RESOURCE_GROUP_SCAN_SECS:
+                        last_scan = now
+                        group = _read_group_usage(pid)
+                        if group is not None:
+                            group_rss, group_user, group_sys = group
+                            if group_rss is not None:
+                                self._keep_max(usage, "rss_kb", group_rss)
+                            self._keep_max(usage, "cpu_user", group_user)
+                            self._keep_max(usage, "cpu_sys", group_sys)
+                interval = RESOURCE_SAMPLE_SECS if elapsed < RESOURCE_SAMPLE_FAST_FOR_SECS else RESOURCE_SAMPLE_SLOW_SECS
+                await asyncio.sleep(interval)
+                elapsed += interval
         except asyncio.CancelledError:
             pass
 
@@ -1249,31 +1461,22 @@ class Daemon:
         self, proc: asyncio.subprocess.Process, grace: float = DEFAULT_GRACE_SECS, sig: signal.Signals = signal.SIGTERM,
     ) -> None:
         """Send `sig` (default SIGTERM) to the job's whole process group, wait up to
-        `grace` seconds for it to exit on its own, then SIGKILL if it's still
-        alive. Used by both `cancel` and timeout enforcement."""
-        pgid = proc.pid  # start_new_session=True makes pid == pgid (session leader)
-        try:
-            os.killpg(pgid, sig)
-        except ProcessLookupError:
-            return
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=grace)
-            return
-        except asyncio.TimeoutError:
-            pass
-        try:
-            os.killpg(pgid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        `grace` seconds for the GROUP to empty, then SIGKILL what is left. Used by both
+        `cancel` and timeout enforcement. M1: it watches the group, not just the leader: a
+        child that ignores `sig` (a script's background python, an MPI helper) used to keep
+        the job `running` for ever after the leader had exited."""
+        await self._kill_group_for_shutdown(proc, grace, sig)
 
-    async def _kill_group_for_shutdown(self, proc: asyncio.subprocess.Process, grace: float | None = None) -> None:
-        """SIGTERM the job's whole process group, give it `grace` seconds, then
-        SIGKILL whatever is left. Unlike `_kill_process_group` this watches the
-        GROUP, not just the main process: a backgrounded child that ignores SIGTERM
-        would otherwise keep the log pipe (and so the job) open past our exit."""
+    async def _kill_group_for_shutdown(
+        self, proc: asyncio.subprocess.Process, grace: float | None = None, sig: signal.Signals = signal.SIGTERM,
+    ) -> None:
+        """Send `sig` (default SIGTERM) to the job's whole process group, give it `grace`
+        seconds, then SIGKILL whatever is left. It watches the GROUP, not just the main
+        process: a backgrounded child that ignores the signal would otherwise keep the log
+        pipe (and so the job) open past our exit. Also what `_kill_process_group` does (M1)."""
         pgid = proc.pid
         try:
-            os.killpg(pgid, signal.SIGTERM)
+            os.killpg(pgid, sig)
         except ProcessLookupError:
             return
         deadline = time.monotonic() + (DEFAULT_GRACE_SECS if grace is None else grace)
@@ -1348,12 +1551,18 @@ class Daemon:
             return {"ok": True, "data": data}
         except (ValueError, KeyError, TypeError) as e:
             return {"ok": False, "error": str(e)}
+        except OverflowError:  # H2: a number past what SQLite or the OS can hold
+            return {"ok": False, "error": "a number in the request is out of range"}
+        except sqlite3.Error as e:  # H2: locked / full / corrupt database: a clean reply, not a traceback
+            return {"ok": False, "error": f"database error: {e}"}
 
     async def _cmd_add(self, args: dict[str, Any]) -> dict[str, Any]:
         """Queue one job, or -- with `jobs` (a list of {argv, raw_argv, index}, from
-        `--each` / `--array`) -- one independent job per entry, all-or-nothing, with
-        the same channel/cwd/timeout/flags/dependencies. `index` becomes the job's
-        QUR_INDEX env var. With `dry_run` (F16) everything is validated and placed
+        `--each`; `raw_argv` may be left out when it equals `argv`) -- one independent job
+        per entry, all-or-nothing, with the same channel/cwd/timeout/flags/dependencies.
+        `array: [first, last]` (from `--array`; with the one `argv`/`raw_argv` of the command,
+        sent once) is expanded here into one job per number, which becomes the job's
+        QUR_INDEX. `index` becomes the job's QUR_INDEX env var. With `dry_run` (F16) everything is validated and placed
         exactly as for a real add, then rolled back: nothing is queued and no worker
         is woken; the reply describes what would happen."""
         # `raw_argv` is exactly what the user typed after `--`, with no
@@ -1362,8 +1571,25 @@ class Daemon:
         # in show/list reflects what was typed. Older clients that don't
         # send it fall back to `argv`, same as before this field existed.
         jobs_arg = args.get("jobs")
+        array_arg = args.get("array")
         specs: list[dict[str, Any]]
-        if jobs_arg is None:
+        if jobs_arg is not None and array_arg is not None:
+            raise ValueError("jobs and array cannot be combined")
+        if array_arg is not None:
+            if (
+                not isinstance(array_arg, list) or len(array_arg) != 2
+                or any(type(n) is not int or not 0 <= n <= db.MAX_INDEX for n in array_arg) or array_arg[1] < array_arg[0]
+            ):
+                raise ValueError(f"array must be [first, last]: two integers between 0 and {db.MAX_INDEX}, first <= last")
+            if array_arg[1] - array_arg[0] + 1 > db.MAX_SWEEP:
+                raise ValueError(f"too many jobs: at most {db.MAX_SWEEP} per add")
+            specs = [
+                {"argv": args.get("argv"), "raw_argv": args.get("raw_argv"), "index": n}
+                for n in range(array_arg[0], array_arg[1] + 1)
+            ]
+        elif jobs_arg is None:
+            if "argv" not in args:
+                raise ValueError("argv is required")
             specs = [{"argv": args["argv"], "raw_argv": args.get("raw_argv"), "index": None}]
         else:
             if not isinstance(jobs_arg, list) or not jobs_arg or not all(isinstance(j, dict) for j in jobs_arg):
@@ -1373,8 +1599,10 @@ class Daemon:
             specs = [{"argv": j.get("argv"), "raw_argv": j.get("raw_argv"), "index": j.get("index")} for j in jobs_arg]
             for spec in specs:
                 idx = spec["index"]
-                if idx is not None and (type(idx) is not int or idx < 0):
-                    raise ValueError("index must be a non-negative integer")
+                if idx is not None and (type(idx) is not int or not 0 <= idx <= db.MAX_INDEX):
+                    raise ValueError(f"index must be an integer between 0 and {db.MAX_INDEX}")
+        if "cwd" not in args:
+            raise ValueError("cwd is required")
         cwd = args["cwd"]
         channel = args.get("channel") or db.DEFAULT_CHANNEL
         now = bool(args.get("now"))
@@ -1387,15 +1615,13 @@ class Daemon:
                 raise ValueError("empty command")
             if not (isinstance(argv, list) and all(isinstance(a, str) for a in argv)) or not isinstance(cwd, str):
                 raise ValueError("argv must be a list of strings and cwd a string")
-        if type(channel) is not int or channel < 1:
-            raise ValueError("channel must be a positive integer")
-        if timeout_secs is not None and (type(timeout_secs) is not int or timeout_secs < 0):
-            raise ValueError("timeout must be a non-negative integer")
+        self._check_channel(channel)
+        if timeout_secs is not None:
+            self._check_timeout(timeout_secs)
         for key in ("before", "after"):
             if args.get(key) is not None and type(args[key]) is not int:
                 raise ValueError(f"{key} must be a job id")
-        if not isinstance(max_retries, int) or max_retries < 0:
-            raise ValueError("retries must be a non-negative integer")
+        self._check_retries(max_retries)
         if now and (args.get("before") is not None or args.get("after") is not None):
             raise ValueError("--now cannot be combined with --before/--after")
         on_fail = args.get("on_fail") or "continue"
@@ -1434,6 +1660,7 @@ class Daemon:
                 raise ValueError(f"{key} must be a string")
         client_path = args.get("path") or None
         prepared: list[tuple[list[str], list[str], int | None]] = []  # (raw argv, resolved argv, index)
+        resolved_cache: dict[tuple[str, ...], list[str]] = {}  # an --array sweep resolves its one command once
         for spec in specs:
             argv = spec["argv"]
             raw_argv = spec["raw_argv"] or argv
@@ -1445,10 +1672,14 @@ class Daemon:
                 raise ValueError("environment values must not contain NUL bytes")
             if not os.path.isdir(cwd):
                 raise ValueError(f"working directory does not exist: {cwd}")
-            resolved = resolve_command(argv, cwd, path_env=client_path)
-            exe = resolved[0]
-            if not (os.path.isfile(exe) and os.access(exe, os.X_OK)):
-                raise ValueError(f"executable not found or not executable: {exe}")
+            cache_key = tuple(argv)
+            resolved = resolved_cache.get(cache_key)
+            if resolved is None:
+                resolved = resolve_command(argv, cwd, path_env=client_path)
+                exe = resolved[0]
+                if not (os.path.isfile(exe) and os.access(exe, os.X_OK)):
+                    raise ValueError(f"executable not found or not executable: {exe}")
+                resolved_cache[cache_key] = resolved
             prepared.append((raw_argv, resolved, spec["index"]))
         # layers, later wins: passthrough copied by the client, PATH/VIRTUAL_ENV/PYTHONPATH,
         # then the explicit --env (a sweep's QUR_INDEX is set per job below, over all of them)
@@ -1474,7 +1705,7 @@ class Daemon:
         # inserted in ONE transaction: if any job is rejected, none is created.
         assert self.conn is not None
         job_ids: list[int] = []
-        for raw_argv, resolved, index in prepared:
+        for n, (raw_argv, resolved, index) in enumerate(prepared, 1):
             job_env = dict(env_extra)
             if index is not None:
                 job_env["QUR_INDEX"] = str(index)
@@ -1502,6 +1733,9 @@ class Daemon:
                 stop_signal=stop_signal,
                 stop_grace_secs=stop_grace_secs,
                 commit=False,
+                # one deadlock search per sweep: a cycle through any job of the chain also
+                # passes through the last one (5.todo item 10)
+                check_deadlock=n == len(prepared),
             ))
         if dry_run:
             # no await between the inserts above and this rollback, so nothing else can
@@ -1519,7 +1753,7 @@ class Daemon:
         self.conn.commit()
         job_id = job_ids[0]
         result: dict[str, Any] = {"id": job_id, "channel": channel}
-        if jobs_arg is not None:
+        if jobs_arg is not None or array_arg is not None:
             result["ids"] = job_ids
 
         if deps:
@@ -1561,9 +1795,9 @@ class Daemon:
         would-be jobs are in the open transaction (the caller rolls it back), so the
         positions and dependency verdicts are the real ones."""
         assert self.conn is not None
-        lane = [j["id"] for j in db.get_queue(self.conn, channel, now)]
-        running = db.get_running(self.conn, channel)
-        stopped = db.get_stopped(self.conn, channel)
+        lane = db.get_queue_ids(self.conn, channel, now)
+        running_id = db.get_running_id(self.conn, channel)
+        stopped_id = db.get_stopped_id(self.conn, channel)
         jobs: list[dict[str, Any]] = []
         for new_id, (raw_argv, resolved, index) in zip(job_ids, prepared, strict=True):
             verdict, dep_id = db.dep_verdict(self.conn, new_id) if deps else ("ready", None)
@@ -1581,8 +1815,8 @@ class Daemon:
             "cwd": cwd,
             "priority": now,
             "queued_before": len(lane) - len(job_ids),
-            "running_id": running["id"] if running else None,
-            "frozen_id": stopped["id"] if stopped else None,
+            "running_id": running_id,
+            "frozen_id": stopped_id,
             "paused": db.get_paused(self.conn, channel),
             "env": env_extra,
             "on_finish": on_finish_cmd,
@@ -1608,11 +1842,14 @@ class Daemon:
                 deps[i] = mode
         return deps
 
-    def _with_deps(self, job: dict[str, Any]) -> dict[str, Any]:
+    def _with_deps(self, job: dict[str, Any], deps: dict[str, list[int]] | None = None) -> dict[str, Any]:
         """`job` plus its dependencies for display: `depends_on`, `after_any` and
-        `waiting_on` (job ids; the last is those that have not ended yet)."""
+        `waiting_on` (job ids; the last is those that have not ended yet). `deps`
+        lets a caller that already looked up several jobs' dependencies in one
+        bulk query (`db.dep_info_bulk`) pass the result in instead of a fresh
+        per-job query here."""
         assert self.conn is not None
-        info: dict[str, Any] = {**job, **db.dep_info(self.conn, job["id"])}
+        info: dict[str, Any] = {**job, **(deps if deps is not None else db.dep_info(self.conn, job["id"]))}
         info["editing"] = False
         if job["status"] == "queued":
             lock = db.live_edit_lock(self.conn, job["id"])
@@ -1626,15 +1863,27 @@ class Daemon:
         assert self.conn is not None
         channels: dict[int, dict[str, Any]] = {}
         for channel in db.list_channels(self.conn):
+            queue = db.get_queue(self.conn, channel)
+            # one query for every queued job's dependencies instead of one per job
+            deps_by_id = db.dep_info_bulk(self.conn, [j["id"] for j in queue])
             channels[channel] = {
                 "running": db.get_running(self.conn, channel),
-                "queue": [self._with_deps(j) for j in db.get_queue(self.conn, channel)],
+                "queue": [self._with_deps(j, deps_by_id[j["id"]]) for j in queue],
                 "priority_queue": db.get_queue(self.conn, channel, is_priority=True),
                 "frozen": db.get_stopped(self.conn, channel),
                 "backlog": db.get_backlog(self.conn, channel),
                 "paused": db.get_paused(self.conn, channel),
             }
         return {"channels": channels}
+
+    async def _cmd_channel_status(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Cheap summary for `wait --channel`: counts only (running, frozen, queued,
+        priority_queued) plus paused, instead of `list`'s full per-job rows -- `wait`
+        only needs to know whether the channel is idle."""
+        assert self.conn is not None
+        self._int_arg(args, "channel", positive=True)
+        channel = args["channel"]
+        return {"channel": channel, "paused": db.get_paused(self.conn, channel), **db.get_channel_counts(self.conn, channel)}
 
     async def _cmd_history(self, args: dict[str, Any]) -> dict[str, Any]:
         """Finished jobs, newest first. Optional args: `statuses` (list of terminal
@@ -1708,7 +1957,41 @@ class Daemon:
             return None
         if type(value) is not int or (positive and value < 1):
             raise ValueError(f"{key} must be a{' positive' if positive else 'n'} integer")
+        if key == "channel" and value > db.MAX_CHANNEL:  # L7: every request that names a channel
+            raise ValueError(f"channel must be between 1 and {db.MAX_CHANNEL}")
         return value
+
+    @staticmethod
+    def _check_channel(value: Any) -> None:
+        """L7: a channel is an int in 1..db.MAX_CHANNEL (a bool or a huge number is refused)."""
+        if type(value) is not int or value < 1:
+            raise ValueError("channel must be a positive integer")
+        if value > db.MAX_CHANNEL:
+            raise ValueError(f"channel must be between 1 and {db.MAX_CHANNEL}")
+
+    @staticmethod
+    def _check_timeout(value: Any) -> None:
+        """L7: --timeout seconds: an int in 0..db.MAX_TIMEOUT_SECS (0 = none)."""
+        if type(value) is not int or value < 0:
+            raise ValueError("timeout must be a non-negative integer")
+        if value > db.MAX_TIMEOUT_SECS:
+            raise ValueError(f"timeout must be at most {db.MAX_TIMEOUT_SECS} seconds (10 years)")
+
+    @staticmethod
+    def _check_retries(value: Any) -> None:
+        """L7: --retries: an int (not a bool) in 0..db.MAX_RETRIES."""
+        if type(value) is not int or value < 0:
+            raise ValueError("retries must be a non-negative integer")
+        if value > db.MAX_RETRIES:
+            raise ValueError(f"retries must be at most {db.MAX_RETRIES}")
+
+    @classmethod
+    def _pid_arg(cls, args: Any, *, required: bool = True) -> int | None:
+        """H2: an editor's process id: an int in 1..MAX_PID (a larger one can never be a live Linux pid)."""
+        pid = cls._int_arg(args, "pid", required=required, positive=True)
+        if pid is not None and pid > MAX_PID:
+            raise ValueError(f"pid must be between 1 and {MAX_PID}")
+        return pid
 
     async def _cmd_show(self, args: dict[str, Any]) -> dict[str, Any]:
         assert self.conn is not None
@@ -1717,6 +2000,21 @@ class Daemon:
         if job is None:
             raise ValueError(f"job {args['id']} does not exist")
         return self._with_deps(job)
+
+    async def _cmd_states(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Batch state lookup for `qur wait JOBS`: `ids` (at most MAX_SWEEP job ids) in, and out
+        `jobs` (id, status, exit_code, note, attempt, max_retries, channel for each id that
+        exists, in request order, duplicates dropped) and `missing` (ids with no row). One
+        round trip and one query instead of a `show` per job."""
+        assert self.conn is not None
+        ids = args.get("ids")
+        if not isinstance(ids, list) or not ids or any(type(i) is not int or i < 1 for i in ids):
+            raise ValueError("ids must be a non-empty list of job ids")
+        if len(ids) > db.MAX_SWEEP:
+            raise ValueError(f"too many ids (at most {db.MAX_SWEEP})")
+        unique = list(dict.fromkeys(ids))
+        found = db.get_states(self.conn, unique)
+        return {"jobs": [found[i] for i in unique if i in found], "missing": [i for i in unique if i not in found]}
 
     async def _cmd_clear(self, args: dict[str, Any]) -> dict[str, Any]:
         assert self.conn is not None
@@ -1727,6 +2025,7 @@ class Daemon:
     async def _cmd_rm(self, args: dict[str, Any]) -> dict[str, Any]:
         assert self.conn is not None
         self._int_arg(args, "id")
+        self._not_starting(args["id"])
         job = db.get_job(self.conn, args["id"])
         db.remove_from_queue(self.conn, args["id"])
         if job is not None:
@@ -1764,6 +2063,7 @@ class Daemon:
 
         status = job["status"]
         if status == "queued":
+            self._not_starting(job_id)
             db.cancel_queued(self.conn, job_id, self.keep)
             self._settle_dependants(job_id)
             self._wake_worker(channel)  # it may have been the waiting head that held the channel
@@ -1780,6 +2080,7 @@ class Daemon:
             # drop it from the frozen slot first so the priority lane does
             # not try to resume a job that is about to die
             del self._frozen[channel]
+            self._freeze_changed(channel)
             await self._cancel_running(job_id, frozen[1], frozen=True, sig=sig, grace=grace)
         else:
             raise ValueError(f"job {job_id} is already {status}")
@@ -1817,6 +2118,13 @@ class Daemon:
 
     # -- edit (qur edit) ------------------------------------------------------
 
+    def _not_starting(self, job_id: int) -> None:
+        """L3: refuse to remove/cancel a job whose process is being created right now (the row
+        still says queued, so the removal would succeed and the new process would be left
+        untracked: nothing reads its output, nothing can kill it)."""
+        if job_id in self._starting:
+            raise ValueError(f"job {job_id} is starting right now; try again in a moment")
+
     def _editable(self, job_id: int) -> dict[str, Any]:
         assert self.conn is not None
         if job_id in self._starting:
@@ -1829,7 +2137,7 @@ class Daemon:
         is dropped by the daemon if that process dies or after db.EDIT_LOCK_SECS. Returns the job."""
         assert self.conn is not None
         job_id = self._int_arg(args, "id")
-        pid = self._int_arg(args, "pid", positive=True)
+        pid = self._pid_arg(args)
         assert job_id is not None and pid is not None
         job = self._editable(job_id)
         db.take_edit_lock(self.conn, job_id, pid)
@@ -1840,7 +2148,7 @@ class Daemon:
         """Abandon an edit: drop the caller's lock and let the channel go on."""
         assert self.conn is not None
         job_id = self._int_arg(args, "id")
-        pid = self._int_arg(args, "pid", positive=True)
+        pid = self._pid_arg(args)
         assert job_id is not None and pid is not None
         released = db.release_edit_lock(self.conn, job_id, pid)
         job = db.get_job(self.conn, job_id)
@@ -1880,7 +2188,7 @@ class Daemon:
         the job must not be locked by someone else. Returns {"id", "changed": [...]}."""
         assert self.conn is not None
         job_id = self._int_arg(args, "id")
-        pid = self._int_arg(args, "pid", required=False, positive=True)
+        pid = self._pid_arg(args, required=False)
         assert job_id is not None
         job = self._editable(job_id)
         updates: dict[str, Any] = {}
@@ -1930,16 +2238,15 @@ class Daemon:
 
         if "timeout_secs" in args:
             timeout_secs = args["timeout_secs"]
-            if timeout_secs is not None and (type(timeout_secs) is not int or timeout_secs < 0):
-                raise ValueError("timeout must be a non-negative integer")
+            if timeout_secs is not None:
+                self._check_timeout(timeout_secs)
             timeout_secs = timeout_secs or None  # 0 = no timeout
             if timeout_secs != job["timeout_secs"]:
                 updates["timeout_secs"] = timeout_secs
                 changed.append("timeout")
         if "max_retries" in args:
             max_retries = args["max_retries"]
-            if type(max_retries) is not int or max_retries < 0:
-                raise ValueError("retries must be a non-negative integer")
+            self._check_retries(max_retries)
             if max_retries != job["max_retries"]:
                 updates["max_retries"] = max_retries
                 changed.append("retries")
@@ -1998,8 +2305,7 @@ class Daemon:
         channel: int | None = None
         if "channel" in args:
             channel = args["channel"]
-            if type(channel) is not int or channel < 1:
-                raise ValueError("channel must be a positive integer")
+            self._check_channel(channel)
             if channel == job["channel"]:
                 channel = None
             else:
@@ -2071,19 +2377,25 @@ class Daemon:
             writer.close()
             return
         req: Any = None
+        line: bytes | None
         try:
             try:
                 line = await asyncio.wait_for(reader.readline(), timeout=CLIENT_READ_TIMEOUT_SECS)
             except asyncio.TimeoutError:
                 writer.close()
                 return
-            if not line:
-                writer.close()
-                await writer.wait_closed()
-                return
-            req = json.loads(line.decode())
-            resp = await self.handle_request(req)
-        except ValueError:  # bad JSON, bad UTF-8, or line over the stream limit
+            except ValueError:  # H4: readline reports a line over the stream limit as ValueError
+                line = None
+            if line is None:
+                resp = {"ok": False, "error": f"request too large (over {MAX_REQUEST_BYTES // (1024 * 1024)} MiB)"}
+            else:
+                if not line:
+                    writer.close()
+                    await writer.wait_closed()
+                    return
+                req = json.loads(line.decode())
+                resp = await self.handle_request(req)
+        except ValueError:  # bad JSON or bad UTF-8
             resp = {"ok": False, "error": "invalid request"}
         except Exception as e:  # last-resort guard: one bad request must not kill the daemon
             print(f"[queuerd] unexpected error handling request {req!r}:", file=sys.stderr)
@@ -2123,7 +2435,7 @@ class Daemon:
         # umask 077 while binding: socket is born 0600, no window where it is looser
         old_umask = os.umask(0o077)
         try:
-            server = await asyncio.start_unix_server(self._handle_client, path=str(self.socket_path))
+            server = await asyncio.start_unix_server(self._handle_client, path=str(self.socket_path), limit=MAX_REQUEST_BYTES)
         finally:
             os.umask(old_umask)
         os.chmod(self.socket_path, 0o600)
@@ -2133,6 +2445,7 @@ class Daemon:
             cleaner = asyncio.create_task(self._log_cleaner())
             serving = asyncio.create_task(server.serve_forever())
             stop_wait = asyncio.ensure_future(self._stopping.wait())
+            ended_wait = asyncio.ensure_future(self._worker_ended.wait())  # H2: also covers workers made after startup
             loop = asyncio.get_running_loop()
             handled: list[signal.Signals] = []
             for sig in (signal.SIGTERM, signal.SIGINT):
@@ -2141,33 +2454,59 @@ class Daemon:
                     handled.append(sig)
                 except (NotImplementedError, RuntimeError, ValueError):  # not the main thread
                     pass
-            try:
-                waitables: set[asyncio.Future[Any]] = {serving, stop_wait, *self._worker_tasks.values()}
-                done, _ = await asyncio.wait(waitables, return_when=asyncio.FIRST_COMPLETED)
-            except asyncio.CancelledError:
-                # cancelled from outside (not a stop request): hard stop, as before
-                for task in self._worker_tasks.values():
-                    task.cancel()
-                raise
+            try:  # L9: the signal handlers stay until _shutdown has returned (a repeat only re-sets the flag)
+                try:
+                    waitables: set[asyncio.Future[Any]] = {serving, stop_wait, ended_wait, *self._worker_tasks.values()}
+                    done, _ = await asyncio.wait(waitables, return_when=asyncio.FIRST_COMPLETED)
+                except asyncio.CancelledError:
+                    # cancelled from outside (not a stop request): hard stop, as before
+                    for task in self._worker_tasks.values():
+                        task.cancel()
+                    raise
+                finally:
+                    stop_wait.cancel()
+                    ended_wait.cancel()
+                    serving.cancel()
+                    listener.cancel()
+                    cleaner.cancel()
+                # a stop request, or a worker/server that ended: either way the daemon is going
+                # down, so running jobs are recorded as interrupted before the process exits
+                await self._shutdown(server)
             finally:
                 for sig in handled:
                     loop.remove_signal_handler(sig)
-                stop_wait.cancel()
-                serving.cancel()
-                listener.cancel()
-                cleaner.cancel()
-            # a stop request, or a worker/server that ended: either way the daemon is going
-            # down, so running jobs are recorded as interrupted before the process exits
-            await self._shutdown(server)
-            for finished in done:
-                if finished is not stop_wait and not finished.cancelled():
+            for finished in (*done, *self._worker_tasks.values()):
+                if finished is not stop_wait and finished is not ended_wait and finished.done() and not finished.cancelled():
                     finished.result()  # a crashed worker still surfaces its error
+
+
+def _hard_exit(code: int) -> NoReturn:
+    """Flush stdout/stderr and end the process at once, skipping interpreter teardown."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except (OSError, ValueError):
+            pass
+    os._exit(code)
+
+
+async def _serve_then_exit(daemon: Daemon) -> None:
+    """Run the daemon, and once it has shut down cleanly end the process right here.
+
+    5.todo item 14: `asyncio.run()` waits for the default executor's threads when it returns,
+    and a Telegram `getUpdates` long poll (up to ~20 s) is nearly always in flight there with
+    nothing to cancel it, so a stop could take that long more and, on a dead network, pass
+    systemd's TimeoutStopSec (a SIGKILL that looks like a crash). `_shutdown` has finished by
+    now (jobs recorded, state saved, every commit already durable in WAL), so nothing is
+    left to wait for. An error from serve() still propagates as before."""
+    await daemon.serve()
+    _hard_exit(0)
 
 
 def main() -> None:
     daemon = Daemon()
     try:
-        asyncio.run(daemon.serve())
+        asyncio.run(_serve_then_exit(daemon))
     except KeyboardInterrupt:
         pass
     except AlreadyRunning as e:

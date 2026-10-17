@@ -16,19 +16,33 @@ from typing import Any
 
 PASSTHROUGH_KEY = "QUR_ENV_PASSTHROUGH"  # reserved: never reaches the job
 PASSTHROUGH_ENV_VAR = "QUEUER_ENV_PASSTHROUGH"  # overrides DEFAULT_PASSTHROUGH
+# 5.todo M4: widened from the single names (CUDA_VISIBLE_DEVICES, OMP_NUM_THREADS, ...) to the
+# families MD/DFT/GPU tools read: CUDA_HOME, OMP_PLACES / OMP_PROC_BIND, MKL_*, NCCL_*, OMPI_*,
+# UCX_*, CONDA_*. Anything else (LAMMPS_POTENTIALS, ...): QUEUER_ENV_PASSTHROUGH or --env.
 DEFAULT_PASSTHROUGH = (
-    "CUDA_VISIBLE_DEVICES",
-    "OMP_NUM_THREADS",
-    "MKL_NUM_THREADS",
-    "OPENBLAS_NUM_THREADS",
+    "CUDA_*",
+    "OMP_*",
+    "MKL_*",
+    "OPENBLAS_*",
+    "NCCL_*",
+    "OMPI_*",
+    "UCX_*",
+    "CONDA_*",
     "LD_LIBRARY_PATH",
     "LANG",
     "LC_*",
     "TERM",
     "TZ",
 )
+# 5.todo M4: always taken from the DAEMON's own environment (when set there) and given to every
+# job: some MPI, conda and licence tools refuse to start without them. `--env` can override.
+BASE_ENV_NAMES = ("USER", "LOGNAME", "SHELL", "TMPDIR")
 DEFAULT_JOB_ENV = {"PYTHONUNBUFFERED": "1"}  # applied to every job; an --env can override
-SECRET_WORDS = ("KEY", "TOKEN", "SECRET", "PASSWORD")
+SECRET_WORDS = ("KEY", "TOKEN", "SECRET", "PASSWORD")  # hidden when the name CONTAINS one (MONKEY, API_KEY_2)
+# 5.todo M6: hidden only as a WHOLE name segment (split on _ . -), so MYSQL_PWD, DB_PASS,
+# AWS_CREDENTIALS, API_AUTH and SESSION_COOKIE are masked but QUR_ENV_PASSTHROUGH, AUTHOR and
+# `--tokenizer`-style names stay readable
+SECRET_SEGMENTS = frozenset({"PASS", "PWD", "CRED", "CREDS", "CREDENTIAL", "CREDENTIALS", "AUTH", "COOKIE", "COOKIES", "SESSION"})
 # variables queuer itself sets from the client: shown by name only (values are long)
 NAME_ONLY = frozenset({"PATH", "VIRTUAL_ENV", "PYTHONPATH"})
 
@@ -95,7 +109,21 @@ def parse_env_options(values: list[str] | None, environ: Mapping[str, str]) -> d
 
 def is_secret_name(name: str) -> bool:
     upper = name.upper()
-    return any(word in upper for word in SECRET_WORDS)
+    if any(word in upper for word in SECRET_WORDS):
+        return True
+    return any(part in SECRET_SEGMENTS for part in re.split(r"[_.\-]+", upper))
+
+
+def base_environment(environ: Mapping[str, str]) -> dict[str, str]:
+    """What every job (and hook) starts from: PATH and HOME (always, empty if unset, as before)
+    plus USER, LOGNAME, SHELL and TMPDIR when the daemon has them. Nothing else of the
+    daemon's environment is passed on, and an unset name is never invented."""
+    env = {"PATH": environ.get("PATH", ""), "HOME": environ.get("HOME", "")}
+    for name in BASE_ENV_NAMES:
+        value = environ.get(name)
+        if value is not None and "\0" not in value:
+            env[name] = value
+    return env
 
 
 def job_environment(env_extra: Mapping[str, str]) -> dict[str, str]:

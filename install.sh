@@ -8,11 +8,17 @@
 #   ./install.sh install --skip-tests    install without running the test suite first
 #   ./install.sh uninstall --yes         uninstall without any prompt (no terminal needed);
 #                                        keeps the job logs and leaves linger enabled
+#   ./install.sh install --yes           re-install without asking, even if jobs are running
+#
+# Stopping the daemon kills its running jobs (recorded "interrupted", never retried). Before
+# it does that, install and uninstall list the running jobs and ask (default: no). With no
+# terminal and no --yes the answer is no, so a re-run from a script never kills a job.
 #
 # Order of operations, and why: bootstrap uv -> sync venv -> run full test
 # suite (unless --skip-tests) -> install CLI + shell completion -> only then touch the
 # running service. If the tests fail, the script stops there and the previously-installed
-# (working) daemon, if any, is left running untouched.
+# (working) daemon, if any, is left running untouched. The same goes for a "no" to the
+# question about running jobs.
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -29,6 +35,107 @@ cd "$PROJECT_DIR"
 ask() {  # ask "prompt" -> sets REPLY; empty when there is no terminal
     REPLY=""
     if [ -t 0 ]; then read -r -p "$1" REPLY || REPLY=""; fi
+}
+
+# M2 (5.todo): never kill a running job without asking. `qur daemon stop/restart` ask
+# first; the installer used to stop the service without a word.
+running_jobs() {  # one line per running or frozen job; nothing when idle or no daemon answers
+    local qur_bin py
+    if [ -x "$PROJECT_DIR/.venv/bin/qur" ]; then
+        qur_bin="$PROJECT_DIR/.venv/bin/qur"
+    else
+        qur_bin="$(command -v qur || true)"
+    fi
+    [ -n "$qur_bin" ] || return 0  # no CLI, so no daemon of ours to ask
+    py="$PROJECT_DIR/.venv/bin/python"
+    [ -x "$py" ] || py="$(command -v python3 || true)"
+    if [ -z "$py" ]; then
+        echo "WARNING: python3 not found, so running jobs cannot be checked." >&2
+        return 0
+    fi
+    # `qur status --json` fails when the daemon does not answer: then there is nothing to kill
+    "$qur_bin" status --json 2> /dev/null | "$py" -c '
+import json, sys
+try:
+    channels = json.load(sys.stdin).get("channels", {})
+except ValueError:
+    sys.exit(0)
+for channel in sorted(channels, key=int):
+    for key in ("running", "frozen"):
+        job = channels[channel].get(key)
+        if not job:
+            continue
+        try:
+            words = " ".join(json.loads(job["raw_cmd"]))
+        except (KeyError, TypeError, ValueError):
+            words = "?"
+        if len(words) > 70:
+            words = words[:67] + "..."
+        print("#%s (channel %s, %s)  %s" % (job["id"], channel, key, words))
+' 2> /dev/null || true
+}
+
+confirm_stop_jobs() {  # confirm_stop_jobs WHAT -> returns when it is fine to stop the daemon, else exits 1
+    local jobs
+    jobs="$(running_jobs)"
+    [ -n "$jobs" ] || return 0
+    echo ""
+    echo "queuerd is running these jobs:"
+    echo "$jobs" | sed 's/^/  /'
+    echo "$1 stops the daemon, which kills them. They are recorded as 'interrupted'"
+    echo "(not failed, not retried); the queued jobs stay queued."
+    # written "yes" in quotes on purpose: tests/test_install_sh.py finds the uninstall prompts by the
+    # first unquoted `[ "$ASSUME_YES" = yes ]`
+    if [ "$ASSUME_YES" = "yes" ]; then
+        echo "--yes: continuing."
+        return 0
+    fi
+    ask "Kill them and continue? [y/N] "
+    case "$REPLY" in
+        y|Y|yes|YES) ;;
+        *)
+            echo "Cancelled. The daemon and its jobs were not touched." >&2
+            echo "Re-run when the jobs have finished, or use --yes to kill them." >&2
+            exit 1
+            ;;
+    esac
+}
+
+wait_unit_stopped() {  # up to 25 s for the unit to go inactive; exits 1 if it does not
+    local _
+    for _ in $(seq 1 25); do systemctl --user is-active --quiet queuerd 2> /dev/null || return 0; sleep 1; done
+    echo "WARNING: the queuerd service is still active after 25 s:" >&2
+    systemctl --user status queuerd --no-pager >&2 || true
+    exit 1
+}
+
+stop_stray_queuerd() {  # a queuerd that systemd does not manage (started by hand, a dev copy)
+    local pids _
+    pids="$(pgrep -x queuerd || true)"
+    [ -n "$pids" ] || return 0
+    echo "A queuerd process that the service does not manage is running:"
+    pgrep -a -x queuerd
+    if [ "$ASSUME_YES" != yes ]; then
+        ask "Stop it? [y/N] "
+        case "$REPLY" in
+            y|Y|yes|YES) ;;
+            *)
+                echo "Cancelled. That process was left running." >&2
+                exit 1
+                ;;
+        esac
+    fi
+    # SIGTERM only: a stopping daemon kills its jobs (up to 5 s grace) and records them as
+    # "interrupted" before it exits, so give it time to do that
+    # shellcheck disable=SC2086
+    kill $pids 2> /dev/null || true
+    for _ in $(seq 1 25); do pgrep -x queuerd > /dev/null || break; sleep 1; done
+    if pgrep -x queuerd > /dev/null; then
+        echo "WARNING: a queuerd process is still running:" >&2
+        pgrep -a -x queuerd >&2
+        echo "Kill it (kill <pid>) and re-run to finish." >&2
+        exit 1
+    fi
 }
 
 ACTION=""
@@ -93,18 +200,11 @@ if [ "$ACTION" = "uninstall" ]; then
         case "$REPLY" in y|Y|yes|YES) DEL_LINGER=yes ;; esac
     fi
 
+    confirm_stop_jobs "Uninstalling"
     echo "==> Stopping and disabling queuerd"
     systemctl --user disable --now queuerd 2>/dev/null || true
-    pkill -x queuerd 2>/dev/null || true
-    # a stopping daemon kills its jobs (up to 5 s grace) and records them as "interrupted"
-    # before it exits: give a stray one time to do that
-    for _ in $(seq 1 25); do pgrep -x queuerd > /dev/null || break; sleep 1; done
-    if pgrep -x queuerd > /dev/null; then
-        echo "WARNING: a queuerd process is still running:" >&2
-        pgrep -a -x queuerd >&2
-        echo "Kill it (kill <pid>) and re-run to finish." >&2
-        exit 1
-    fi
+    wait_unit_stopped
+    stop_stray_queuerd
     rm -f "$SERVICE_FILE"
     systemctl --user daemon-reload 2>/dev/null || true
     systemctl --user reset-failed queuerd 2>/dev/null || true
@@ -154,7 +254,7 @@ if [ "$ACTION" = "uninstall" ]; then
 fi
 
 if [ "$ACTION" != "install" ]; then
-    echo "Usage: $0 [install|uninstall] [--skip-tests]" >&2
+    echo "Usage: $0 [install|uninstall] [--skip-tests] [--yes]" >&2
     exit 2
 fi
 
@@ -262,17 +362,14 @@ done
 # 4. Stop any existing queuerd (systemd-managed or a stray manual process)
 # ---------------------------------------------------------------------------
 
+# M2: a running job is listed and the answer asked for first (default no); only the
+# service is stopped (no blanket pkill), and a process the service does not manage is
+# stopped only after a separate yes.
+confirm_stop_jobs "Re-installing"
 echo "==> Stopping any existing queuerd (systemd-managed or stray manual process)"
 systemctl --user stop queuerd 2>/dev/null || true
-pkill -x queuerd 2>/dev/null || true
-# a stopping daemon kills its jobs (up to 5 s grace) and records them as "interrupted"
-# before it exits: give a stray one time to do that
-for _ in $(seq 1 25); do pgrep -x queuerd > /dev/null || break; sleep 1; done
-if pgrep -x queuerd > /dev/null; then
-    echo "WARNING: a queuerd process is still running after attempting to stop it." >&2
-    pgrep -a -x queuerd >&2
-    exit 1
-fi
+wait_unit_stopped
+stop_stray_queuerd
 
 # ---------------------------------------------------------------------------
 # 4b. Tighten permissions of state created by older versions (daemon is
@@ -343,6 +440,11 @@ RestartSec=2
 # On stop the daemon SIGTERMs (5 s later SIGKILLs) running jobs, records them as "interrupted" and
 # sends the Telegram message: ~20 s worst case. Do not hang a logout on them.
 TimeoutStopSec=30
+# One OOM-killed job (the kernel or systemd-oomd picks a job process, not the daemon) must not
+# make systemd stop the whole service: the default policy can, and every other channel's job
+# would then be killed and recorded as interrupted. Needs systemd 243 or newer; an older one
+# ignores the line.
+OOMPolicy=continue
 $(hardening_lines "$1")
 
 [Install]

@@ -335,6 +335,129 @@ def test_schema_unreadable_file_fails():
 
 
 # ---------------------------------------------------------------------------
+# database filesystem (5.todo M8: WAL on network disks)
+# ---------------------------------------------------------------------------
+
+ROOT_EXT4 = "29 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n"
+
+
+def _mountinfo(*mounts: tuple[str, str]) -> str:
+    """A /proc/self/mountinfo text: ext4 root plus the given (mount point, fstype) lines."""
+    lines = [ROOT_EXT4.strip()]
+    for i, (point, fstype) in enumerate(mounts):
+        lines.append(f"{40 + i} 29 0:{40 + i} / {point} rw,relatime shared:{2 + i} - {fstype} src rw")
+    return "\n".join(lines) + "\n"
+
+
+def _db_fs(monkeypatch, text):
+    monkeypatch.setattr(selfcheck, "_read_mountinfo", lambda: text)
+    return selfcheck.check_db_filesystem()
+
+
+def test_mount_for_picks_the_longest_matching_mount_point():
+    text = _mountinfo(("/home", "nfs4"), ("/home/me/fast", "ext4"))
+    assert selfcheck._mount_for("/home/me/.local/state", text) == ("/home", "nfs4")
+    assert selfcheck._mount_for("/home/me/fast/db", text) == ("/home/me/fast", "ext4")
+    assert selfcheck._mount_for("/opt/x", text) == ("/", "ext4")
+
+
+def test_mount_for_needs_a_whole_path_component():
+    text = _mountinfo(("/home", "nfs4"))
+    assert selfcheck._mount_for("/homework/x", text) == ("/", "ext4")
+    assert selfcheck._mount_for("/home", text) == ("/home", "nfs4")
+
+
+def test_mount_for_later_line_wins_for_stacked_mounts():
+    text = _mountinfo(("/data", "ext4"), ("/data", "nfs"))
+    assert selfcheck._mount_for("/data/x", text) == ("/data", "nfs")
+
+
+def test_mount_for_decodes_escaped_spaces_and_skips_garbage_lines():
+    text = "garbage line\n" + ROOT_EXT4 + "50 29 0:50 / /mnt/my\\040disk rw - cifs //srv/share rw\n"
+    assert selfcheck._mount_for("/mnt/my disk/q", text) == ("/mnt/my disk", "cifs")
+    assert selfcheck._mount_for("/mnt/my", text) == ("/", "ext4")
+    assert selfcheck._mount_for("/x", "garbage only\n") is None
+
+
+def test_mount_for_handles_optional_fields_before_the_separator():
+    text = "60 29 0:60 / /srv rw,relatime shared:5 master:2 propagate_from:3 - nfs4 host:/srv rw\n"
+    assert selfcheck._mount_for("/srv/q", text) == ("/srv", "nfs4")
+
+
+@pytest.mark.parametrize("fstype", ["nfs", "nfs4", "cifs", "smb3", "9p", "lustre", "gpfs", "ceph", "fuse", "fuse.sshfs", "fuse.glusterfs"])
+def test_risky_filesystems_are_flagged(fstype):
+    assert selfcheck._is_risky_fs(fstype)
+
+
+@pytest.mark.parametrize("fstype", ["ext4", "xfs", "btrfs", "zfs", "tmpfs", "overlay", "fuseblk", "f2fs", "apfs"])
+def test_local_filesystems_are_not_flagged(fstype):
+    assert not selfcheck._is_risky_fs(fstype)
+
+
+def test_db_on_a_local_disk_is_ok(tmp_path, monkeypatch):
+    c = _db_fs(monkeypatch, _mountinfo())
+    assert c.name == "db filesystem" and c.status == OK and "ext4" in c.detail
+
+
+def test_db_on_nfs_warns_and_points_at_the_db_path_variable(tmp_path, monkeypatch):
+    c = _db_fs(monkeypatch, _mountinfo((str(tmp_path.resolve()), "nfs4")))
+    assert c.status == WARN and "nfs4" in c.detail and "WAL" in c.detail
+    assert "QUEUER_DB_PATH" in c.hint and "local disk" in c.hint
+
+
+def test_db_on_fuse_warns(tmp_path, monkeypatch):
+    assert _db_fs(monkeypatch, _mountinfo((str(tmp_path.resolve()), "fuse.sshfs"))).status == WARN
+
+
+def test_a_local_mount_inside_a_network_home_is_ok(tmp_path, monkeypatch):
+    selfcheck._default_db_path().parent.mkdir(parents=True)
+    root = str(tmp_path.resolve())
+    text = _mountinfo((root, "nfs"), (str(Path(root) / "iso-state"), "xfs"))
+    assert _db_fs(monkeypatch, text).status == OK
+
+
+def test_db_filesystem_uses_the_nearest_existing_folder(tmp_path, monkeypatch):
+    path = selfcheck._default_db_path()
+    assert not path.parent.exists()  # the daemon has not created it yet
+    c = _db_fs(monkeypatch, _mountinfo((str(tmp_path.resolve()), "cifs")))
+    assert c.status == WARN and not path.parent.exists()  # read only: nothing was created
+
+
+def test_db_filesystem_follows_a_symlinked_folder(tmp_path, monkeypatch):
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    monkeypatch.setenv("QUEUER_DB_PATH", str(link / "queuer.db"))
+    c = _db_fs(monkeypatch, _mountinfo((str(real.resolve()), "nfs4")))
+    assert c.status == WARN
+
+
+def test_unreadable_mountinfo_warns(monkeypatch):
+    c = _db_fs(monkeypatch, None)
+    assert c.status == WARN and "cannot read" in c.detail
+
+
+def test_unparsable_mountinfo_warns(monkeypatch):
+    c = _db_fs(monkeypatch, "nothing useful here\n")
+    assert c.status == WARN and "cannot find the mount" in c.detail
+
+
+def test_read_mountinfo_returns_text_or_none(tmp_path, monkeypatch):
+    f = tmp_path / "mountinfo"
+    f.write_text(ROOT_EXT4)
+    monkeypatch.setattr(selfcheck, "MOUNTINFO", f)
+    assert selfcheck._read_mountinfo() == ROOT_EXT4
+    monkeypatch.setattr(selfcheck, "MOUNTINFO", tmp_path / "missing")
+    assert selfcheck._read_mountinfo() is None
+
+
+def test_db_filesystem_warning_alone_does_not_fail_the_doctor(tmp_path, monkeypatch):
+    c = _db_fs(monkeypatch, _mountinfo((str(tmp_path.resolve()), "nfs4")))
+    assert selfcheck.exit_code([c]) == 0
+
+
+# ---------------------------------------------------------------------------
 # logs and disk
 # ---------------------------------------------------------------------------
 
@@ -552,6 +675,28 @@ def test_unit_with_a_different_value_warns(tmp_path, monkeypatch):
     project = _project(tmp_path, monkeypatch)
     c = _content(tmp_path, _unit_text(project / ".venv" / "bin" / "queuerd", TimeoutStopSec="90"))["unit settings"]
     assert c.status == WARN and "TimeoutStopSec is '90', expected '30'" in c.detail
+
+
+def test_unit_without_oom_policy_warns(tmp_path, monkeypatch):
+    """5.todo M3: a unit from before OOMPolicy=continue is stale (one OOM-killed job could stop the service)."""
+    project = _project(tmp_path, monkeypatch)
+    c = _content(tmp_path, _unit_text(project / ".venv" / "bin" / "queuerd", drop=("OOMPolicy",)))["unit settings"]
+    assert c.status == WARN and "OOMPolicy is missing" in c.detail
+    assert "install.sh" in c.hint
+
+
+def test_unit_with_oom_policy_stop_warns(tmp_path, monkeypatch):
+    project = _project(tmp_path, monkeypatch)
+    c = _content(tmp_path, _unit_text(project / ".venv" / "bin" / "queuerd", OOMPolicy="stop"))["unit settings"]
+    assert c.status == WARN and "OOMPolicy is 'stop', expected 'continue'" in c.detail
+
+
+def test_oom_policy_is_not_a_hardening_line_so_level_none_keeps_it(tmp_path, monkeypatch):
+    """`hardening: none` units (QUEUER_HARDEN=none, or the fallback) still carry OOMPolicy and are OK."""
+    assert "OOMPolicy" in selfcheck.UNIT_SETTINGS and "OOMPolicy" not in selfcheck.HARDENING_SETTINGS
+    project = _project(tmp_path, monkeypatch)
+    c = _content(tmp_path, _unit_text(project / ".venv" / "bin" / "queuerd", hardening=False))["unit settings"]
+    assert c.status == OK and "hardening: none" in c.detail
 
 
 def test_unit_with_partial_hardening_warns(tmp_path, monkeypatch):
@@ -786,13 +931,14 @@ def _quiet_world(monkeypatch, daemon_up=False):
     monkeypatch.setattr(client, "send", send)
     monkeypatch.setattr(selfcheck, "_run", lambda argv: None)
     monkeypatch.setattr(selfcheck, "_free_bytes", lambda p: 10**12)
+    monkeypatch.setattr(selfcheck, "_read_mountinfo", lambda: ROOT_EXT4)
 
 
 def test_run_checks_covers_everything_and_fails_when_the_daemon_is_down(monkeypatch):
     _quiet_world(monkeypatch)
     checks = selfcheck.run_checks()
     names = [c.name for c in checks]
-    for expected in ("daemon", "socket", "config dir", "notify.json", "db file", "schema", "log dir", "log writable", "disk space", "linger", "unit file", "service", "telegram"):
+    for expected in ("daemon", "socket", "config dir", "notify.json", "db file", "schema", "db filesystem", "log dir", "log writable", "disk space", "linger", "unit file", "service", "telegram"):
         assert expected in names
     assert selfcheck.exit_code(checks) == 1
 

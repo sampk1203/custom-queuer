@@ -12,6 +12,7 @@ import asyncio
 import json
 import os
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -373,6 +374,63 @@ async def test_status_shows_per_channel_running(daemon):
     await asyncio.sleep(0.2)
     resp = await send(daemon.socket_path, "status")
     assert _ch(resp["data"], 1)["running"]["id"] == r1["data"]["id"]
+
+
+@pytest.mark.asyncio
+async def test_channel_status_counts_only(daemon):
+    """The cheap command `wait --channel` polls: counts, not full job rows."""
+    await send(daemon.socket_path, "add", argv=["sleep", "1"], cwd=CWD, channel=1)
+    await send(daemon.socket_path, "add", argv=["echo", "second"], cwd=CWD, channel=1)
+    await asyncio.sleep(0.2)  # let the worker pick up job 1
+
+    resp = await send(daemon.socket_path, "channel_status", channel=1)
+    assert resp["ok"]
+    assert resp["data"] == {"channel": 1, "paused": False, "running": 1, "frozen": 0, "queued": 1, "priority_queued": 0}
+    assert "argv" not in resp["data"]  # counts only, no job rows
+
+
+@pytest.mark.asyncio
+async def test_channel_status_unknown_channel_is_idle(daemon):
+    resp = await send(daemon.socket_path, "channel_status", channel=99)
+    assert resp["ok"]
+    assert resp["data"] == {"channel": 99, "paused": False, "running": 0, "frozen": 0, "queued": 0, "priority_queued": 0}
+
+
+@pytest.mark.asyncio
+async def test_states_returns_only_the_state_columns_in_request_order(daemon):
+    """The batch command `wait JOBS` polls: a few columns per job, one request for all of them."""
+    a = await _add(daemon, ["sleep", "30"])
+    await wait_for_status(daemon.socket_path, a, {"running"})
+    b = await _add(daemon, ["echo", "queued"])
+    resp = await send(daemon.socket_path, "states", ids=[b, a, 999, b])
+    assert resp["ok"]
+    jobs = resp["data"]["jobs"]
+    assert [j["id"] for j in jobs] == [b, a]  # request order, the duplicate dropped, 999 left out
+    assert resp["data"]["missing"] == [999]
+    assert set(jobs[0]) == set(db_module.STATE_COLUMNS)
+    assert jobs[0]["status"] == "queued" and jobs[1]["status"] == "running"
+    assert "raw_cmd" not in jobs[0] and "env_extra" not in jobs[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ids", [None, [], "1", [1, "2"], [True], [0], [-3], [1.5]])
+async def test_states_rejects_bad_ids(daemon, ids):
+    resp = await send(daemon.socket_path, "states", ids=ids)
+    assert resp["ok"] is False and "ids" in resp["error"]
+
+
+@pytest.mark.asyncio
+async def test_states_caps_the_number_of_ids(daemon):
+    resp = await send(daemon.socket_path, "states", ids=list(range(1, db_module.MAX_SWEEP + 2)))
+    assert resp["ok"] is False and "too many" in resp["error"]
+    resp = await send(daemon.socket_path, "states", ids=list(range(1, db_module.MAX_SWEEP + 1)))
+    assert resp["ok"] and resp["data"]["jobs"] == [] and len(resp["data"]["missing"]) == db_module.MAX_SWEEP
+
+
+@pytest.mark.asyncio
+async def test_channel_status_requires_channel_arg(daemon):
+    resp = await send(daemon.socket_path, "channel_status")
+    assert resp["ok"] is False and "channel" in resp["error"]
 
 
 @pytest.mark.asyncio
@@ -898,6 +956,31 @@ async def test_sample_usage_with_no_reading_leaves_usage_empty(daemon, monkeypat
     assert usage == {"rss_kb": None, "cpu_user": None, "cpu_sys": None}
 
 
+@pytest.mark.asyncio
+async def test_sample_usage_slows_down_after_the_fast_window(daemon, monkeypatch):
+    """5.todo item 9: fast (RESOURCE_SAMPLE_SECS) for only RESOURCE_SAMPLE_FAST_FOR_SECS,
+    then slow (RESOURCE_SAMPLE_SLOW_SECS) -- not RESOURCE_SAMPLE_SECS the whole time. Real
+    (tiny) sleeps, like the other _sample_usage tests -- no global asyncio.sleep patching."""
+    calls: list[float] = []
+
+    def fake_read(pid: int) -> tuple[int | None, float, float]:
+        calls.append(time.monotonic())
+        return (100, 1.0, 0.5)
+
+    monkeypatch.setattr("queuer.daemon._read_proc_usage", fake_read)
+    monkeypatch.setattr("queuer.daemon.RESOURCE_SAMPLE_SECS", 0.01)
+    monkeypatch.setattr("queuer.daemon.RESOURCE_SAMPLE_FAST_FOR_SECS", 0.03)
+    monkeypatch.setattr("queuer.daemon.RESOURCE_SAMPLE_SLOW_SECS", 0.2)
+    usage: dict = {"rss_kb": None, "cpu_user": None, "cpu_sys": None}
+    task = asyncio.create_task(daemon._sample_usage(12345, usage))
+    await asyncio.sleep(0.5)
+    await daemon._stop_usage_sampling(task)
+    # had it stayed at the fast interval the whole time this would be ~50 calls
+    assert 3 <= len(calls) <= 10
+    gaps = [b - a for a, b in zip(calls, calls[1:], strict=False)]
+    assert any(gap > 0.1 for gap in gaps)  # at least one slow-interval gap
+
+
 # ---------------------------------------------------------------------------
 # ordering: --before / --after
 # ---------------------------------------------------------------------------
@@ -1195,6 +1278,57 @@ async def test_now_on_idle_channel_just_runs_no_freeze(daemon):
 
     listing = await send(daemon.socket_path, "list")
     assert _ch(listing["data"], 1)["frozen"] is None
+
+
+@pytest.mark.asyncio
+async def test_normal_job_waits_for_now_job_running_on_idle_channel(daemon):
+    # H1: a --now job on an idle channel used to run side by side with the next normal add
+    r1 = await send(daemon.socket_path, "add", argv=["sleep", "0.8"], cwd=CWD, now=True)
+    now_id = r1["data"]["id"]
+    await wait_for_status(daemon.socket_path, now_id, {"running"})
+
+    r2 = await send(daemon.socket_path, "add", argv=["echo", "normal"], cwd=CWD)
+    normal_id = r2["data"]["id"]
+    await asyncio.sleep(0.4)
+    assert (await send(daemon.socket_path, "show", id=normal_id))["data"]["status"] == "queued"
+    assert (await send(daemon.socket_path, "show", id=now_id))["data"]["status"] == "running"
+
+    await wait_for_status(daemon.socket_path, now_id, {"done"}, timeout=8.0)
+    normal = await wait_for_status(daemon.socket_path, normal_id, {"done"}, timeout=8.0)
+    assert normal["status"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_cancel_by_id_of_now_job_works_with_normal_job_queued(daemon):
+    # H1: with two jobs running, the newer one owned the channel slot and `cancel ID` of the
+    # --now job answered "not running"
+    r1 = await send(daemon.socket_path, "add", argv=["sleep", "30"], cwd=CWD, now=True)
+    now_id = r1["data"]["id"]
+    await wait_for_status(daemon.socket_path, now_id, {"running"})
+    r2 = await send(daemon.socket_path, "add", argv=["echo", "normal"], cwd=CWD)
+    normal_id = r2["data"]["id"]
+    await asyncio.sleep(0.3)
+    assert (await send(daemon.socket_path, "show", id=normal_id))["data"]["status"] == "queued"
+
+    resp = await send(daemon.socket_path, "cancel", id=now_id)
+    assert resp["ok"], resp
+    assert (await wait_for_status(daemon.socket_path, now_id, {"cancelled"}))["status"] == "cancelled"
+    assert (await wait_for_status(daemon.socket_path, normal_id, {"done"}))["status"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_resumed_channel_does_not_start_head_while_now_job_runs(daemon):
+    # H1: resuming a paused channel (or a due --delay head) must also respect a running --now job
+    await send(daemon.socket_path, "pause")
+    r1 = await send(daemon.socket_path, "add", argv=["sleep", "0.8"], cwd=CWD, now=True)
+    now_id = r1["data"]["id"]
+    await wait_for_status(daemon.socket_path, now_id, {"running"})
+    r2 = await send(daemon.socket_path, "add", argv=["echo", "normal"], cwd=CWD)
+    normal_id = r2["data"]["id"]
+    await send(daemon.socket_path, "resume")
+    await asyncio.sleep(0.3)
+    assert (await send(daemon.socket_path, "show", id=normal_id))["data"]["status"] == "queued"
+    assert (await wait_for_status(daemon.socket_path, normal_id, {"done"}, timeout=8.0))["status"] == "done"
 
 
 @pytest.mark.asyncio
@@ -2369,6 +2503,62 @@ def test_main_exits_1_with_message_when_already_running(monkeypatch, capsys):
     assert "already running" in capsys.readouterr().err
 
 
+def test_main_ends_the_process_right_after_a_clean_shutdown(monkeypatch):
+    # 5.todo item 14: no waiting for the executor's threads (a Telegram long poll) once serve() is done
+    from queuer import daemon as dmod
+
+    events = []
+
+    async def fake_serve(self):
+        events.append("served")
+
+    def fake_exit(code):
+        events.append(("exit", code))
+        raise SystemExit(code)  # os._exit would end pytest too
+
+    monkeypatch.setattr(dmod.Daemon, "serve", fake_serve)
+    monkeypatch.setattr(dmod, "_hard_exit", fake_exit)
+    with pytest.raises(SystemExit) as e:
+        dmod.main()
+    assert e.value.code == 0 and events == ["served", ("exit", 0)]
+
+
+def test_main_does_not_hard_exit_when_serve_fails(monkeypatch):
+    from queuer import daemon as dmod
+
+    async def crash(self):
+        raise RuntimeError("worker crashed")
+
+    exits = []
+    monkeypatch.setattr(dmod.Daemon, "serve", crash)
+    monkeypatch.setattr(dmod, "_hard_exit", lambda code: exits.append(code))
+    with pytest.raises(RuntimeError, match="worker crashed"):
+        dmod.main()
+    assert exits == []  # the error surfaces as before, with a traceback and a non-zero exit
+
+
+def test_hard_exit_flushes_both_streams_then_calls_os_exit(monkeypatch):
+    from queuer import daemon as dmod
+
+    flushed = []
+
+    class Stream:
+        def __init__(self, name, broken=False):
+            self.name, self.broken = name, broken
+
+        def flush(self):
+            flushed.append(self.name)
+            if self.broken:
+                raise ValueError("I/O operation on closed file")
+
+    codes = []
+    monkeypatch.setattr(dmod.sys, "stdout", Stream("out", broken=True))
+    monkeypatch.setattr(dmod.sys, "stderr", Stream("err"))
+    monkeypatch.setattr(dmod.os, "_exit", lambda code: codes.append(code))
+    dmod._hard_exit(0)
+    assert flushed == ["out", "err"] and codes == [0]  # a closed stdout does not stop the exit
+
+
 @pytest.mark.asyncio
 async def test_default_state_folders_are_tightened(tmp_path, monkeypatch):
     state = tmp_path / "state"
@@ -2513,6 +2703,95 @@ async def test_dead_worker_is_respawned_on_next_add(daemon):
     r = await send(daemon.socket_path, "add", argv=["echo", "x"], cwd=CWD, channel=6)
     job = await wait_for_status(daemon.socket_path, r["data"]["id"], {"done", "failed"})
     assert job["status"] == "done"
+
+
+class _FakeProc:
+    """Just enough of asyncio's Process for Daemon._wait_running_time."""
+
+    def __init__(self, code: int = 7) -> None:
+        self._done = asyncio.Event()
+        self._code = code
+
+    async def wait(self) -> int:
+        await self._done.wait()
+        return self._code
+
+    def finish(self) -> None:
+        self._done.set()
+
+
+def _freeze_slot(daemon, channel, job_id, proc):
+    daemon._frozen[channel] = (job_id, proc)
+    daemon._freeze_changed(channel)
+
+
+def _unfreeze_slot(daemon, channel):
+    daemon._frozen.pop(channel)
+    daemon._freeze_changed(channel)
+
+
+@pytest.mark.asyncio
+async def test_wait_running_time_raises_after_the_timeout_without_polling(daemon):
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    with pytest.raises(asyncio.TimeoutError):
+        await daemon._wait_running_time(_FakeProc(), 1, 1, 0.4)
+    assert 0.35 <= loop.time() - start < 1.5
+
+
+@pytest.mark.asyncio
+async def test_wait_running_time_returns_the_exit_code_when_the_job_ends_first(daemon):
+    proc = _FakeProc(code=3)
+    asyncio.get_running_loop().call_later(0.1, proc.finish)
+    assert await daemon._wait_running_time(proc, 1, 1, 30) == 3
+
+
+@pytest.mark.asyncio
+async def test_wait_running_time_does_not_count_the_time_frozen_from_the_start(daemon):
+    loop = asyncio.get_running_loop()
+    proc = _FakeProc()
+    _freeze_slot(daemon, 1, 1, proc)
+    loop.call_later(0.5, _unfreeze_slot, daemon, 1)
+    start = loop.time()
+    with pytest.raises(asyncio.TimeoutError):
+        await daemon._wait_running_time(proc, 1, 1, 0.4)
+    # 0.5 s frozen (not counted) + 0.4 s of run time
+    assert loop.time() - start >= 0.85
+
+
+@pytest.mark.asyncio
+async def test_wait_running_time_books_the_run_time_before_a_freeze_and_resumes_the_rest(daemon):
+    loop = asyncio.get_running_loop()
+    proc = _FakeProc()
+    loop.call_later(0.2, _freeze_slot, daemon, 1, 1, proc)
+    loop.call_later(0.7, _unfreeze_slot, daemon, 1)
+    start = loop.time()
+    with pytest.raises(asyncio.TimeoutError):
+        await daemon._wait_running_time(proc, 1, 1, 0.5)
+    # 0.2 s run + 0.5 s frozen + the remaining 0.3 s of run time
+    assert loop.time() - start >= 0.95
+
+
+@pytest.mark.asyncio
+async def test_wait_running_time_returns_when_the_job_ends_while_frozen(daemon):
+    loop = asyncio.get_running_loop()
+    proc = _FakeProc(code=-9)
+    _freeze_slot(daemon, 1, 1, proc)
+    loop.call_later(0.1, proc.finish)
+    assert await asyncio.wait_for(daemon._wait_running_time(proc, 1, 1, 0.2), timeout=3) == -9
+    daemon._frozen.clear()  # a fake process must not be left for the daemon's shutdown to signal
+
+
+@pytest.mark.asyncio
+async def test_wait_running_time_ignores_another_jobs_freeze_on_the_channel(daemon):
+    loop = asyncio.get_running_loop()
+    proc = _FakeProc()
+    _freeze_slot(daemon, 1, 99, _FakeProc())  # some other job is frozen: this one keeps running
+    start = loop.time()
+    with pytest.raises(asyncio.TimeoutError):
+        await daemon._wait_running_time(proc, 1, 1, 0.3)
+    assert loop.time() - start < 1.5
+    daemon._frozen.clear()
 
 
 @pytest.mark.asyncio
@@ -3272,6 +3551,78 @@ async def test_sweep_creates_one_job_per_entry_in_order_with_qur_index(daemon):
         assert Path(job["log_path"]).read_text() == f"idx={n}\n"
     done = [(await send(daemon.socket_path, "show", id=i))["data"] for i in ids]
     assert done[0]["finished_at"] <= done[1]["started_at"] <= done[2]["started_at"]  # in order, one at a time
+
+
+@pytest.mark.asyncio
+async def test_array_is_expanded_by_the_daemon_into_one_job_per_number(daemon):
+    resp = await send(daemon.socket_path, "add", argv=["sh", "-c", "echo idx=$QUR_INDEX"], array=[3, 5], cwd=CWD, channel=2)
+    assert resp["ok"], resp
+    ids = resp["data"]["ids"]
+    assert resp["data"]["id"] == ids[0] and ids == list(range(ids[0], ids[0] + 3)) and resp["data"]["channel"] == 2
+    for job_id, n in zip(ids, (3, 4, 5)):
+        job = await wait_for_status(daemon.socket_path, job_id, {"done", "failed"})
+        assert job["status"] == "done" and job["channel"] == 2
+        assert Path(job["log_path"]).read_text() == f"idx={n}\n"
+        assert json.loads(job["raw_cmd"]) == ["sh", "-c", "echo idx=$QUR_INDEX"]  # raw_argv left out: falls back to argv
+
+
+@pytest.mark.asyncio
+async def test_array_keeps_a_separate_raw_argv_when_one_is_sent(daemon):
+    resp = await send(daemon.socket_path, "add", argv=["echo", "hi"], raw_argv=["echo", "{}"], array=[1, 2], cwd=CWD, dry_run=True)
+    assert resp["ok"], resp
+    got = resp["data"]["jobs"]
+    assert [j["index"] for j in got] == [1, 2] and all(j["raw_argv"] == ["echo", "{}"] for j in got)
+    assert _job_count(daemon) == 0
+
+
+@pytest.mark.asyncio
+async def test_array_resolves_its_command_once(daemon, monkeypatch):
+    from queuer import daemon as daemon_mod
+
+    calls = []
+    real = daemon_mod.resolve_command
+
+    def counting(*a, **kw):
+        calls.append(a[0])
+        return real(*a, **kw)
+
+    monkeypatch.setattr(daemon_mod, "resolve_command", counting)
+    resp = await send(daemon.socket_path, "add", argv=["echo", "hi"], array=[1, 50], cwd=CWD, dry_run=True)
+    assert resp["ok"], resp
+    assert len(resp["data"]["jobs"]) == 50 and len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_array_still_rejects_an_executable_that_does_not_exist(daemon):
+    resp = await send(daemon.socket_path, "add", argv=["no-such-exe-array"], array=[1, 3], cwd=CWD)
+    assert resp["ok"] is False and "not found" in resp["error"]
+    assert _job_count(daemon) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("array", ["1-3", 5, [1], [1, 2, 3], [3, 1], [-1, 2], ["a", 2], [True, 2], [1.5, 2], [None, 2], {"a": 1}])
+async def test_array_rejects_a_bad_range(daemon, array):
+    resp = await send(daemon.socket_path, "add", argv=["echo", "hi"], array=array, cwd=CWD)
+    assert resp["ok"] is False and "array" in resp["error"]
+    assert _job_count(daemon) == 0
+
+
+@pytest.mark.asyncio
+async def test_array_is_capped_like_jobs_and_cannot_be_combined_with_jobs(daemon):
+    resp = await send(daemon.socket_path, "add", argv=["echo", "hi"], array=[0, db_module.MAX_SWEEP], cwd=CWD)
+    assert resp["ok"] is False and "too many" in resp["error"]
+    # (the largest allowed range is not sent as a dry run: its 1000-job report is bigger than send()'s line limit)
+    resp = await send(daemon.socket_path, "add", argv=["echo", "hi"], array=[0, 9], cwd=CWD, dry_run=True)
+    assert resp["ok"] and len(resp["data"]["jobs"]) == 10
+    resp = await send(daemon.socket_path, "add", jobs=[_spec(["echo", "x"], index=1)], array=[1, 2], argv=["echo", "x"], cwd=CWD)
+    assert resp["ok"] is False and "cannot be combined" in resp["error"]
+
+
+@pytest.mark.asyncio
+async def test_sweep_job_without_raw_argv_falls_back_to_its_argv(daemon):
+    jobs = [{"argv": ["echo", "a"], "index": 1}, {"argv": ["echo", "b"], "index": 2}]
+    ids = (await send(daemon.socket_path, "add", jobs=jobs, cwd=CWD))["data"]["ids"]
+    assert [json.loads(db_module.get_job(daemon.conn, i)["raw_cmd"]) for i in ids] == [["echo", "a"], ["echo", "b"]]
 
 
 @pytest.mark.asyncio
@@ -4355,7 +4706,7 @@ async def test_export_rejects_bad_arguments(daemon, bad):
 # ---------------------------------------------------------------------------
 
 _FUZZ_KEYS = [
-    "argv", "raw_argv", "jobs", "cwd", "path", "virtual_env", "python_path", "env", "env_pass", "channel",
+    "argv", "raw_argv", "jobs", "array", "cwd", "path", "virtual_env", "python_path", "env", "env_pass", "channel",
     "before", "after", "timeout_secs", "now", "max_retries", "depends_on", "after_any", "not_before",
     "on_fail", "retry_delay_secs", "retry_backoff", "id", "pid", "statuses", "since", "grep", "limit",
     "clear_deps", "clear_delay", "retries", "timeout", "delay", "all", "grace", "signal",
@@ -4397,6 +4748,40 @@ async def test_fuzzed_requests_get_a_clean_reply_and_never_hurt_the_daemon(daemo
     assert (await send(daemon.socket_path, "status"))["ok"] is True  # still alive and answering
 
 
+@pytest_asyncio.fixture
+async def small_request_limit(monkeypatch):
+    """Must be requested BEFORE `daemon`: the limit is read when the server starts."""
+    monkeypatch.setattr("queuer.daemon.MAX_REQUEST_BYTES", 100_000)
+
+
+@pytest.mark.asyncio
+async def test_request_over_the_limit_gets_request_too_large(small_request_limit, daemon, capsys):
+    # H4: a line past the limit used to get the unhelpful "invalid request"
+    data = await _raw(daemon.socket_path, b"x" * 110_000 + b"\n")
+    resp = json.loads(data)
+    assert resp["ok"] is False and "request too large" in resp["error"]
+    assert "Traceback" not in capsys.readouterr().err
+    assert (await send(daemon.socket_path, "status"))["ok"]
+
+
+@pytest.mark.asyncio
+async def test_big_each_sweep_fits_through_the_real_socket(daemon):
+    # H4: 1000 jobs with 150-character commands is ~200 KB of JSON: over the old 64 KiB stream limit
+    jobs = [{"argv": ["echo", f"{i:04d}" + "x" * 146], "index": i} for i in range(1000)]
+    request = {"cmd": "add", "args": {"jobs": jobs, "cwd": CWD, "path": "/bin:/usr/bin", "dry_run": True}}
+    payload = (json.dumps(request) + "\n").encode()
+    assert len(payload) > 64 * 1024
+    reader, writer = await asyncio.open_unix_connection(str(daemon.socket_path), limit=16 * 1024 * 1024)  # the reply is big too
+    writer.write(payload)
+    await writer.drain()
+    resp = json.loads((await reader.readline()).decode())
+    writer.close()
+    await writer.wait_closed()
+    assert resp["ok"] is True, resp
+    assert len(resp["data"]["jobs"]) == 1000
+    assert _job_count(daemon) == 0  # a dry run queues nothing
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("raw", [
     b"[]\n", b"null\n", b"5\n", b'"x"\n', b"true\n",
@@ -4412,6 +4797,105 @@ async def test_malformed_request_shapes_get_ok_false(daemon, raw):
     await writer.wait_closed()
     assert resp["ok"] is False and resp["error"]
     assert (await send(daemon.socket_path, "status"))["ok"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cmd", ["edit_lock", "edit_unlock", "edit"])
+@pytest.mark.parametrize("pid", [2**22 + 1, 2**31, 2**40, 2**63, 10**30])
+async def test_huge_editor_pid_is_refused_and_leaves_no_lock(daemon, cmd, pid):
+    # H2: pid 2**40 used to be stored as a lock, then crash the worker (and the daemon) when
+    # that job became the head
+    blocker = (await send(daemon.socket_path, "add", argv=["sleep", "30"], cwd=CWD))["data"]["id"]
+    await wait_for_status(daemon.socket_path, blocker, {"running"})
+    queued = (await send(daemon.socket_path, "add", argv=["echo", "q"], cwd=CWD))["data"]["id"]
+    resp = await send(daemon.socket_path, cmd, id=queued, pid=pid, timeout_secs=5)
+    assert resp["ok"] is False and not resp["error"].startswith("internal error")
+    assert daemon.conn.execute("SELECT COUNT(*) FROM edit_locks").fetchone()[0] == 0
+    await send(daemon.socket_path, "cancel", id=blocker)
+    assert (await wait_for_status(daemon.socket_path, queued, {"done"}))["status"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_worker_survives_a_failing_step_and_carries_on(daemon, monkeypatch, capsys):
+    # H2: one DB error in the worker loop body used to end the worker and shut the daemon down
+    monkeypatch.setattr("queuer.daemon.WORKER_ERROR_SECS", 0.05)
+    real = db_module.get_paused
+    calls = {"n": 0}
+
+    def flaky(conn, channel=1):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return real(conn, channel)
+
+    monkeypatch.setattr(db_module, "get_paused", flaky)
+    daemon._wake_worker(1)
+    r = await send(daemon.socket_path, "add", argv=["echo", "after-error"], cwd=CWD)
+    job = await wait_for_status(daemon.socket_path, r["data"]["id"], {"done", "failed"})
+    assert job["status"] == "done"
+    assert calls["n"] >= 2
+    assert "worker error" in capsys.readouterr().err
+    assert not daemon._worker_tasks[1].done()
+
+
+@pytest.mark.asyncio
+async def test_database_error_in_a_command_gets_a_clean_reply(daemon, monkeypatch, capsys):
+    async def locked(args):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(daemon, "_cmd_status", locked)
+    resp = await send(daemon.socket_path, "status")
+    assert resp["ok"] is False and "database is locked" in resp["error"]
+    assert "Traceback" not in capsys.readouterr().err
+    monkeypatch.delattr(daemon, "_cmd_status")  # the instance override only; the class method is back
+    assert (await send(daemon.socket_path, "status"))["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_overflow_in_a_command_gets_a_clean_reply(daemon, capsys):
+    resp = await send(daemon.socket_path, "add", argv=["echo", "x"], cwd=CWD, channel=2**70)
+    assert resp["ok"] is False and not resp["error"].startswith("internal error")
+    assert "Traceback" not in capsys.readouterr().err
+    assert (await send(daemon.socket_path, "status"))["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_huge_ints_in_every_int_field_never_hurt_the_daemon(daemon):
+    # H2 / Q6: ints past 2**31, 2**63 and 10**30 in every numeric field of every command
+    commands = sorted(n[len("_cmd_"):] for n in dir(Daemon) if n.startswith("_cmd_"))
+    keys = ["id", "pid", "channel", "before", "after", "timeout_secs", "max_retries", "retry_delay_secs",
+            "limit", "index", "grace", "since"]
+    internal = []
+    for cmd in commands:
+        for big in (2**31, 2**40, 2**63, 10**30):
+            for key in keys:
+                resp = await send(daemon.socket_path, cmd, argv=["echo", "x"], cwd=CWD, **{key: big})
+                assert isinstance(resp.get("ok"), bool), (cmd, key, big, resp)
+                if resp["ok"] is False and resp["error"].startswith("internal error"):
+                    internal.append((cmd, key, big, resp["error"]))
+    assert internal == []
+    assert (await send(daemon.socket_path, "status"))["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_serve_is_told_when_a_worker_made_after_startup_ends_by_itself(tmp_path):
+    d = Daemon(db_path=tmp_path / "q.db", socket_path=tmp_path / "q.sock", log_dir=tmp_path / "logs")
+
+    async def boom() -> None:
+        raise RuntimeError("worker bug")
+
+    crashed = asyncio.create_task(boom())
+    crashed.add_done_callback(d._worker_done)
+    await asyncio.sleep(0.05)
+    assert d._worker_ended.is_set()
+    assert isinstance(crashed.exception(), RuntimeError)
+
+    d._worker_ended.clear()
+    cancelled = asyncio.create_task(asyncio.sleep(30))
+    cancelled.add_done_callback(d._worker_done)
+    cancelled.cancel()
+    await asyncio.sleep(0.05)
+    assert not d._worker_ended.is_set()  # a cancelled worker is respawned on the next add, not a stop
 
 
 # ---------------------------------------------------------------------------
@@ -4448,6 +4932,7 @@ async def test_dry_run_reports_the_queue_position_and_the_running_job(daemon):
     b = await _add(daemon, ["sleep", "30"])
     c = await _add(daemon, ["sleep", "30"])
     before_count = _job_count(daemon)
+    positions = {i: db_module.get_job(daemon.conn, i)["position"] for i in (b, c)}
     data = (await _dry(daemon))["data"]
     assert data["jobs"][0]["position"] == 3 and data["queued_before"] == 2 and data["running_id"] == a
     data = (await _dry(daemon, before=c))["data"]
@@ -4460,7 +4945,7 @@ async def test_dry_run_reports_the_queue_position_and_the_running_job(daemon):
     assert _job_count(daemon) == before_count
     assert (await send(daemon.socket_path, "show", id=a))["data"]["status"] == "running"
     assert [j["id"] for j in db_module.get_queue(daemon.conn, 1)] == [b, c]
-    assert db_module.get_job(daemon.conn, b)["position"] == 0 and db_module.get_job(daemon.conn, c)["position"] == 1
+    assert {i: db_module.get_job(daemon.conn, i)["position"] for i in (b, c)} == positions  # the rolled-back dry runs renumbered nothing
 
 
 @pytest.mark.asyncio
@@ -4873,6 +5358,40 @@ async def test_cancel_flags_override_the_jobs_own_stop_settings(daemon, tmp_path
     assert time.monotonic() - t0 < 3
 
 
+# M1: the leader exits on SIGTERM but a child in the same process group ignores it
+_LEADER_DIES_CHILD_IGNORES_TERM = ["bash", "-c", '(trap "" TERM; exec sleep 600) & wait']
+
+
+@pytest.mark.asyncio
+async def test_cancel_kills_a_child_that_ignores_sigterm_after_the_leader_exited(daemon):
+    a = await _add(daemon, _LEADER_DIES_CHILD_IGNORES_TERM)
+    await wait_for_status(daemon.socket_path, a, {"running"})
+    await asyncio.sleep(0.5)
+    t0 = time.monotonic()
+    assert (await send(daemon.socket_path, "cancel", id=a, grace=1))["ok"]
+    job = await wait_for_status(daemon.socket_path, a, {"cancelled"}, timeout=6)
+    assert job["status"] == "cancelled" and time.monotonic() - t0 < 6  # grace + 1 s, not for ever
+
+
+@pytest.mark.asyncio
+async def test_a_second_cancel_still_escalates_to_sigkill(daemon):
+    a = await _add(daemon, _LEADER_DIES_CHILD_IGNORES_TERM, stop_grace=60)
+    await wait_for_status(daemon.socket_path, a, {"running"})
+    await asyncio.sleep(0.5)
+    first = asyncio.create_task(send(daemon.socket_path, "cancel", id=a))  # waits out the 60 s grace
+    await asyncio.sleep(0.5)
+    assert (await send(daemon.socket_path, "cancel", id=a, grace=0))["ok"]
+    await wait_for_status(daemon.socket_path, a, {"cancelled"}, timeout=6)
+    assert (await first)["ok"]
+
+
+@pytest.mark.asyncio
+async def test_timeout_kills_a_child_that_ignores_sigterm_after_the_leader_exited(daemon):
+    a = await _add(daemon, _LEADER_DIES_CHILD_IGNORES_TERM, timeout_secs=1, stop_grace=1)
+    job = await wait_for_status(daemon.socket_path, a, {"failed"}, timeout=8)
+    assert job["note"] == "timed out"
+
+
 @pytest.mark.asyncio
 async def test_a_timeout_uses_the_jobs_stop_signal(daemon, tmp_path):
     out = tmp_path / "timeout"
@@ -4953,3 +5472,401 @@ async def test_usage_sampler_keeps_the_last_peak_rss_when_a_later_sample_has_non
     await _until(lambda: usage["cpu_user"] == 2.0)
     await d._stop_usage_sampling(task)
     assert usage == {"rss_kb": 2048, "cpu_user": 2.0, "cpu_sys": 1.0}
+
+
+# ---------------------------------------------------------------------------
+# 5.todo M5: resource accounting covers the job's whole process group
+# ---------------------------------------------------------------------------
+
+def _fake_proc(root: Path, procs: dict[int, tuple[int, int, int, int, int, int | None]]) -> str:
+    """A fake /proc under `root`: pid -> (pgrp, utime, stime, cutime, cstime, VmRSS kB or None)."""
+    root.mkdir(parents=True, exist_ok=True)
+    for pid, (pgrp, ut, st, cut, cst, rss) in procs.items():
+        d = root / str(pid)
+        d.mkdir()
+        (d / "stat").write_text(f"{pid} (a b) S 1 {pgrp} {pgrp} 0 -1 0 0 0 0 0 {ut} {st} {cut} {cst} 20 0 1 0 1 1 1 1\n")
+        status = "Name:\ta\n" + ("" if rss is None else f"VmRSS:\t{rss} kB\n")
+        (d / "status").write_text(status)
+    (root / "self").mkdir()  # not a pid: must be ignored
+    (root / "cpuinfo").write_text("x")
+    return str(root)
+
+
+def test_read_group_usage_sums_only_the_members_of_the_group(tmp_path, monkeypatch):
+    from queuer import daemon as daemon_mod
+
+    monkeypatch.setattr(daemon_mod, "_CLK_TCK", 100)
+    root = _fake_proc(tmp_path / "proc", {
+        100: (100, 100, 10, 50, 5, 1000),  # the leader: it has already reaped children (cutime/cstime)
+        101: (100, 20, 2, 0, 0, 2000),  # a rank
+        102: (100, 5, 1, 0, 0, None),  # a zombie rank: CPU times but no VmRSS line
+        200: (200, 9999, 9999, 0, 0, 99999),  # another group: never counted
+    })
+    rss, user, sys_ = daemon_mod._read_group_usage(100, root)
+    assert rss == 3000
+    assert user == pytest.approx((100 + 50 + 20 + 5) / 100)
+    assert sys_ == pytest.approx((10 + 5 + 2 + 1) / 100)
+
+
+def test_read_group_usage_without_members_or_proc_is_none(tmp_path):
+    from queuer import daemon as daemon_mod
+
+    root = _fake_proc(tmp_path / "proc", {100: (100, 1, 1, 0, 0, 10)})
+    assert daemon_mod._read_group_usage(999, root) is None
+    assert daemon_mod._read_group_usage(100, str(tmp_path / "missing")) is None
+
+
+def test_read_group_usage_with_only_zombies_has_cpu_but_no_rss(tmp_path, monkeypatch):
+    from queuer import daemon as daemon_mod
+
+    monkeypatch.setattr(daemon_mod, "_CLK_TCK", 100)
+    root = _fake_proc(tmp_path / "proc", {7: (7, 300, 0, 0, 0, None)})
+    assert daemon_mod._read_group_usage(7, root) == (None, 3.0, 0.0)
+
+
+def test_read_group_usage_sees_children_that_the_leader_alone_does_not():
+    """A real `sh` that starts a 40 MB python child in its own group: the group sum has the
+    child, the launcher's own VmHWM does not (this is `mpirun`/`bash -c` in miniature)."""
+    from queuer.daemon import _read_group_usage, _read_proc_usage
+
+    script = '"$0" -c "import time; x = bytearray(40 * 1024 * 1024); time.sleep(3)" & wait'
+    proc = subprocess.Popen(["sh", "-c", script, sys.executable], start_new_session=True)
+    try:
+        group = None
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            group = _read_group_usage(proc.pid)
+            if group is not None and group[0] is not None and group[0] >= 40 * 1024:
+                break
+            time.sleep(0.05)
+        assert group is not None and group[0] is not None and group[0] >= 40 * 1024
+        leader = _read_proc_usage(proc.pid)
+        assert leader is not None and (leader[0] is None or leader[0] < 40 * 1024)
+    finally:
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
+
+
+@pytest.mark.asyncio
+async def test_sample_usage_keeps_the_peak_group_sum_and_the_largest_cpu(daemon, monkeypatch):
+    """The peak is the largest SUM seen; a rank that exits (smaller sum, smaller CPU) lowers nothing."""
+    groups = iter([(5000, 3.0, 1.0), (3000, 2.0, 0.5), None])
+    monkeypatch.setattr("queuer.daemon._read_proc_usage", lambda pid: (100, 1.0, 0.5))
+    monkeypatch.setattr("queuer.daemon._read_group_usage", lambda pgid: next(groups, None))
+    monkeypatch.setattr("queuer.daemon.RESOURCE_SAMPLE_SECS", 0.01)
+    monkeypatch.setattr("queuer.daemon.RESOURCE_GROUP_SCAN_SECS", 0.0)
+    usage: dict = {"rss_kb": None, "cpu_user": None, "cpu_sys": None}
+    task = asyncio.create_task(daemon._sample_usage(12345, usage, whole_group=True))
+    await asyncio.sleep(0.15)
+    await daemon._stop_usage_sampling(task)
+    assert usage == {"rss_kb": 5000, "cpu_user": 3.0, "cpu_sys": 1.0}
+
+
+@pytest.mark.asyncio
+async def test_sample_usage_records_the_group_when_the_leader_is_gone(daemon, monkeypatch):
+    """The leader exited but a child that ignores SIGTERM is still in the group (see M1)."""
+    monkeypatch.setattr("queuer.daemon._read_proc_usage", lambda pid: None)
+    monkeypatch.setattr("queuer.daemon._read_group_usage", lambda pgid: (4096, 2.0, 0.25))
+    monkeypatch.setattr("queuer.daemon.RESOURCE_SAMPLE_SECS", 0.01)
+    usage: dict = {"rss_kb": None, "cpu_user": None, "cpu_sys": None}
+    task = asyncio.create_task(daemon._sample_usage(12345, usage, whole_group=True))
+    await asyncio.sleep(0.05)
+    await daemon._stop_usage_sampling(task)
+    assert usage == {"rss_kb": 4096, "cpu_user": 2.0, "cpu_sys": 0.25}
+
+
+@pytest.mark.asyncio
+async def test_sample_usage_scans_the_group_only_when_asked_and_not_every_poll(daemon, monkeypatch):
+    scans: list[int] = []
+    monkeypatch.setattr("queuer.daemon._read_proc_usage", lambda pid: (100, 1.0, 0.5))
+    monkeypatch.setattr("queuer.daemon._read_group_usage", lambda pgid: scans.append(pgid) or (200, 1.0, 0.5))
+    monkeypatch.setattr("queuer.daemon.RESOURCE_SAMPLE_SECS", 0.01)
+
+    usage: dict = {"rss_kb": None, "cpu_user": None, "cpu_sys": None}
+    task = asyncio.create_task(daemon._sample_usage(12345, usage))  # default: leader only
+    await asyncio.sleep(0.1)
+    await daemon._stop_usage_sampling(task)
+    assert scans == [] and usage["rss_kb"] == 100
+
+    monkeypatch.setattr("queuer.daemon.RESOURCE_GROUP_SCAN_SECS", 60.0)
+    usage = {"rss_kb": None, "cpu_user": None, "cpu_sys": None}
+    task = asyncio.create_task(daemon._sample_usage(12345, usage, whole_group=True))
+    await asyncio.sleep(0.15)  # about 15 polls, one scan (the first)
+    await daemon._stop_usage_sampling(task)
+    assert scans == [12345] and usage["rss_kb"] == 200
+
+
+@pytest.mark.asyncio
+async def test_a_jobs_peak_rss_adds_up_its_subprocesses(daemon, monkeypatch):
+    """`sh` starts two 30 MB python children (an `mpirun -np 2` in miniature): the recorded
+    peak is about their SUM, which the launcher alone (a few MB) could never show."""
+    monkeypatch.setattr("queuer.daemon.RESOURCE_SAMPLE_SECS", 0.02)
+    monkeypatch.setattr("queuer.daemon.RESOURCE_GROUP_SCAN_SECS", 0.02)
+    child = "import time; x = bytearray(30 * 1024 * 1024); time.sleep(1.5)"
+    script = f'"$0" -c "{child}" & "$0" -c "{child}" & wait'
+    job_id = await _add(daemon, ["sh", "-c", script, sys.executable])
+    job = await wait_for_status(daemon.socket_path, job_id, {"done", "failed"}, timeout=15.0)
+    assert job["status"] == "done"
+    assert job["max_rss_kb"] is not None and job["max_rss_kb"] >= 55 * 1024
+    assert job["cpu_user_secs"] is not None and job["cpu_sys_secs"] is not None
+
+
+# ---------------------------------------------------------------------------
+# 5.todo M4: a fuller job environment and QUEUER_JOB_UMASK
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_job_gets_user_logname_shell_and_tmpdir_from_the_daemons_environment(daemon, monkeypatch):
+    monkeypatch.setenv("USER", "alice")
+    monkeypatch.setenv("LOGNAME", "alice-login")
+    monkeypatch.setenv("SHELL", "/bin/zsh")
+    monkeypatch.setenv("TMPDIR", "/var/tmp/alice")
+    monkeypatch.setenv("DAEMON_ONLY_SECRET", "must-not-reach-jobs")
+    _, seen = await _run_env_job(daemon)
+    assert seen["USER"] == "alice" and seen["LOGNAME"] == "alice-login"
+    assert seen["SHELL"] == "/bin/zsh" and seen["TMPDIR"] == "/var/tmp/alice"
+    assert "PATH" in seen and "HOME" in seen
+    assert "DAEMON_ONLY_SECRET" not in seen  # still not the whole environment
+
+
+@pytest.mark.asyncio
+async def test_a_name_the_daemon_does_not_have_is_not_invented_and_env_overrides(daemon, monkeypatch):
+    monkeypatch.delenv("TMPDIR", raising=False)
+    monkeypatch.setenv("USER", "alice")
+    _, seen = await _run_env_job(daemon, env={"USER": "bob"})
+    assert "TMPDIR" not in seen
+    assert seen["USER"] == "bob"  # --env wins over the daemon's own value
+
+
+def test_hooks_get_the_same_base_environment(monkeypatch):
+    monkeypatch.setenv("USER", "alice")
+    monkeypatch.setenv("SHELL", "/bin/zsh")
+    job = {
+        "id": 3, "status": "done", "exit_code": 0, "channel": 1, "cwd": "/tmp", "log_path": "/tmp/3.log",
+        "raw_cmd": json.dumps(["true"]), "env_extra": None, "started_at": None, "finished_at": None,
+    }
+    env = Daemon._hook_env("on-finish", job)
+    assert env["USER"] == "alice" and env["SHELL"] == "/bin/zsh" and env["QUR_JOB_ID"] == "3"
+
+
+def test_job_umask_from_the_environment(monkeypatch, capsys):
+    from queuer import daemon as daemon_mod
+
+    monkeypatch.delenv("QUEUER_JOB_UMASK", raising=False)
+    assert daemon_mod._env_job_umask() is None
+    for raw, want in (("022", 0o22), ("0o027", 0o27), (" 002 ", 0o2), ("0", 0), ("777", 0o777)):
+        monkeypatch.setenv("QUEUER_JOB_UMASK", raw)
+        assert daemon_mod._env_job_umask() == want, raw
+    monkeypatch.setenv("QUEUER_JOB_UMASK", "")
+    assert daemon_mod._env_job_umask() is None and capsys.readouterr().err == ""  # empty = unset, quietly
+    for bad in ("9", "abc", "1000", "-1", "0.2"):
+        monkeypatch.setenv("QUEUER_JOB_UMASK", bad)
+        assert daemon_mod._env_job_umask() is None, bad
+        assert "ignoring QUEUER_JOB_UMASK" in capsys.readouterr().err
+
+
+def test_daemon_takes_the_job_umask_from_the_argument_or_the_environment(tmp_path, monkeypatch):
+    paths = {"db_path": tmp_path / "q.db", "socket_path": tmp_path / "q.sock", "log_dir": tmp_path / "logs"}
+    monkeypatch.setenv("QUEUER_JOB_UMASK", "027")
+    assert Daemon(**paths).job_umask == 0o27
+    assert Daemon(**paths, job_umask=0o22).job_umask == 0o22  # the argument wins
+    monkeypatch.delenv("QUEUER_JOB_UMASK")
+    assert Daemon(**paths).job_umask is None
+
+
+_PRINT_UMASK = [sys.executable, "-c", "import os; print(oct(os.umask(0)))"]
+
+
+@pytest.mark.asyncio
+async def test_a_job_keeps_the_daemons_umask_by_default(daemon):
+    current = os.umask(0)
+    os.umask(current)
+    daemon.job_umask = None
+    job_id = await _add(daemon, _PRINT_UMASK)
+    job = await wait_for_status(daemon.socket_path, job_id, {"done", "failed"})
+    assert job["status"] == "done"
+    assert Path(job["log_path"]).read_text().strip() == oct(current)
+
+
+@pytest.mark.asyncio
+async def test_job_umask_applies_to_the_job(daemon):
+    daemon.job_umask = 0o027
+    job_id = await _add(daemon, _PRINT_UMASK)
+    job = await wait_for_status(daemon.socket_path, job_id, {"done", "failed"})
+    assert job["status"] == "done"
+    assert Path(job["log_path"]).read_text().strip() == "0o27"
+
+
+@pytest.mark.asyncio
+async def test_job_umask_applies_to_hooks_too(daemon, tmp_path):
+    daemon.job_umask = 0o027
+    out = tmp_path / "hook-umask.txt"
+    await _add(daemon, ["true"], on_finish=f"umask > {out}")
+    await _until(lambda: out.exists() and out.read_text().strip() != "")
+    assert out.read_text().strip() == "0027"
+
+
+
+# ---------------------------------------------------------------------------
+# 5.todo L3, L4, L5, L7, L9
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_rm_and_cancel_refuse_a_job_that_is_starting_right_now(daemon):
+    """L3: a job whose process is being created still says `queued`; removing or cancelling it
+    then would leave an untracked process behind."""
+    a = await _add(daemon, ["sleep", "30"])
+    await wait_for_status(daemon.socket_path, a, {"running"})
+    b = await _add(daemon, ["echo", "b"])
+    daemon._starting.add(b)
+    try:
+        for cmd in ("rm", "cancel"):
+            r = await send(daemon.socket_path, cmd, id=b)
+            assert r["ok"] is False and "starting right now" in r["error"]
+        assert (await send(daemon.socket_path, "show", id=b))["data"]["status"] == "queued"
+    finally:
+        daemon._starting.discard(b)
+    assert (await send(daemon.socket_path, "rm", id=b))["ok"]  # the window is over: it works again
+    assert (await send(daemon.socket_path, "cancel", id=a))["ok"]
+
+
+@pytest.mark.asyncio
+async def test_a_row_that_vanishes_during_start_up_does_not_leave_a_process_behind(daemon, monkeypatch):
+    """L3 belt and braces: mark_running fails after the process exists -> its group is killed."""
+    killed: list[int] = []
+    real_kill = daemon._kill_group_for_shutdown
+
+    async def spy(proc, *a, **k):
+        killed.append(proc.pid)
+        await real_kill(proc, *a, **k)
+
+    def boom(*a, **k):
+        raise ValueError("job is not queued")
+
+    monkeypatch.setattr(daemon, "_kill_group_for_shutdown", spy)
+    monkeypatch.setattr(db_module, "mark_running", boom)
+    await _add(daemon, ["sleep", "30"])
+    for _ in range(100):
+        if killed:
+            break
+        await asyncio.sleep(0.05)
+    assert killed, "the untracked process was not killed"
+    with pytest.raises(ProcessLookupError):
+        os.killpg(killed[0], 0)
+
+
+@pytest.mark.asyncio
+async def test_a_job_never_reads_the_daemons_stdin(daemon):
+    """L4: stdin is /dev/null, not whatever the daemon was started with."""
+    job = await _add(daemon, ["sh", "-c", "readlink /proc/self/fd/0"])
+    await wait_for_status(daemon.socket_path, job, {"done"})
+    assert _log_text(daemon, job).strip() == "/dev/null"
+
+
+@pytest.mark.asyncio
+async def test_an_old_log_with_the_same_id_is_kept_not_truncated(daemon):
+    """L5: after a database reset job ids start at 1 again; the old 1.log must survive."""
+    daemon.log_dir.mkdir(parents=True, exist_ok=True)
+    (daemon.log_dir / "1.log").write_text("output of the old job 1\n")
+    job = await _add(daemon, ["echo", "new"])
+    assert job == 1
+    await wait_for_status(daemon.socket_path, job, {"done"})
+    assert _log_text(daemon, job).strip() == "new"
+    assert (daemon.log_dir / "1.log.old").read_text() == "output of the old job 1\n"
+
+
+def test_keep_old_log_ignores_missing_empty_and_symlinked_logs(tmp_path):
+    missing = tmp_path / "1.log"
+    Daemon._keep_old_log(missing)
+    assert not missing.exists() and not (tmp_path / "1.log.old").exists()
+    empty = tmp_path / "2.log"
+    empty.write_text("")
+    Daemon._keep_old_log(empty)
+    assert empty.exists() and not (tmp_path / "2.log.old").exists()
+    target = tmp_path / "target"
+    target.write_text("x")
+    link = tmp_path / "3.log"
+    link.symlink_to(target)
+    Daemon._keep_old_log(link)
+    assert link.is_symlink() and not (tmp_path / "3.log.old").exists()  # the O_NOFOLLOW open refuses it later
+
+
+def test_keep_old_log_replaces_an_older_old_file(tmp_path):
+    log = tmp_path / "4.log"
+    (tmp_path / "4.log.old").write_text("older")
+    log.write_text("old")
+    Daemon._keep_old_log(log)
+    assert not log.exists() and (tmp_path / "4.log.old").read_text() == "old"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", [
+    {"channel": 10**6}, {"channel": 2**70}, {"channel": True},
+    {"max_retries": True}, {"max_retries": 10**6}, {"max_retries": 2**70}, {"max_retries": "3"},
+    {"timeout_secs": 10**12}, {"timeout_secs": 2**70},
+    {"array": [0, 10**10]}, {"array": [2**70, 2**70]},
+    {"jobs": [{"argv": ["echo", "x"], "index": 10**10}]},
+])
+async def test_add_refuses_numbers_beyond_the_upper_bounds(daemon, bad):
+    """L7: no worker task / registry row for a silly channel, no OverflowError, no `True` as 1."""
+    args = {"argv": ["echo", "x"], "cwd": CWD, **bad}
+    resp = await send(daemon.socket_path, "add", **args)
+    assert resp["ok"] is False and "internal" not in resp["error"]
+    status = (await send(daemon.socket_path, "status"))["data"]
+    assert set(status["channels"]) <= {"1"}  # nothing was created for the refused request
+
+
+@pytest.mark.asyncio
+async def test_add_accepts_the_upper_bounds_themselves(daemon):
+    resp = await send(daemon.socket_path, "add", argv=["echo", "x"], cwd=CWD,
+                      channel=db_module.MAX_CHANNEL, max_retries=db_module.MAX_RETRIES,
+                      timeout_secs=db_module.MAX_TIMEOUT_SECS)
+    assert resp["ok"], resp
+
+
+@pytest.mark.asyncio
+async def test_add_without_cwd_or_argv_says_which_is_missing(daemon):
+    r = await send(daemon.socket_path, "add", argv=["echo", "x"])
+    assert r["ok"] is False and r["error"] == "cwd is required"
+    r = await send(daemon.socket_path, "add", cwd=CWD)
+    assert r["ok"] is False and r["error"] == "argv is required"
+
+
+@pytest.mark.asyncio
+async def test_edit_refuses_numbers_beyond_the_upper_bounds(daemon):
+    blocker = await _add(daemon, ["sleep", "30"])
+    await wait_for_status(daemon.socket_path, blocker, {"running"})
+    b = await _add(daemon, ["echo", "b"])
+    for bad in ({"channel": 10**6}, {"max_retries": 10**6}, {"timeout_secs": 10**12}):
+        r = await send(daemon.socket_path, "edit", id=b, **bad)
+        assert r["ok"] is False and "internal" not in r["error"], bad
+    assert (await send(daemon.socket_path, "cancel", id=blocker))["ok"]
+
+
+@pytest.mark.asyncio
+async def test_requests_naming_a_huge_channel_are_refused_cleanly(daemon):
+    for cmd in ("pause", "resume", "cancel"):
+        r = await send(daemon.socket_path, cmd, channel=10**6)
+        assert r["ok"] is False and "internal" not in r["error"], cmd
+
+
+@pytest.mark.asyncio
+async def test_signal_handlers_stay_until_the_shutdown_has_run(daemon):
+    """L9: a second SIGTERM / Ctrl-C while the jobs are being stopped must not use the default action."""
+    seen: dict[str, bool] = {}
+    real = daemon._shutdown
+
+    async def spy(server):
+        handlers = asyncio.get_running_loop()._signal_handlers  # type: ignore[attr-defined]
+        seen["term"] = signal.SIGTERM in handlers
+        seen["int"] = signal.SIGINT in handlers
+        await real(server)
+
+    daemon._shutdown = spy  # type: ignore[method-assign]
+    daemon._stopping.set()
+    for _ in range(200):
+        if seen:
+            break
+        await asyncio.sleep(0.05)
+    assert seen == {"term": True, "int": True}

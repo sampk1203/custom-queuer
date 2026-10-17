@@ -3,9 +3,27 @@
 Every test gets a throwaway notify config path. Without this, a Daemon built
 with defaults would read the developer's real ~/.config/queuer/notify.json
 and send real Telegram messages while the suite runs.
+
+Every other QUEUER_* variable of the shell that runs the suite is removed for the
+duration of each test (5.todo M7): install.sh runs this suite from the owner's shell,
+and a QUEUER_POST_JOB_HOOK, QUEUER_KEEP, QUEUER_LOG_MAX_* or QUEUER_ENV_PASSTHROUGH
+exported there would otherwise be read by every test Daemon.
 """
 
+import os
+
 import pytest
+
+# The variables the isolation fixtures below set themselves; the scrub leaves them alone.
+ISOLATED_QUEUER_VARS = ("QUEUER_NOTIFY_PATH", "QUEUER_DB_PATH", "QUEUER_LOG_DIR", "QUEUER_SOCKET_PATH")
+
+
+@pytest.fixture(autouse=True)
+def _no_inherited_queuer_settings(monkeypatch) -> None:
+    """Tests start with none of the developer's QUEUER_* settings. A test that wants one
+    sets it itself with monkeypatch.setenv (undone after the test, like this removal)."""
+    for name in [n for n in os.environ if n.startswith("QUEUER_") and n not in ISOLATED_QUEUER_VARS]:
+        monkeypatch.delenv(name, raising=False)
 
 
 @pytest.fixture(autouse=True)

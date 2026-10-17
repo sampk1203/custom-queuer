@@ -6,7 +6,7 @@ reorder, and cancel jobs.
 
 ## Requirements
 
-- Python 3.12
+- Python 3.10 or newer (`requires-python >= 3.10`; CI tests 3.10-3.15, `.python-version` pins 3.12 for development)
 - [uv](https://docs.astral.sh/uv/)
 - Linux with `systemd --user` support (this was built and tested on Pop!_OS)
 
@@ -23,7 +23,7 @@ the project directory) — it syncs the venv, runs the test suite, installs
 `queuer` / `qur` / `queuerd` onto your `PATH` via `uv tool install
 --editable .` (edits to the code take effect without reinstalling), stops
 shell tab-completion for `qur`/`queuer` (for your login shell), stops
-any existing `queuerd` process (systemd-managed or stray), rewrites the
+the existing `queuerd` service (asking first if a job is running, see below), rewrites the
 systemd unit with the correct path, enables + starts it, and enables
 linger so it survives logout. It also makes any state left by an older version
 owner-only (db, logs, config; see [Security and permissions](#security-and-permissions)).
@@ -47,13 +47,26 @@ the running daemon is touched.
 no terminal (a script, ssh without a tty). It answers the safe way: the job logs are kept and
 linger stays enabled.
 
+**Running jobs.** Stopping the daemon kills its jobs (recorded `interrupted`, not failed, not
+retried), so a re-install after a `git pull` could end a multi-day run. Before it stops the
+service, `./install.sh install` and `./install.sh uninstall` ask the daemon (`qur status`)
+which jobs are running (or frozen by `--now`), list them and ask `Kill them and continue? [y/N]`.
+The default is no: nothing is stopped, the script exits with 1 and says so, and you re-run it when
+the jobs have finished (the tests, venv and `qur` commands are already updated by then). With no
+terminal the answer is also no, so a script never kills a job by accident. `--yes` (`-y`) answers
+yes: `./install.sh install --yes`. A daemon that does not answer is not asked about. Only the
+`queuerd` systemd service is stopped; the old blanket `pkill -x queuerd` is gone, so a second
+`queuerd` of yours (a dev copy) is no longer killed silently. A `queuerd` process that the service does not
+manage (started by hand) is listed and stopped only after its own `Stop it? [y/N]` (or `--yes`).
+
 The project path is written into the systemd unit (`ExecStart` points at the project's
 `.venv`). If you move or delete the project folder, run `./install.sh install` again from the
 new place; until then the service cannot start.
 
 **Uninstall** lists what it will remove and asks to proceed (default no), then asks
 separately whether to delete the job logs and whether to disable linger (both
-default no). It stops and disables `queuerd`, deletes the systemd unit, runs
+default no); if a job is running it lists it and asks once more before the daemon is stopped
+(see "Running jobs" above). It stops and disables `queuerd`, deletes the systemd unit, runs
 `uv tool uninstall queuer`, removes the shell completion files and the lines typer
 added to `~/.bashrc` (the old file is kept as `~/.bashrc.queuer-bak`), deletes the job database (queue and history), the Telegram
 setup (`~/.config/queuer`, bot token included), the socket (and its private
@@ -110,18 +123,22 @@ qur add --after 12 -- ./run_simulation.sh input.yaml
 
 The command is captured two ways:
 - **raw** — exactly what you typed
-- **resolved** — path-like tokens (anything containing `/`, or a bare
-  filename that exists in the current directory, or the executable itself
-  looked up on `PATH`) canonicalized to absolute paths. Symlinks are
-  **not** followed (deliberately — this matters for venvs: resolving
-  `.venv/bin/python3` to its symlink target would silently break venv
-  activation for the job).
+- **resolved** — the same words, except that the executable (the first word) is made
+  an absolute path: looked up on `PATH` (your shell's `PATH` at `qur add` time), or made
+  absolute against the current directory if it contains a `/` or exists there. Every
+  other word reaches the job exactly as you typed it (the job runs in the directory you
+  added it from, so relative paths mean the same thing; `--config=conf/a.yaml`,
+  `facebook/opt-125m` or a URL are never rewritten). Symlinks are **not** followed
+  (deliberately — this matters for venvs: resolving `.venv/bin/python3` to its symlink
+  target would silently break venv activation for the job).
 
 `--before ID` / `--after ID` choose the job's **position** in the queue and nothing
 more: the new job does not wait for that job to finish or succeed, and the ID must
 still be queued on the same channel (once it started, the add is rejected).
 `--now` freezes the running job (SIGSTOP) while the priority job runs; a frozen job
-stays alive and keeps its memory, so briefly one channel can have two live jobs.
+stays alive and keeps its memory, so briefly one channel can have two live processes (one
+frozen, one running). A normal job never starts beside a running `--now` job: the queue
+waits until the `--now` lane is empty.
 
 **Dependencies.** `--depends-on IDS` runs the job only if every listed job ended
 `done` (exit 0); if any ended failed, cancelled, skipped, interrupted or was removed,
@@ -156,6 +173,8 @@ value, in order, with `{}` replaced by the value in every word of the command th
 contains it (an error if there is no `{}`). `--array A-B -- CMD ...` queues one job
 per number A..B inclusive; each job's environment has `QUR_INDEX` set to its number
 (for `--each`, to the value's 1-based position). `--array` does not touch `{}`.
+A sweep's request stays small: `--array` sends the command once with the range (the daemon
+expands it), so `--array 1-1000` is no bigger than `--array 1-2`.
 
 ```bash
 qur add --each 0.1 0.2 0.5 -- python train.py --lr {}     # added jobs 31-33
@@ -244,13 +263,22 @@ delayed again.
 **Environment.** A job does not get your whole shell environment (that would copy secrets
 into the job row and logs). It gets:
 
+- Standard input is `/dev/null` (a job never reads the daemon's terminal, even when the daemon was started by hand).
 - `PATH`, `HOME`, `VIRTUAL_ENV` and `PYTHONPATH` as before, and `PYTHONUNBUFFERED=1` so Python
   output reaches the log and `qur logs` as it is printed (override it with `--env PYTHONUNBUFFERED=0`);
+- `USER`, `LOGNAME`, `SHELL` and `TMPDIR`, taken from the daemon's own environment (the systemd user
+  manager sets the first three) when it has them there; a name the daemon does not have is not
+  invented. Some MPI, conda and licence tools refuse to start without them. `--env` overrides them,
+  and hooks get the same;
 - a **passthrough list**, copied from the shell that runs `qur add` when set there:
-  `CUDA_VISIBLE_DEVICES`, `OMP_NUM_THREADS`, `MKL_NUM_THREADS`, `OPENBLAS_NUM_THREADS`,
+  `CUDA_*` (`CUDA_HOME`, `CUDA_VISIBLE_DEVICES`, ...), `OMP_*` (`OMP_NUM_THREADS`, `OMP_PLACES`,
+  `OMP_PROC_BIND`, ...), `MKL_*`, `OPENBLAS_*`, `NCCL_*`, `OMPI_*`, `UCX_*`, `CONDA_*`,
   `LD_LIBRARY_PATH`, `LANG`, `LC_*`, `TERM`, `TZ`. Replace the list with the variable
   `QUEUER_ENV_PASSTHROUGH` in your shell (comma-separated names, `*` allowed;
-  `QUEUER_ENV_PASSTHROUGH=` empty means pass nothing);
+  `QUEUER_ENV_PASSTHROUGH=` empty means pass nothing). For anything else your tools read
+  (`LAMMPS_POTENTIALS`, a licence server, ...) list it there, for example
+  `QUEUER_ENV_PASSTHROUGH='CUDA_*,OMP_*,LD_LIBRARY_PATH,LAMMPS_*'` (that REPLACES the built-in list, so
+  repeat what you still want), or give it per job with `--env NAME`;
 - anything you give with `--env KEY=VAL` (sets it) or `--env KEY` (copies the value from your shell;
   an error if it is not set). Repeatable; names must match `[A-Za-z_][A-Za-z0-9_]*`. `--env` beats the
   passthrough list, and a sweep's `QUR_INDEX` beats `--env`.
@@ -295,8 +323,8 @@ later when it reaches the front of the queue.
 qur add --dry-run --delay 2h --env OMP_NUM_THREADS=8 -- python train.py
 ```
 
-It prints the raw command (what you typed) and the resolved command (interpreter and
-executable as absolute paths, what will really be exec'd), the working directory, the
+It prints the raw command (what you typed) and the resolved command (the executable as an
+absolute path, what will really be exec'd), the working directory, the
 environment the job would get (same masking as `qur show`: copied names only, `NAME=***` for
 secret-looking names), the channel, and the queue position (`queue position: 3 (2 queued
 ahead; job 7 is running now)`; with `--now` the position on the `--now` lane and the job that
@@ -325,8 +353,9 @@ qur add --stop-signal INT --stop-grace 120 -- ./lmp -in run.in   # Ctrl-C, then 
 - `--stop-signal` is one of `TERM`, `INT`, `HUP`, `QUIT`, `USR1`, `USR2`, `KILL` (also `SIGINT`
   or the number). `STOP`/`CONT` are refused: queuer uses them to freeze jobs for `--now`.
 - `--stop-grace` is a number of seconds, or a duration (`90s`, `2m`, `1h`), at most 1 day; `0`
-  sends SIGKILL right after the signal. The grace is how long the job's MAIN process gets to
-  exit; if it has not exited by then the whole group is killed.
+  sends SIGKILL right after the signal. The grace is how long the job's WHOLE process group gets to
+  exit; if any process of it (a background child that ignores the signal, an MPI helper) is
+  still alive then, the whole group is killed.
 - Both apply to `qur cancel` and to a timeout. They do NOT apply when the daemon itself stops
   (reboot, `qur daemon stop`): that keeps its fixed SIGTERM and 5-second budget so the stop
   stays inside systemd's `TimeoutStopSec=30`.
@@ -345,7 +374,7 @@ the table title says how many are shown). The daemon keeps more (see `history`).
 - The `Origin` column says where a job came from: `new` (you queued it),
   `retry of #N (k/max)` (automatic, after job N failed), or `requeue of #N`
   (manual, via `qur requeue N`)
-- `--full` shows resolved absolute paths instead of what you typed
+- `--full` shows the resolved command (executable as an absolute path) instead of what you typed
 - `--json` prints the raw response instead of a table, for scripting
 
 ### `show ID [ID...]`
@@ -369,10 +398,14 @@ peak RSS   30.0 GB
 cpu time   2m14s user + 3s sys
 ```
 
-- **peak RSS**: the process's high-water mark of resident memory (`VmHWM` in `/proc/PID/status`),
-  shown as KB, MB or GB. Use it to size the next DFT or LAMMPS run.
-- **cpu time**: user and system CPU seconds of the process (`utime`/`stime`). Wall time is the
-  existing `duration`.
+- **peak RSS**: the largest resident memory the job's WHOLE process group had at once: the sum of
+  `VmRSS` over every process in the group (the process `qur` started, `mpirun`'s ranks, a shell
+  script's children), the biggest sum seen while it ran, never lowered when a rank exits. The
+  started process's own `VmHWM` counts too. Shown as KB, MB or GB. Use it to size the next DFT or
+  LAMMPS run.
+- **cpu time**: user and system CPU seconds of every process in the group (`utime`/`stime`) plus
+  the children each one has already waited for (`cutime`/`cstime`), so `mpirun -np 16 lmp` shows
+  the ranks' CPU time, not the launcher's. Wall time is the existing `duration`.
 - The finished-job message in Telegram gets a short tail: `... · exit 0 · used 31.0 GB · 1h58m cpu`.
   Whichever of the two was captured is shown; a job that has nothing is shown as before.
 - Raw numbers are in `qur show --json`, `qur history --json` and `qur export` as `max_rss_kb`,
@@ -381,13 +414,19 @@ cpu time   2m14s user + 3s sys
 
 What it does NOT measure (read before trusting a number):
 
-- Only the process `qur` starts, not its children. `qur add -- python run.py` or `-- lmp -in in.x`
-  measures that process itself. `qur add -- ./run.sh` (or any command with shell syntax, which
-  runs under `bash -c`) measures the shell; `mpirun -np 16 lmp ...` measures `mpirun`, not the 16
-  ranks; subprocesses started by your program are not added. For those, make the real program the
-  queued command, or run an external monitor.
-- A job shorter than about 0.2 s has no numbers (it ends before the first sample). The CPU time can
-  lag the real end by up to 0.2 s, and a memory spike in the last 0.2 s may be missed.
+- Only processes in the job's process group count (queuer starts every job in its own group). A
+  daemon a job starts with `setsid`/`nohup setsid`, or a process that makes its own group
+  (`setpgid`), is outside it. A scheduler-style tool that moves work to another host (`srun`,
+  `ssh`) shows only its local part.
+- The RSS sum counts a page once per process that has it mapped, so ranks that share memory
+  (MPI shared-memory windows, a mapped library, copy-on-write pages after a fork) make the sum higher
+  than the real use. It is an upper-leaning estimate of what to ask for, not an exact figure.
+  Memory that only a process's children had, once they have all exited, is not in a later sum, but
+  the peak keeps it.
+- The group is scanned about once a second (one pass over `/proc`; the started process itself every
+  0.2 s at first, then every second). A job shorter than about 0.2 s has no numbers (it ends before
+  the first sample). A memory spike between two scans can be missed, and the CPU time can lag the
+  real end by up to a second (what a child used in the last moments, before its parent collects it).
 - Linux only (`/proc`). Where `/proc` is unreadable a job just has no numbers; it never fails.
 
 ### `wait ID|RANGE... | --channel N`
@@ -411,7 +450,8 @@ by `--retries` is followed to its retry, so you get the result of the last attem
 channel stays busy, so `--channel` on it waits until `qur resume`. A channel that never had a job counts as idle.
 `--timeout 2h`, `--quiet` (no output), `--json` (`{"exit_code", "timed_out", "jobs": [{"id", "status",
 "exit_code", "channel", "ran_as", "note", "code", "finished"}]}`; with `--channel`:
-`{"channel", "idle", "timed_out", "exit_code"}`). It polls the daemon every 1.5 s.
+`{"channel", "idle", "timed_out", "exit_code"}`). It polls the daemon every 1.5 s, asking about all
+the jobs in one request (so `qur wait 1-1000` costs one round trip per poll, not 1000).
 
 ```
 qur add -- ./prep.sh            # "Queued as job 40", then echoes the command and cwd
@@ -441,8 +481,8 @@ the last 10.
 - `--limit N` / `-n N`: most rows, default 50, at most 10000
 - `--full`: resolved commands; `--json`: a JSON list of the job records; `--csv`: CSV with a header row
   (`id, channel, status, command, cwd, origin, enqueued_at, started_at, finished_at, duration_secs,
-  exit_code, note`; UTC timestamps; a cell starting with `=`, `+`, `-` or `@` gets a leading `'` so a
-  spreadsheet does not run it as a formula). `--csv` and `--json` cannot be combined
+  exit_code, note`; UTC timestamps; a command, cwd, origin or note cell starting with `=`, `+`, `-` or `@` gets a leading `'` so a
+  spreadsheet does not run it as a formula; the number columns, e.g. an exit code of `-9`, are left as they are). `--csv` and `--json` cannot be combined
 
 Filters combine (all must match). Exit code 0 even when nothing matches.
 
@@ -543,7 +583,7 @@ channels are not affected.
 
 `pause` stops the daemon from starting new jobs — the current job (if
 any) keeps running to completion. State persists across daemon
-restarts, so a paused queue doesn't silently resume after a crash.
+restarts, so a paused queue doesn't silently resume after a crash. `qur clear` forgets a channel that has no jobs left (except channel 1) together with its pause flag, so reusing that number later starts unpaused; pausing a channel before its first job still works.
 
 ### `doctor [--fix] [--json]`
 
@@ -558,11 +598,12 @@ not fail it), so it also works in scripts.
 | `config dir`, `notify.json`, `redact.json` | files 0600, folder 0700, real files you own, no symlinks | loose file FAIL, loose folder WARN, symlink/foreign owner FAIL |
 | `db dir`, `db file`, `db wal/shm` | database and its `-wal`/`-shm` files 0600, folder 0700 | same rules |
 | `schema` | database at this queuer's schema version (read only, never migrates) | older WARN (the daemon upgrades it on start), newer FAIL |
+| `db filesystem` | the database folder is on a local filesystem (read from `/proc/self/mountinfo`; nothing is opened or created) | on NFS, CIFS/SMB, Lustre, GPFS, Ceph, 9p or a FUSE mount (`fuse`, `fuse.*`) WARN: SQLite WAL may not work there, set `QUEUER_DB_PATH` to a local disk; `/proc/self/mountinfo` unreadable WARN. Cannot be fixed by `--fix` |
 | `log dir`, `log writable`, `disk space` | log folder private and writable, at least 1 GB free where the logs go | under 1 GB WARN, under 100 MB FAIL, not writable FAIL |
 | `linger` | `loginctl` linger is on (the daemon survives logout) | WARN |
 | `unit file`, `service` | `~/.config/systemd/user/queuerd.service` exists and `systemctl --user is-active queuerd` says active | WARN |
 | `unit exec` | the unit's `ExecStart` program exists, is executable and is this project's `.venv/bin/queuerd` | no `ExecStart` or program missing (project moved or deleted) FAIL; a different project folder WARN |
-| `unit settings` | the installed unit has the restart/stop lines `install.sh` writes now (`Type`, `Restart`, `RestartSec`, `TimeoutStopSec`) and either all or none of the hardening lines (`UMask`, `NoNewPrivileges`, `LockPersonality`, `RestrictAddressFamilies`); `hardening: none` is fine (`QUEUER_HARDEN=none`, or systemd refused `basic`) | a missing/different setting or a half-hardened unit WARN: re-run `./install.sh` |
+| `unit settings` | the installed unit has the restart/stop lines `install.sh` writes now (`Type`, `Restart`, `RestartSec`, `TimeoutStopSec`, `OOMPolicy=continue`) and either all or none of the hardening lines (`UMask`, `NoNewPrivileges`, `LockPersonality`, `RestrictAddressFamilies`); `hardening: none` is fine (`QUEUER_HARDEN=none`, or systemd refused `basic`) | a missing/different setting or a half-hardened unit WARN: re-run `./install.sh` |
 | `telegram ...` | only if configured: one `getMe` per bot accepts the token | rejected token (401/404) FAIL; offline or other API error WARN; not configured is OK |
 
 `--fix` repairs **permission problems only**: it chmods files and folders you own to 0600/0700.
@@ -638,7 +679,10 @@ redacted: you see your own data. What is masked (replaced by `***`):
 
 - `NAME=VALUE` when NAME ends in key/token/secret/password/passwd/passphrase (`API_KEY=`,
   `GITHUB_TOKEN=`, `db.password=`, also inside URLs: `?access_token=...`), or has a
-  `secret`/`password` part (`SECRET_KEY_BASE=`). Names that only *contain* the word are left
+  `secret`/`password` part (`SECRET_KEY_BASE=`), or has a whole segment (split on `_ . -`) that is
+  `pass`, `pwd`, `cred(s)`, `credential(s)`, `auth`, `cookie(s)` or `session` (`MYSQL_PWD=`, `DB_PASS=`,
+  `AWS_CREDENTIALS=`, `API_AUTH=`, `SESSION_COOKIE=`; `QUEUER_ENV_PASSTHROUGH` and `author` are not).
+  Names that only *contain* the word are left
   alone, so `--tokenizer=gpt2`, `max_tokens=100` and `token_count=5` stay readable.
 - `--password=VAL`, `--password VAL`, `--api-key VAL`, `--access-token VAL` (same name rule;
   `--key-file PATH` is not touched).
@@ -765,20 +809,19 @@ token on all machines, send `/revoke` to @BotFather.
 
 ### `logs ID [-n N] [--tail]` / `logs --running [--channel N]`
 
-Reads the job's log file straight off disk — this doesn't go through
-the daemon at all, so it works even if `queuerd` isn't running. A big log is
+Reads the job's log file straight off disk. It asks the daemon where the file is (the daemon may have a `QUEUER_LOG_DIR` your shell does not), and falls back to your shell's default log folder when the daemon is down or no longer knows the job, so it works even if `queuerd` isn't running. A big log is
 streamed in chunks, never loaded whole. `-n N` / `--lines N` prints only the last
 N lines. `--tail` follows the file as it grows (Ctrl-C to stop); `-n 20 --tail`
 shows the last 20 lines first, then follows. `qur logs --running` picks the job running now
 on a channel (default 1, `--channel N` for another) so you do not need its id; it prints
 `(job N)` on stderr first, and fails with a clear message if nothing is running there. Each job's log
 is capped at 50MB; once hit, further output is dropped and a single
-`[queuer] log truncated at 50MB` marker is appended.
+`[queuer] log truncated at 50MB` marker is appended. If `<id>.log` already exists with content when job `<id>` starts (the database was deleted or reset, so ids began at 1 again), the old file is moved to `<id>.log.old` instead of being overwritten; `clean-logs` does not touch `*.log.old` files, delete them by hand.
 
 ### `clean-logs [--days N] [--max-mb N] [--dry-run]`
 
 Deletes the logs of finished jobs (done, failed, cancelled, skipped, interrupted) that ended
-more than `--days` ago (default 30), plus orphaned logs whose job row is gone from the
+more than `--days` ago (default 30; `0` or more, a negative number is refused), plus orphaned logs whose job row is gone from the
 history (an orphan only when its file is also older than `--days`). `--max-mb N` then also
 deletes the oldest remaining finished logs until the whole log folder is at most N MB
 (logs of queued, running and frozen jobs count towards the total but are never deleted, so
@@ -839,7 +882,8 @@ the Telegram button.
   daemon stops starting jobs, sends SIGTERM to every running (and `--now`-frozen)
   job's process group, SIGKILLs what is left after 5 s, writes `interrupted` for each
   job, sends the Telegram messages, then exits. That takes at most about 20 s, inside
-  the unit's `TimeoutStopSec=30`. Queued jobs stay queued.
+  the unit's `TimeoutStopSec=30`. A second SIGTERM or Ctrl-C while that runs is ignored (the handlers stay installed until the jobs are recorded). Queued jobs stay queued. The process ends as soon as that
+  shutdown is done; it does not wait for an in-flight Telegram poll.
 - **Unclean stop** (crash, `kill -9`, power loss): the daemon could not write anything. On
   the next start every row still `running` (or `stopped`) from the previous instance is
   marked `interrupted` and you get a message for it. If the job's own process is still
@@ -860,6 +904,8 @@ reboots without any special handling. The database runs in SQLite WAL mode (so `
 the daemon can use it at the same time; you will see `queuer.db-wal` and `-shm` next to it, also 0600)
 and carries a `schema_version`: an older database is upgraded automatically, in transactions,
 the first time the daemon (or `clean-logs`) opens it. A database written by a newer queuer is refused.
+WAL needs working shared memory and file locks, so keep the database on a **local disk**: on NFS/CIFS or some FUSE mounts (a cluster home directory is the usual case) SQLite may not refuse WAL and can still corrupt or lock up. Check with `findmnt -T ~/.local/state/queuer`; `qur doctor` warns (`db filesystem`) when the folder is on such a filesystem. The fix is to point `QUEUER_DB_PATH` at a local disk (for example in the unit: `systemctl --user edit queuerd`, `[Service]` / `Environment=QUEUER_DB_PATH=/var/tmp/<you>/queuer.db`, then restart, and set the same variable in your shell so `qur` finds the same file; the logs and socket can stay where they are).
+A queued job's `position` only orders its queue; the numbers are spaced 1024 apart, so starting, removing or cancelling a job (and appending to a long queue or a big `--array` sweep) does not rewrite the other rows. Seeing gaps in the column is normal.
 
 ## File locations
 
@@ -867,7 +913,7 @@ the first time the daemon (or `clean-logs`) opens it. A database written by a ne
 |---|---|
 | Job database | `~/.local/state/queuer/queuer.db` |
 | Job logs | `~/.local/state/queuer/logs/<id>.log` |
-| Socket | `$XDG_RUNTIME_DIR/queuer.sock`, or `/tmp/queuer-<uid>/queuer.sock` (private dir) if that is unset |
+| Socket | `$XDG_RUNTIME_DIR/queuer.sock`, or `/tmp/queuer-<uid>/queuer.sock` (private dir) if that is unset (the `qur` client also tries `/run/user/<uid>/queuer.sock` when nothing is at the `/tmp` path) |
 | Notification config (bot token, chats, this qur's id) | `~/.config/queuer/notify.json` (0600) |
 | Extra Telegram redaction patterns (optional, JSON list of regexes) | `~/.config/queuer/redact.json` (0600) |
 | systemd unit | `~/.config/systemd/user/queuerd.service` |
@@ -875,7 +921,8 @@ the first time the daemon (or `clean-logs`) opens it. A database written by a ne
 The database, log, socket and notification paths can be overridden with `QUEUER_DB_PATH`,
 `QUEUER_LOG_DIR`, `QUEUER_SOCKET_PATH`, `QUEUER_NOTIFY_PATH` and `QUEUER_REDACT_PATH` env vars (and `QUEUER_KEEP`, the
 number of finished jobs kept per channel, default 200; `QUEUER_LOG_MAX_AGE_DAYS`, `QUEUER_LOG_MAX_MB` and
-`QUEUER_LOG_CLEAN_HOURS` for automatic log cleaning, see `clean-logs`; `QUEUER_POST_JOB_HOOK`, the global post-job hook, see `add`) — mainly useful for
+`QUEUER_LOG_CLEAN_HOURS` for automatic log cleaning, see `clean-logs`; `QUEUER_POST_JOB_HOOK`, the global post-job hook, see `add`;
+`QUEUER_JOB_UMASK`, the umask of jobs and hooks, see "Service hardening") — mainly useful for
 running the daemon against a scratch location during manual testing,
 without touching real state.
 
@@ -891,10 +938,29 @@ boundary. What is enforced:
   `sudo`), the fallback is `/tmp/queuer-<uid>/queuer.sock`, never a bare `/tmp`. The folder
   is created 0700; an existing one is used only if it is a real folder (not a symlink)
   owned by you, and a loose mode is tightened. Otherwise the daemon refuses to start.
+  A `qur` run from cron, `sudo -u` or ssh without a login session has no `XDG_RUNTIME_DIR` either, so it would look in
+  `/tmp/queuer-<uid>` while the systemd service listens in `/run/user/<uid>`: when nothing is at the `/tmp` path and the
+  systemd socket exists, the client uses that one. An explicit `QUEUER_SOCKET_PATH` or `XDG_RUNTIME_DIR` is never second-guessed.
 - **Service hardening.** `install.sh` writes the unit with `UMask=0077`, `NoNewPrivileges`,
   `LockPersonality` and `RestrictAddressFamilies` (level `basic`, the default; jobs inherit
   these, so `sudo` inside a job fails: use `QUEUER_HARDEN=none` for that).
   If systemd refuses the unit the installer falls back to `QUEUER_HARDEN=none` and says so.
+- **Job umask.** The unit's `UMask=0077` is inherited by every job, so result files are created
+  `0600` and a collaborator, or a group-shared project folder, cannot read them. To change that for
+  jobs only, set `QUEUER_JOB_UMASK` in the daemon's environment, as an octal number
+  (`systemctl --user edit queuerd`: `[Service]` / `Environment=QUEUER_JOB_UMASK=027`, then restart):
+  `022` = everyone can read, `027` = your group can read, `077` = private. Unset or empty keeps the
+  daemon's own umask (`0077` with the default unit); a bad value is ignored with a line in the journal.
+  Jobs and hooks get it; the daemon's own files (database, logs, config, socket) stay private
+  whatever it says, because the daemon sets their modes itself. Nothing else about the unit changes.
+- **One OOM-killed job does not stop the service.** The unit sets `OOMPolicy=continue` (also at
+  hardening level `none`). Jobs live in the daemon's cgroup; with systemd's default policy the kernel
+  OOM killer (or systemd-oomd) killing ONE job process can make systemd stop the whole unit, so every
+  channel's job would get SIGTERM and be recorded `interrupted`. Now only that job ends (it is
+  recorded `failed`, like any job killed by a signal) and the other channels go on.
+  Needs systemd 243 or newer (an older one ignores the line). Units written by an older
+  `install.sh` do not have it: `qur doctor` shows `unit settings` as WARN, and `./install.sh` fixes it. To check what
+  systemd uses: `systemctl --user show queuerd -p OOMPolicy`.
 - **One daemon per socket.** A second `queuerd` exits with `queuerd is already running`
   before it opens the database, so it can't steal the socket or mark the first one's
   running job as failed. A stale socket file left by a crash does not block startup.
@@ -908,10 +974,16 @@ boundary. What is enforced:
 - **Accepted risk: your own processes.** Any process running as your user can queue commands
   through the socket (and read your 0600 files). There is no client auth token by design;
   the daemon only keeps other users out.
-- **Bad requests.** A request that isn't valid JSON, isn't UTF-8, or is longer than 64 KB
-  gets `invalid request` and the daemon carries on (it used to log a traceback and
-  send no reply). `add` rejects wrongly typed fields (timeout, channel, argv, cwd,
-  before/after) with an error instead of failing later inside the worker. A job log that
+- **Bad requests.** A request that isn't valid JSON or isn't UTF-8 gets `invalid request`,
+  and one longer than 16 MiB gets `request too large` (a 1000-job sweep is far below that);
+  the daemon carries on (it used to log a traceback and send no reply). A database error
+  or a number out of range inside a command is answered with `ok: false` and no traceback;
+  an editor pid must be 1..4194304; one failing step never ends a channel's worker (it is
+  logged and retried after 2 s). `add` rejects wrongly typed fields (timeout, channel, argv, cwd,
+  before/after) with an error instead of failing later inside the worker, answers a missing `cwd`/`argv` by name,
+  and refuses numbers beyond the limits: channel 1..9999, `--retries` at most 1000, `--timeout` at most 10 years,
+  a sweep index 0..1000000000. Removing or cancelling a job in the instant its process is being created is refused
+  ("is starting right now"). A job whose row vanishes during start-up has its process group killed. A job log that
   cannot be opened or written (disk full) is logged to the journal and the job's output is
   dropped; the job and the daemon keep going. The log file is opened without following
   symlinks.
@@ -968,13 +1040,15 @@ uv sync
 uv run pytest -v          # storage layer + path-resolution unit tests
 ```
 
+The suite is isolated from your own setup: `tests/conftest.py` points the database, logs, socket and
+notify config at a temporary folder and removes every other `QUEUER_*` variable from the environment
+for the length of each test (so a `QUEUER_POST_JOB_HOOK` or `QUEUER_KEEP` exported in the shell that runs
+`./install.sh` is never read by a test daemon). A test that needs one sets it itself with `monkeypatch.setenv`.
+
 `.github/workflows/ci.yml` runs the same tests, and a dependency audit
 (`pip-audit` on the locked dependencies), on every push and pull request, and
 once a week so new advisories show up without a push. It needs a GitHub repo to run;
 locally the commands above are the same thing.
-
-For a design/architecture writeup and the phase-by-phase build plan, see
-`queuer_plan.md` in the repo root.
 
 ## Known limitations (by design, not oversights)
 
@@ -985,7 +1059,7 @@ For a design/architecture writeup and the phase-by-phase build plan, see
   (`cmd &`) keeps its channel busy until that child exits too. `qur cancel` kills the whole
   group.
 - Retries are opt-in per job (`--retries`), immediate unless `--retry-delay` is set, and go to the end of the queue.
-- Hooks (`--on-finish`, `--on-error`, `QUEUER_POST_JOB_HOOK`) are best-effort background commands: no retry, a 5-minute limit, and a hook still running when the daemon stops is killed. Their output goes to the job's log.
+- Hooks (`--on-finish`, `--on-error`, `QUEUER_POST_JOB_HOOK`) are best-effort background commands: no retry, a 5-minute limit, and a hook still running when the daemon stops is killed. Their output (at most 64 KB) goes to the job's log, even when that log has already hit the 50 MB cap.
 - Notifications are Telegram-only, best-effort (a send that fails is dropped,
   not retried), and visible to Telegram. Pair one machine at a time (see
   `connect`).
@@ -996,9 +1070,9 @@ For a design/architecture writeup and the phase-by-phase build plan, see
 - A job that starts a background child (`bash -c "sleep 8 & echo hi"`) stays `running`
   until that child exits too: the daemon waits for the job's output pipe to close, and
   the child holds it open. `qur cancel ID` ends the whole process group.
-- Resource accounting (`peak RSS`, `cpu time`) covers only the process `qur` starts, not its
-  children (a shell wrapper, `mpirun` and its ranks, subprocesses), is sampled every 0.2 s and is
-  Linux-only. See "Resource accounting" under `show`.
+- Resource accounting (`peak RSS`, `cpu time`) covers the job's whole process group (a shell
+  wrapper's children, `mpirun` and its ranks, subprocesses), is sampled about once a second and is
+  Linux-only; shared memory is counted once per process. See "Resource accounting" under `show`.
 - No sandboxing — jobs run with your own user permissions, same as
   running them directly in a shell.
 - A second `queuerd` refuses to start while one already answers on the socket

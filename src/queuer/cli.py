@@ -26,10 +26,18 @@ from rich.markup import escape
 from rich.table import Table
 from typer.core import TyperCommand
 
-from queuer import client, db, jobenv, logclean, notify, selfcheck
-from queuer.daemon import DEFAULT_GRACE_SECS, _default_db_path, _default_log_dir
+from queuer import client, db, jobenv, logclean, notify
 from queuer.db import DEFAULT_CHANNEL
 from queuer.pathresolve import SHELL_INTERPRETERS
+from queuer.paths import (
+    DEFAULT_GRACE_SECS,
+    FAIL,
+    OK,
+    UNIT_NAME,
+    WARN,
+    _default_db_path,
+    _default_log_dir,
+)
 
 app = typer.Typer(
     help="""Background job queue. Jobs on one channel run one at a time, in order; \
@@ -142,23 +150,17 @@ def _resolve_interpreter(cmd: list[str]) -> list[str]:
     resolving into the opaque script text is `pathresolve.py`'s job to
     deliberately avoid, not this function's.
 
-    Deliberately narrower than pathresolve's own per-token resolution: it
-    only ever touches cmd[0]. Running the same logic over every token would
-    also walk into any inline source text that follows a `-c`/`-e` flag
-    (`python -c "..."`, `perl -e "..."`, `node -e "..."`, etc.) -- those are
-    opaque code, not paths, and rewriting a literal '/' inside them would
-    silently corrupt the script. pathresolve.py's own shell -c exception
-    exists for exactly this hazard, but only recognizes shell interpreters
-    (SHELL_INTERPRETERS), not other languages' inline-eval flags, so this
-    stays safe by never resolving past argv[0].
+    Like pathresolve.resolve_command (H3), it only ever touches cmd[0]: the rest
+    of the command is never rewritten (a literal '/' inside `python -c "..."`,
+    `--config=conf/a.yaml` or a Hugging Face id must reach the job byte for byte).
     """
     if not cmd:
         return cmd
     if _is_explicit_shell_c(cmd):
         # user hand-wrote `bash -c '...'` themselves, or `_build_job_argv`
         # produced this shape because the command needed real shell syntax
-        # -- either way pathresolve resolves the interpreter itself
-        # daemon-side, and the script text is deliberately left alone.
+        # -- either way the daemon resolves the interpreter (argv[0]) itself,
+        # and the script text is deliberately left alone.
         return cmd
     prog = cmd[0]
     if "/" in prog or Path(prog).exists():
@@ -503,13 +505,15 @@ class _AddCommand(TyperCommand):
         return super().parse_args(ctx, _expand_each(args))
 
 
-def _sweep_jobs(cmd: list[str], each: list[str] | None, array: str | None) -> list[dict[str, Any]] | None:
-    """The per-job requests of a `--each` / `--array` sweep (None if neither flag).
+def _sweep_jobs(cmd: list[str], each: list[str] | None, array: str | None) -> dict[str, Any] | None:
+    """The sweep part of the `add` request for `--each` / `--array` (None if neither flag).
 
-    --each: one job per value, `{}` replaced by the value in every word that has it;
-    QUR_INDEX is the 1-based position. A value substituted into a command that a shell
-    will parse (one quoted word, or a hand-written `bash -c`) is shell-quoted first.
-    --array A-B: one job per number A..B inclusive, the same command, QUR_INDEX = the number."""
+    --each: `{"jobs": [...]}`, one entry per value, `{}` replaced by the value in every word
+    that has it; QUR_INDEX is the 1-based position. A value substituted into a command that a
+    shell will parse (one quoted word, or a hand-written `bash -c`) is shell-quoted first. An
+    entry's `raw_argv` is left out when it equals its `argv` (the daemon falls back to `argv`).
+    --array A-B: `{"array": [A, B], "argv": ..., "raw_argv": ...}`: the command is sent ONCE and
+    the daemon makes one job per number A..B inclusive, QUR_INDEX = the number (5.todo item 12)."""
     if each and array:
         _fail("--each and --array cannot be combined")
     if each:
@@ -527,8 +531,11 @@ def _sweep_jobs(cmd: list[str], each: list[str] | None, array: str | None) -> li
                 argv = _resolve_interpreter(_build_job_argv(words))
             except ValueError as e:
                 _fail(f"--each value {value!r}: {e}")
-            jobs.append({"argv": argv, "raw_argv": words, "index": position})
-        return jobs
+            job: dict[str, Any] = {"argv": argv, "index": position}
+            if words != argv:
+                job["raw_argv"] = words
+            jobs.append(job)
+        return {"jobs": jobs}
     if array is not None:
         m = re.fullmatch(r"(\d+)-(\d+)", array.strip())
         if m is None:
@@ -539,7 +546,10 @@ def _sweep_jobs(cmd: list[str], each: list[str] | None, array: str | None) -> li
         if high - low + 1 > db.MAX_SWEEP:
             _fail(f"--array: {high - low + 1} jobs is too many (at most {db.MAX_SWEEP} per add)")
         argv = _resolve_interpreter(_build_job_argv(cmd))
-        return [{"argv": argv, "raw_argv": cmd, "index": n} for n in range(low, high + 1)]
+        request: dict[str, Any] = {"array": [low, high], "argv": argv}
+        if cmd != argv:
+            request["raw_argv"] = cmd
+        return request
     return None
 
 
@@ -729,12 +739,13 @@ def add(
     env: Optional[list[str]] = typer.Option(
         None, "--env", metavar="KEY[=VAL]",
         help="Add an environment variable to the job; repeat for more. KEY alone copies the value from this "
-        "shell, KEY=VAL sets it. Jobs always get PATH, HOME, VIRTUAL_ENV, PYTHONPATH and PYTHONUNBUFFERED=1, "
-        "plus these when set in this shell: CUDA_VISIBLE_DEVICES, OMP_NUM_THREADS, MKL_NUM_THREADS, "
-        "OPENBLAS_NUM_THREADS, LD_LIBRARY_PATH, LANG, LC_*, TERM, TZ (change that list with the "
+        "shell, KEY=VAL sets it. Jobs always get PATH, HOME, VIRTUAL_ENV, PYTHONPATH and PYTHONUNBUFFERED=1 "
+        "(and USER, LOGNAME, SHELL, TMPDIR from the daemon when it has them), "
+        "plus these when set in this shell: CUDA_*, OMP_*, MKL_*, OPENBLAS_*, NCCL_*, OMPI_*, UCX_*, "
+        "CONDA_*, LD_LIBRARY_PATH, LANG, LC_*, TERM, TZ (change that list with the "
         "QUEUER_ENV_PASSTHROUGH variable: comma-separated names, `*` allowed, empty = none). --env wins over "
         "all of these; QUR_INDEX of a sweep wins over --env. Values are stored in the job and are visible "
-        "in `qur show`, except names containing KEY/TOKEN/SECRET/PASSWORD.",
+        "in `qur show`, except names containing KEY/TOKEN/SECRET/PASSWORD or a whole segment PASS/PWD/CRED(S)/CREDENTIAL(S)/AUTH/COOKIE/SESSION.",
     ),
     timeout: Optional[int] = typer.Option(
         None, "--timeout", help="Kill the job if it runs longer than this many seconds (counts as a failure)"
@@ -838,7 +849,7 @@ def add(
     # typed after `--` -- kept separate purely for `raw command` in
     # `show`/`list` so that view reflects what the user wrote, not queuer's
     # own interpreter-pinning. `resolved command` (see pathresolve.py,
-    # daemon-side) is where absolute executable/file paths belong.
+    # daemon-side) differs from it only in argv[0], made absolute (H3).
     if on_fail not in db.ON_FAIL_MODES:
         _fail(f"--on-fail must be one of {', '.join(db.ON_FAIL_MODES)} (got {on_fail!r})")
     stop_signal_name = _stop_signal(stop_signal, "--stop-signal")
@@ -860,7 +871,7 @@ def add(
         _fail(str(e))
     env_pass = {k: v for k, v in jobenv.collect_passthrough(os.environ).items() if k not in env_explicit}
 
-    job_kwargs: dict[str, Any] = {"argv": job_argv, "raw_argv": cmd} if sweep is None else {"jobs": sweep}
+    job_kwargs: dict[str, Any] = {"argv": job_argv, "raw_argv": cmd} if sweep is None else sweep
     data = _call(
         "add",
         **job_kwargs,
@@ -1179,13 +1190,15 @@ CSV_COLUMNS = (
     "id", "channel", "status", "command", "cwd", "origin", "enqueued_at", "started_at", "finished_at",
     "duration_secs", "exit_code", "note",
 )
+CSV_TEXT_COLUMNS = frozenset({"command", "cwd", "origin", "note"})  # L1: the columns the formula guard applies to
 
 
-def _csv_cell(value: Any) -> str:
+def _csv_cell(value: Any, guard: bool = True) -> str:
     """One CSV cell. A text starting with = + - @ (or tab/CR) would run as a formula when the
-    file is opened in a spreadsheet, so it gets a leading apostrophe."""
+    file is opened in a spreadsheet, so it gets a leading apostrophe. `guard=False` is for the
+    number columns (L1): an exit code of -9 (killed by a signal) must stay -9."""
     text = "" if value is None else str(value)
-    if text[:1] in ("=", "+", "-", "@", "\t", "\r"):
+    if guard and text[:1] in ("=", "+", "-", "@", "\t", "\r"):
         return "'" + text
     return text
 
@@ -1199,7 +1212,8 @@ def _job_csv_row(job: dict[str, Any], full: bool) -> list[str]:
         job.get("enqueued_at"), job.get("started_at"), job.get("finished_at"), secs, job.get("exit_code"),
         job.get("note"),
     ]
-    return [_csv_cell(v) for v in values]
+    # L1: only the free-text columns can carry a formula; ids, status, timestamps, duration and exit code cannot
+    return [_csv_cell(v, guard=CSV_COLUMNS[i] in CSV_TEXT_COLUMNS) for i, v in enumerate(values)]
 
 
 def _history_csv(jobs: list[dict[str, Any]], full: bool) -> str:
@@ -1450,27 +1464,42 @@ def _wait_record(orig: int, job: dict[str, Any] | None, watched: int) -> dict[st
             "ran_as": watched, "note": job["note"], "code": _wait_code(job["status"]), "finished": True}
 
 
-def _wait_poll_one(orig: int, watching: dict[int, int], seen: dict[int, str], first: bool) -> dict[str, Any] | None:
-    """Ask the daemon about one job. Returns its final record, or None while it is still
-    queued/running. A failed job that `--retries` requeued is followed to its retry (the
-    retry's id is in the note); raises LookupError for an unknown id on the first pass."""
-    while True:
-        watched = watching[orig]
-        try:
-            job = _wait_send("show", id=watched)
-        except client.DaemonError:
-            if first and watched == orig:
-                raise LookupError(orig) from None
-            return _wait_record(orig, None, watched)
-        seen[orig] = job["status"]
-        if job["status"] not in db.TERMINAL_STATUSES:
-            return None
-        if job["status"] == "failed" and job.get("attempt", 0) < job.get("max_retries", 0):
-            m = _RETRY_NOTE.search(job.get("note") or "")
-            if m and int(m.group(1)) != watched:
-                watching[orig] = int(m.group(1))
-                continue  # ask about the retry right away
-        return _wait_record(orig, job, watched)
+def _wait_poll(
+    pending: list[int], watching: dict[int, int], seen: dict[int, str], first: bool
+) -> tuple[dict[int, dict[str, Any]], list[int]]:
+    """Ask the daemon about every still-waiting job with ONE `states` request. Returns (final
+    record per finished job, keyed by the original id; ids that do not exist -- reported only
+    on the first pass). A job still queued/running is simply absent from the first part. A
+    failed job that `--retries` requeued is followed to its retry (the retry's id is in the
+    note) with another request right away, so only retries cost an extra round trip."""
+    finished: dict[int, dict[str, Any]] = {}
+    missing: list[int] = []
+    todo = list(pending)
+    while todo:
+        data = _wait_send("states", ids=list(dict.fromkeys(watching[o] for o in todo)))
+        by_id = {j["id"]: j for j in data["jobs"]}
+        again: list[int] = []
+        for orig in todo:
+            watched = watching[orig]
+            job = by_id.get(watched)
+            if job is None:
+                if first and watched == orig:
+                    missing.append(orig)
+                else:
+                    finished[orig] = _wait_record(orig, None, watched)
+                continue
+            seen[orig] = job["status"]
+            if job["status"] not in db.TERMINAL_STATUSES:
+                continue
+            if job["status"] == "failed" and job.get("attempt", 0) < job.get("max_retries", 0):
+                m = _RETRY_NOTE.search(job.get("note") or "")
+                if m and int(m.group(1)) != watched:
+                    watching[orig] = int(m.group(1))
+                    again.append(orig)  # ask about the retry right away
+                    continue
+            finished[orig] = _wait_record(orig, job, watched)
+        todo = again
+    return finished, missing
 
 
 def _wait_sleep(deadline: float | None) -> bool:
@@ -1493,19 +1522,13 @@ def _wait_for_jobs(ids: list[int], timeout: timedelta | None, announce: bool) ->
     done: dict[int, dict[str, Any]] = {}
     first = True
     while True:
-        missing: list[int] = []
-        for orig in ids:
-            if orig in done:
-                continue
-            try:
-                rec = _wait_poll_one(orig, watching, seen, first)
-            except LookupError:
-                missing.append(orig)
-                continue
-            if rec is not None:
-                done[orig] = rec
+        pending = [i for i in ids if i not in done]
+        finished, missing = _wait_poll(pending, watching, seen, first)
+        for orig in pending:
+            if orig in finished:
+                done[orig] = finished[orig]
                 if announce:
-                    _announce_waited(rec)
+                    _announce_waited(finished[orig])
         if missing:
             _wait_stop(f"job {_fmt_ids(missing)} does not exist" if len(missing) == 1
                        else f"jobs {_fmt_ids(missing)} do not exist", WAIT_EXIT_USAGE)
@@ -1513,8 +1536,8 @@ def _wait_for_jobs(ids: list[int], timeout: timedelta | None, announce: bool) ->
         if len(done) == len(ids):
             return [done[i] for i in ids], False
         if _wait_sleep(deadline):
-            pending = {"finished": False, "exit_code": None, "channel": None, "note": None, "code": None}
-            return [done.get(i) or {"id": i, "status": seen.get(i, "unknown"), "ran_as": watching[i], **pending}
+            blank = {"finished": False, "exit_code": None, "channel": None, "note": None, "code": None}
+            return [done.get(i) or {"id": i, "status": seen.get(i, "unknown"), "ran_as": watching[i], **blank}
                     for i in ids], True
 
 
@@ -1529,15 +1552,16 @@ def _announce_waited(rec: dict[str, Any]) -> None:
 
 def _wait_for_channel(channel: int, timeout: timedelta | None, quiet: bool) -> bool:
     """Block until `channel` has nothing running, frozen or queued. True = timed out.
-    A channel that has never had a job (or was cleared) counts as idle."""
+    A channel that has never had a job (or was cleared) counts as idle. Polls the cheap
+    `channel_status` command (counts only) rather than `list`'s full per-job rows."""
     deadline = None if timeout is None else time.monotonic() + timeout.total_seconds()
     hinted = False
     while True:
-        data = _wait_send("list")
-        chan = {int(k): v for k, v in data["channels"].items()}.get(channel)
-        if not chan or not (chan.get("running") or chan.get("frozen") or chan.get("queue") or chan.get("priority_queue")):
+        data = _wait_send("channel_status", channel=channel)
+        busy = data["running"] or data["frozen"] or data["queued"] or data["priority_queued"]
+        if not busy:
             return False
-        if chan.get("paused") and not chan.get("running") and not chan.get("frozen") and not hinted and not quiet:
+        if data.get("paused") and not data["running"] and not data["frozen"] and not hinted and not quiet:
             typer.echo(f"Note: channel {channel} is paused; it stays busy until `qur resume --channel {channel}`", err=True)
             hinted = True
         if _wait_sleep(deadline):
@@ -1561,7 +1585,7 @@ def wait(
     Waits for the given jobs to reach a final state (done, failed, cancelled, skipped,
     interrupted), or with --channel until that channel has nothing running or queued.
     A job that failed and was requeued by --retries is followed to its retry, so you hear
-    about the last attempt. Polls the daemon every 1.5 s.
+    about the last attempt. Polls the daemon every 1.5 s (one request for all the jobs).
 
     \b
     Exit codes:
@@ -1852,7 +1876,7 @@ def _edit_interactive(job_id: int) -> None:
             if fields["cwd"] != old["cwd"]:
                 cwd = os.path.abspath(os.path.expanduser(fields["cwd"]))
                 request["cwd"] = cwd
-                if "argv" not in request:  # a new cwd re-resolves the stored command
+                if "argv" not in request:  # a new cwd: argv[0] is resolved again against it
                     request.update(_command_request(json.loads(job["raw_cmd"])))
             if fields["timeout"] != old["timeout"]:
                 request["timeout_secs"] = _edit_timeout(fields["timeout"]) or None
@@ -2009,7 +2033,7 @@ def edit(
     if cwd is not None:
         request["cwd"] = os.path.abspath(os.path.expanduser(cwd))
     if words or cwd is not None:
-        if not words:  # a new cwd re-resolves the stored command
+        if not words:  # a new cwd: argv[0] is resolved again against it
             words = json.loads(_call("show", id=job_id)["raw_cmd"])
         request.update(_command_request(words))
     data = _call("edit", id=job_id, **request)
@@ -2450,6 +2474,23 @@ def _tail_offset(f: Any, n: int) -> int:
     return 0
 
 
+def _log_path_for(job_id: int) -> Path:
+    """Where job `job_id`'s log is (L6). The daemon knows the real path (its own QUEUER_LOG_DIR,
+    which this shell may not have), so ask it; fall back to this shell's default folder when the
+    daemon is down, the job is gone from the history, or the stored path is not `<id>.log`."""
+    default = _default_log_dir() / f"{job_id}.log"
+    try:
+        job = client.send("show", id=job_id)
+    except (client.DaemonNotRunning, client.DaemonError):
+        return default
+    stored = job.get("log_path") if isinstance(job, dict) else None
+    if isinstance(stored, str) and "\0" not in stored:
+        path = Path(stored)
+        if path.is_absolute() and path.name == f"{job_id}.log":
+            return path
+    return default
+
+
 @app.command()
 def logs(
     job_id: Optional[int] = typer.Argument(None, help="Job ID (not needed with --running)"),
@@ -2465,8 +2506,8 @@ def logs(
 ) -> None:
     """Print a job's log (stdout and stderr combined).
 
-    Reads the log file straight from disk, so it works even if the daemon isn't
-    running. Each retry of a job is a separate job with its own log. A big log is
+    Reads the log file straight from disk (the daemon is only asked where it is), so it works
+    even if the daemon isn't running. Each retry of a job is a separate job with its own log. A big log is
     streamed, never loaded whole.
 
     \b
@@ -2491,7 +2532,7 @@ def logs(
     elif job_id is None:
         _fail("give a job ID, or --running")
     assert job_id is not None
-    log_path = _default_log_dir() / f"{job_id}.log"
+    log_path = _log_path_for(job_id)
     if not log_path.exists():
         typer.echo(f"Error: no log found for job {job_id} at {log_path}", err=True)
         raise typer.Exit(code=1)
@@ -2530,7 +2571,7 @@ def logs(
 
 @app.command(name="clean-logs")
 def clean_logs(
-    days: int = typer.Option(30, "--days", help="Delete logs for jobs finished more than this many days ago"),
+    days: int = typer.Option(30, "--days", min=0, help="Delete logs for jobs finished more than this many days ago"),
     max_mb: Optional[int] = typer.Option(
         None, "--max-mb", min=1,
         help="Also delete the oldest finished jobs' logs until the log folder is at most this many MB "
@@ -2591,7 +2632,7 @@ def clean_logs(
 # doctor
 # ---------------------------------------------------------------------------
 
-_DOCTOR_STYLES = {selfcheck.OK: "green", selfcheck.WARN: "yellow", selfcheck.FAIL: "bold red"}
+_DOCTOR_STYLES = {OK: "green", WARN: "yellow", FAIL: "bold red"}
 
 
 @app.command()
@@ -2616,6 +2657,8 @@ def doctor(
       qur doctor --fix
       qur doctor --json
     """
+    from queuer import selfcheck  # heavy (pulls in the daemon module): only loaded here
+
     checks = selfcheck.run_checks(fix=fix)
     code = selfcheck.exit_code(checks)
     counts = selfcheck.summary(checks)
@@ -2628,7 +2671,7 @@ def doctor(
         console.print(f"[{style}]{c.status:<4}[/{style}]  {escape(c.name):<{width}}  {escape(c.detail)}", highlight=False)
         if c.hint:
             console.print(f"      {'':<{width}}  [dim]fix: {escape(c.hint)}[/dim]", highlight=False)
-    console.print(f"\n{counts[selfcheck.OK]} ok, {counts[selfcheck.WARN]} warning(s), {counts[selfcheck.FAIL]} failure(s)")
+    console.print(f"\n{counts[OK]} ok, {counts[WARN]} warning(s), {counts[FAIL]} failure(s)")
     raise typer.Exit(code=code)
 
 
@@ -2683,7 +2726,7 @@ def _confirm_stop(verb: str, yes: bool) -> None:
 
 
 def _service_action(action: str, done: str) -> None:
-    code = _run_service_tool(["systemctl", "--user", action, selfcheck.UNIT_NAME])
+    code = _run_service_tool(["systemctl", "--user", action, UNIT_NAME])
     if code != 0:
         typer.echo(f"Error: systemctl {action} failed (exit {code}); see: qur daemon logs", err=True)
         raise typer.Exit(code=code)
@@ -2717,7 +2760,7 @@ def daemon_restart(
 @daemon_app.command("status")
 def daemon_status() -> None:
     """Show the service state (`systemctl --user status queuerd`). Exit code is systemctl's (3 = not running)."""
-    raise typer.Exit(code=_run_service_tool(["systemctl", "--user", "status", selfcheck.UNIT_NAME, "--no-pager"]))
+    raise typer.Exit(code=_run_service_tool(["systemctl", "--user", "status", UNIT_NAME, "--no-pager"]))
 
 
 @daemon_app.command("logs")
@@ -2726,7 +2769,7 @@ def daemon_logs(
     follow: bool = typer.Option(False, "--follow", "-f", help="Keep following new lines (Ctrl-C to stop)"),
 ) -> None:
     """Show the daemon's own log (`journalctl --user -u queuerd`), not a job's output (that is `qur logs ID`)."""
-    argv = ["journalctl", "--user", "-u", selfcheck.UNIT_NAME, "-n", str(lines), "--no-pager"]
+    argv = ["journalctl", "--user", "-u", UNIT_NAME, "-n", str(lines), "--no-pager"]
     if follow:
         argv.append("-f")
     raise typer.Exit(code=_run_service_tool(argv))
