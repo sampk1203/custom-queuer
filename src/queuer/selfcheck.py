@@ -4,7 +4,8 @@ to keep its secrets private (F32/U8).
 Each check returns a `Check` with a status of OK, WARN or FAIL and, when something is
 off, a one-line fix hint. `run_checks(fix=True)` also repairs permission problems
 (loose modes on files and folders you own) and nothing else: it never starts services,
-edits the unit, deletes files or touches the database contents.
+edits the unit, deletes files or touches the database contents. The installed systemd
+unit is only READ and compared with the template install.sh writes (F36).
 
 Everything that talks to the system goes through a few small wrappers (`_run`,
 `_writable`, `_free_bytes`) so tests can replace them. All subprocess calls use a fixed
@@ -42,6 +43,17 @@ DISK_FAIL_BYTES = 100 * 1024 * 1024  # less than this free where the logs go: FA
 DISK_WARN_BYTES = 1024 * 1024 * 1024  # less than this: WARN
 SUBPROCESS_TIMEOUT_SECS = 10
 LINGER_DIR = Path("/var/lib/systemd/linger")
+
+# What install.sh writes into the unit (F36). Keep these in step with `write_unit` and
+# `hardening_lines` there; tests/test_install_sh.py fails when they drift apart.
+UNIT_SETTINGS = {"Type": "simple", "Restart": "on-failure", "RestartSec": "2", "TimeoutStopSec": "30"}
+HARDENING_SETTINGS = {
+    "UMask": "0077",
+    "NoNewPrivileges": "yes",
+    "LockPersonality": "yes",
+    "RestrictAddressFamilies": "AF_UNIX AF_INET AF_INET6 AF_NETLINK",
+}
+UNIT_REINSTALL_HINT = "./install.sh   (in the project folder; it stops the daemon, so wait for running jobs first)"
 
 
 @dataclass
@@ -258,11 +270,93 @@ def check_linger() -> Check:
     return Check("linger", WARN, "not enabled: the daemon stops when you log out", hint)
 
 
+def _unit_path() -> Path:
+    return Path.home() / ".config" / "systemd" / "user" / f"{UNIT_NAME}.service"
+
+
+def _project_dir() -> Path | None:
+    """The project folder this queuer runs from (editable install), or None."""
+    root = Path(__file__).resolve().parents[2]
+    return root if (root / "pyproject.toml").is_file() else None
+
+
+def _service_values(text: str) -> dict[str, str]:
+    """`Key=Value` lines of the [Service] section (comments and other sections skipped;
+    a repeated key keeps its last value)."""
+    values: dict[str, str] = {}
+    in_service = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line[0] in "#;":
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            in_service = line == "[Service]"
+            continue
+        if in_service and "=" in line:
+            key, _, value = line.partition("=")
+            values[key.strip()] = value.strip()
+    return values
+
+
+def _exec_path(value: str) -> str:
+    """The program of an ExecStart value (systemd's `-`, `@`, `+`, `!`, `:` prefixes dropped)."""
+    words = value.lstrip("@-:+!").split()
+    return words[0] if words else ""
+
+
+def _check_unit_exec(value: str | None) -> Check:
+    if not value:
+        return Check("unit exec", FAIL, "the unit has no ExecStart line", UNIT_REINSTALL_HINT)
+    exe = _exec_path(value)
+    if not (os.path.isfile(exe) and os.access(exe, os.X_OK)):
+        return Check("unit exec", FAIL, f"ExecStart points at {exe}, which is missing or not executable (project moved or deleted?)", UNIT_REINSTALL_HINT)
+    project = _project_dir()
+    if project is not None:
+        exe_path = Path(exe)
+        if exe_path.name != "queuerd" or exe_path.parent.resolve() != (project / ".venv" / "bin").resolve():
+            expected = project / ".venv" / "bin" / "queuerd"
+            return Check("unit exec", WARN, f"ExecStart is {exe}, but this queuer lives in {project} (expected {expected})", UNIT_REINSTALL_HINT)
+    return Check("unit exec", OK, f"ExecStart {exe}")
+
+
+def _check_unit_settings(values: dict[str, str]) -> Check:
+    """Restart/stop settings must equal the template; the hardening lines are either all
+    there (level basic), all absent (level none: QUEUER_HARDEN=none, or systemd refused
+    basic and install.sh fell back) or something in between (a stale or hand-edited unit)."""
+    problems = [f"{key} is {values[key]!r}, expected {want!r}" if key in values else f"{key} is missing" for key, want in UNIT_SETTINGS.items() if values.get(key) != want]
+    present = [key for key in HARDENING_SETTINGS if key in values]
+    wrong = [key for key in present if values[key] != HARDENING_SETTINGS[key]]
+    if present and (len(present) < len(HARDENING_SETTINGS) or wrong):
+        absent = [key for key in HARDENING_SETTINGS if key not in values]
+        parts = [f"{key} is {values[key]!r}, expected {HARDENING_SETTINGS[key]!r}" for key in wrong]
+        if absent:
+            parts.append("missing " + ", ".join(absent))
+        problems.append("hardening lines differ (" + "; ".join(parts) + ")")
+        level = "partial"
+    else:
+        level = "basic" if present else "none"
+    if problems:
+        return Check("unit settings", WARN, "the installed unit differs from this queuer's template: " + "; ".join(problems), UNIT_REINSTALL_HINT)
+    return Check("unit settings", OK, f"matches this queuer's template (hardening: {level})")
+
+
+def check_unit_content(unit: Path) -> list[Check]:
+    """Compare the installed unit with what install.sh would write now (F36). Read only:
+    never edits the unit (`qur doctor --fix` does not touch it either)."""
+    try:
+        text = unit.read_text()
+    except (OSError, UnicodeDecodeError) as e:
+        return [Check("unit settings", WARN, f"cannot read {unit} ({type(e).__name__})")]
+    values = _service_values(text)
+    return [_check_unit_exec(values.get("ExecStart")), _check_unit_settings(values)]
+
+
 def check_unit() -> list[Check]:
-    unit = Path.home() / ".config" / "systemd" / "user" / f"{UNIT_NAME}.service"
+    unit = _unit_path()
     out: list[Check] = []
     if unit.is_file():
         out.append(Check("unit file", OK, str(unit)))
+        out += check_unit_content(unit)
     else:
         out.append(Check("unit file", WARN, f"{unit} not found (daemon started by hand?)", "./install.sh   (in the project folder)"))
     res = _run(["systemctl", "--user", "is-active", UNIT_NAME])

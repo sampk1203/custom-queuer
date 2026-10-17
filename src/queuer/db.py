@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import sqlite3
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
@@ -35,6 +36,8 @@ LIST_BACKLOG = 10  # finished jobs `qur list` / the Telegram list show per chann
 MAX_HISTORY = 10000  # most rows one history query returns
 MAX_RETRY_DELAY_SECS = 30 * 86400  # longest wait before an automatic retry (also caps --retry-backoff)
 MAX_HOOK_LEN = 4096  # longest --on-finish / --on-error command (characters)
+STOP_SIGNALS = ("SIGTERM", "SIGINT", "SIGHUP", "SIGQUIT", "SIGUSR1", "SIGUSR2", "SIGKILL")  # F11: signals a job may be stopped with
+MAX_STOP_GRACE_SECS = 86400  # F11: longest grace between the stop signal and SIGKILL (1 day)
 BUSY_TIMEOUT_MS = 5000  # how long a connection waits for another one's write lock before "database is locked"
 EDIT_LOCK_SECS = 30 * 60  # an edit lock older than this is stale and ignored (a crashed editor never blocks a channel)
 MAX_SWEEP = 1000  # most jobs one `add` creates (--each/--array) and most ids one dependency list holds
@@ -73,7 +76,9 @@ CREATE TABLE IF NOT EXISTS {name} (
     cpu_user_secs REAL,
     cpu_sys_secs  REAL,
     on_finish_cmd TEXT,
-    on_error_cmd  TEXT
+    on_error_cmd  TEXT,
+    stop_signal   TEXT,
+    stop_grace_secs INTEGER
 );
 """
 
@@ -257,6 +262,17 @@ def _migrate_add_hooks(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE jobs ADD COLUMN on_error_cmd TEXT")
 
 
+def _migrate_add_stop_settings(conn: sqlite3.Connection) -> None:
+    """DBs created before F11 lack `stop_signal` (the signal that stops the job on cancel
+    or timeout; NULL = SIGTERM) and `stop_grace_secs` (seconds between that signal and
+    SIGKILL; NULL = the daemon default). Plain ADD COLUMN, no CHECK change. No-op once migrated."""
+    cols = [r["name"] for r in conn.execute("PRAGMA table_info(jobs)").fetchall()]
+    if "stop_signal" not in cols:
+        conn.execute("ALTER TABLE jobs ADD COLUMN stop_signal TEXT")
+    if "stop_grace_secs" not in cols:
+        conn.execute("ALTER TABLE jobs ADD COLUMN stop_grace_secs INTEGER")
+
+
 # Numbered migrations, run in order, each in its own transaction that also bumps the
 # single-row `schema_version` table. To change the schema: append ONE new
 # (number, function) entry (never edit or reorder old ones) and, if a fresh DB needs the
@@ -270,6 +286,7 @@ _MIGRATIONS: tuple[tuple[int, Callable[[sqlite3.Connection], None]], ...] = (
     (4, _migrate_add_retry_delay),
     (5, _migrate_add_resource_usage),
     (6, _migrate_add_hooks),
+    (7, _migrate_add_stop_settings),
 )
 SCHEMA_VERSION = _MIGRATIONS[-1][0]
 
@@ -393,6 +410,40 @@ def check_hook(value: Any, what: str) -> str | None:
     return value
 
 
+def check_stop_signal(value: Any, what: str = "stop signal") -> str | None:
+    """Validate a stop signal (F11): None or a blank string = the default (None);
+    otherwise a name from STOP_SIGNALS (`INT`, `int` and `SIGINT` all work) or its number
+    (`2`). Returns the canonical name (`SIGINT`). SIGSTOP/SIGCONT are refused: the daemon
+    uses them to freeze jobs."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        raise ValueError(f"{what} must be a signal name or number")
+    text = str(value).strip().upper()
+    if not text:
+        return None
+    if text.isdigit():
+        try:
+            text = signal.Signals(int(text)).name
+        except ValueError:
+            raise ValueError(f"{what}: {value!r} is not a signal number") from None
+    elif not text.startswith("SIG"):
+        text = "SIG" + text
+    if text not in STOP_SIGNALS:
+        raise ValueError(f"{what} must be one of {', '.join(n[3:] for n in STOP_SIGNALS)} (got {value!r})")
+    return text
+
+
+def check_stop_grace(value: Any, what: str = "stop grace") -> int | None:
+    """Validate a grace period in seconds (F11): None = the daemon default; otherwise an
+    integer from 0 (SIGKILL right after the signal) to MAX_STOP_GRACE_SECS."""
+    if value is None:
+        return None
+    if type(value) is not int or not 0 <= value <= MAX_STOP_GRACE_SECS:
+        raise ValueError(f"{what} must be a whole number of seconds between 0 and {MAX_STOP_GRACE_SECS}")
+    return value
+
+
 def enqueue(
     conn: sqlite3.Connection,
     *,
@@ -417,6 +468,8 @@ def enqueue(
     retry_backoff: bool = False,
     on_finish_cmd: str | None = None,
     on_error_cmd: str | None = None,
+    stop_signal: str | None = None,
+    stop_grace_secs: int | None = None,
     commit: bool = True,
 ) -> int:
     """Insert a new queued job on `channel`. Returns the new job's id.
@@ -455,6 +508,10 @@ def enqueue(
     `on_finish_cmd` / `on_error_cmd` (F12; None = none) are shell commands the daemon
     runs after the job's final outcome (see `check_hook`); copied to retries and requeues.
 
+    `stop_signal` / `stop_grace_secs` (F11; None = SIGTERM / the daemon default of 5 s) are the
+    signal that stops this job on `cancel` or timeout and the seconds it gets before SIGKILL
+    (see `check_stop_signal`, `check_stop_grace`); copied to retries and requeues.
+
     Nothing is written if anything is rejected. `commit=False` leaves the
     insert in the open transaction so several jobs can be added all-or-nothing
     (the caller commits, or rolls back).
@@ -469,6 +526,8 @@ def enqueue(
         raise ValueError("retry backoff needs a retry delay")
     on_finish_cmd = check_hook(on_finish_cmd, "on-finish command")
     on_error_cmd = check_hook(on_error_cmd, "on-error command")
+    stop_signal = check_stop_signal(stop_signal)
+    stop_grace_secs = check_stop_grace(stop_grace_secs)
     deps = deps or {}
     if is_priority and (deps or not_before):
         raise ValueError("--now cannot be combined with dependencies or a start time")
@@ -487,8 +546,8 @@ def enqueue(
                 (channel, status, position, raw_cmd, resolved_cmd, cwd, env_extra,
                  enqueued_at, log_path, timeout_secs, is_priority, max_retries, attempt,
                  parent_id, origin, not_before, on_fail, retry_delay_secs, retry_backoff,
-                 on_finish_cmd, on_error_cmd)
-            VALUES (?, 'queued', NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 on_finish_cmd, on_error_cmd, stop_signal, stop_grace_secs)
+            VALUES (?, 'queued', NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 channel,
@@ -510,6 +569,8 @@ def enqueue(
                 int(retry_backoff),
                 on_finish_cmd,
                 on_error_cmd,
+                stop_signal,
+                stop_grace_secs,
             ),
         )
         new_id = cur.lastrowid
@@ -1110,6 +1171,7 @@ def release_edit_lock(conn: sqlite3.Connection, job_id: int, holder_pid: int | N
 _EDITABLE_COLUMNS = (
     "raw_cmd", "resolved_cmd", "cwd", "env_extra", "timeout_secs", "max_retries", "on_fail",
     "not_before", "retry_delay_secs", "retry_backoff", "on_finish_cmd", "on_error_cmd",
+    "stop_signal", "stop_grace_secs",
 )
 
 
@@ -1146,6 +1208,10 @@ def edit_job(
     for hook_column, hook_label in (("on_finish_cmd", "on-finish command"), ("on_error_cmd", "on-error command")):
         if hook_column in updates:
             updates[hook_column] = check_hook(updates[hook_column], hook_label)
+    if "stop_signal" in updates:
+        updates["stop_signal"] = check_stop_signal(updates["stop_signal"])
+    if "stop_grace_secs" in updates:
+        updates["stop_grace_secs"] = check_stop_grace(updates["stop_grace_secs"])
     deps = dict(deps) if deps is not None else None
     if deps is not None:
         for dep_id, mode in deps.items():
@@ -1277,6 +1343,8 @@ def requeue(conn: sqlite3.Connection, job_id: int, *, log_path: str, auto: bool 
         retry_backoff=bool(job["retry_backoff"]),
         on_finish_cmd=job["on_finish_cmd"],
         on_error_cmd=job["on_error_cmd"],
+        stop_signal=job["stop_signal"],
+        stop_grace_secs=job["stop_grace_secs"],
         not_before=not_before,
         attempt=job["attempt"] + 1 if auto else 0,
         parent_id=job_id,

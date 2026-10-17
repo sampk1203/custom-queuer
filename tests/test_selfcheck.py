@@ -491,6 +491,197 @@ def test_service_state_unknown_is_a_warning(monkeypatch, home, reply):
 
 
 # ---------------------------------------------------------------------------
+# unit file content vs the install.sh template (F36)
+# ---------------------------------------------------------------------------
+
+
+def _project(tmp_path, monkeypatch) -> Path:
+    """A fake project folder with an executable .venv/bin/queuerd, as the doctor finds it."""
+    project = tmp_path / "proj"
+    exe = project / ".venv" / "bin" / "queuerd"
+    exe.parent.mkdir(parents=True)
+    exe.write_text("#!/bin/sh\n")
+    exe.chmod(0o755)
+    monkeypatch.setattr(selfcheck, "_project_dir", lambda: project)
+    return project
+
+
+def _unit_text(exe, hardening: bool = True, drop=(), **override: str) -> str:
+    settings = dict(selfcheck.UNIT_SETTINGS)
+    if hardening:
+        settings.update(selfcheck.HARDENING_SETTINGS)
+    settings.update(override)
+    for key in drop:
+        settings.pop(key, None)
+    lines = ["[Unit]", "Description=queuer", "", "[Service]"]
+    if exe is not None:
+        lines.append(f"ExecStart={exe}")
+    lines += [f"{k}={v}" for k, v in settings.items()]
+    lines += ["", "[Install]", "WantedBy=default.target", ""]
+    return "\n".join(lines)
+
+
+def _content(tmp_path, text: str) -> dict[str, Check]:
+    unit = tmp_path / "queuerd.service"
+    unit.write_text(text)
+    return _by_name(selfcheck.check_unit_content(unit))
+
+
+def test_unit_matching_the_template_is_ok(tmp_path, monkeypatch):
+    project = _project(tmp_path, monkeypatch)
+    names = _content(tmp_path, _unit_text(project / ".venv" / "bin" / "queuerd"))
+    assert names["unit exec"].status == OK
+    assert names["unit settings"].status == OK and "hardening: basic" in names["unit settings"].detail
+
+
+def test_unit_without_any_hardening_is_ok_and_called_none(tmp_path, monkeypatch):
+    """QUEUER_HARDEN=none, or systemd refused basic and install.sh fell back: not a fault."""
+    project = _project(tmp_path, monkeypatch)
+    names = _content(tmp_path, _unit_text(project / ".venv" / "bin" / "queuerd", hardening=False))
+    assert names["unit settings"].status == OK and "hardening: none" in names["unit settings"].detail
+
+
+def test_unit_missing_a_setting_warns_and_points_at_install(tmp_path, monkeypatch):
+    project = _project(tmp_path, monkeypatch)
+    c = _content(tmp_path, _unit_text(project / ".venv" / "bin" / "queuerd", drop=("TimeoutStopSec",)))["unit settings"]
+    assert c.status == WARN and "TimeoutStopSec is missing" in c.detail
+    assert "install.sh" in c.hint and "running" in c.hint
+
+
+def test_unit_with_a_different_value_warns(tmp_path, monkeypatch):
+    project = _project(tmp_path, monkeypatch)
+    c = _content(tmp_path, _unit_text(project / ".venv" / "bin" / "queuerd", TimeoutStopSec="90"))["unit settings"]
+    assert c.status == WARN and "TimeoutStopSec is '90', expected '30'" in c.detail
+
+
+def test_unit_with_partial_hardening_warns(tmp_path, monkeypatch):
+    project = _project(tmp_path, monkeypatch)
+    c = _content(tmp_path, _unit_text(project / ".venv" / "bin" / "queuerd", drop=("UMask", "LockPersonality")))["unit settings"]
+    assert c.status == WARN and "hardening lines differ" in c.detail
+    assert "missing UMask, LockPersonality" in c.detail
+
+
+def test_unit_with_a_wrong_hardening_value_warns(tmp_path, monkeypatch):
+    project = _project(tmp_path, monkeypatch)
+    c = _content(tmp_path, _unit_text(project / ".venv" / "bin" / "queuerd", NoNewPrivileges="no"))["unit settings"]
+    assert c.status == WARN and "NoNewPrivileges is 'no', expected 'yes'" in c.detail
+
+
+def test_unit_address_family_list_is_compared_whole(tmp_path, monkeypatch):
+    """An old unit without AF_NETLINK (MPI/NCCL need it) is stale."""
+    project = _project(tmp_path, monkeypatch)
+    c = _content(tmp_path, _unit_text(project / ".venv" / "bin" / "queuerd", RestrictAddressFamilies="AF_UNIX AF_INET AF_INET6"))["unit settings"]
+    assert c.status == WARN and "RestrictAddressFamilies" in c.detail
+
+
+def test_unit_comments_and_other_sections_do_not_count(tmp_path, monkeypatch):
+    project = _project(tmp_path, monkeypatch)
+    exe = project / ".venv" / "bin" / "queuerd"
+    text = _unit_text(exe, drop=("TimeoutStopSec",)).replace("[Install]", "# TimeoutStopSec=30\n; TimeoutStopSec=30\n[Install]\nTimeoutStopSec=30")
+    c = _content(tmp_path, text)["unit settings"]
+    assert c.status == WARN and "TimeoutStopSec is missing" in c.detail
+
+
+def test_unit_repeated_key_keeps_the_last_value():
+    values = selfcheck._service_values("[Service]\nRestartSec=9\nRestartSec=2\n")
+    assert values == {"RestartSec": "2"}
+
+
+def test_unit_without_execstart_fails(tmp_path, monkeypatch):
+    _project(tmp_path, monkeypatch)
+    c = _content(tmp_path, _unit_text(None))["unit exec"]
+    assert c.status == FAIL and "no ExecStart" in c.detail and "install.sh" in c.hint
+
+
+def test_unit_pointing_at_a_missing_program_fails(tmp_path, monkeypatch):
+    _project(tmp_path, monkeypatch)
+    c = _content(tmp_path, _unit_text(tmp_path / "moved" / ".venv" / "bin" / "queuerd"))["unit exec"]
+    assert c.status == FAIL and "missing or not executable" in c.detail and "moved" in c.detail
+
+
+def test_unit_pointing_at_a_program_that_is_not_executable_fails(tmp_path, monkeypatch):
+    project = _project(tmp_path, monkeypatch)
+    exe = project / ".venv" / "bin" / "queuerd"
+    exe.chmod(0o644)
+    assert _content(tmp_path, _unit_text(exe))["unit exec"].status == FAIL
+
+
+def test_unit_installed_from_another_project_folder_warns(tmp_path, monkeypatch):
+    _project(tmp_path, monkeypatch)
+    other = tmp_path / "other" / ".venv" / "bin" / "queuerd"
+    other.parent.mkdir(parents=True)
+    other.write_text("#!/bin/sh\n")
+    other.chmod(0o755)
+    c = _content(tmp_path, _unit_text(other))["unit exec"]
+    assert c.status == WARN and "expected" in c.detail and "install.sh" in c.hint
+
+
+def test_unit_exec_is_only_compared_when_the_project_folder_is_known(tmp_path, monkeypatch):
+    """A non-editable install has no project folder: only 'exists and is executable' is checked."""
+    monkeypatch.setattr(selfcheck, "_project_dir", lambda: None)
+    other = tmp_path / "anywhere" / "queuerd"
+    other.parent.mkdir()
+    other.write_text("#!/bin/sh\n")
+    other.chmod(0o755)
+    assert _content(tmp_path, _unit_text(other))["unit exec"].status == OK
+
+
+def test_exec_path_drops_systemd_prefixes_and_arguments():
+    assert selfcheck._exec_path("/a/b/queuerd") == "/a/b/queuerd"
+    assert selfcheck._exec_path("-/a/b/queuerd --x 1") == "/a/b/queuerd"
+    assert selfcheck._exec_path("@+/a/b/queuerd") == "/a/b/queuerd"
+    assert selfcheck._exec_path("") == ""
+
+
+def test_unreadable_unit_content_warns(tmp_path):
+    directory = tmp_path / "queuerd.service"
+    directory.mkdir()
+    assert selfcheck.check_unit_content(directory)[0].status == WARN
+    binary = tmp_path / "bin.service"
+    binary.write_bytes(b"\xff\xfe\x00\x80")
+    c = selfcheck.check_unit_content(binary)[0]
+    assert c.status == WARN and "cannot read" in c.detail
+
+
+def test_check_unit_compares_content_only_when_the_unit_exists(monkeypatch, home, tmp_path):
+    monkeypatch.setattr(selfcheck, "_run", lambda argv: (0, "active"))
+    assert "unit settings" not in _by_name(selfcheck.check_unit())
+    project = _project(tmp_path, monkeypatch)
+    unit = _unit_file(home)
+    unit.write_text(_unit_text(project / ".venv" / "bin" / "queuerd"))
+    names = _by_name(selfcheck.check_unit())
+    assert names["unit file"].status == OK and names["unit exec"].status == OK and names["unit settings"].status == OK
+
+
+def test_run_checks_includes_the_unit_content_checks(monkeypatch, home, tmp_path):
+    _quiet_world(monkeypatch)
+    project = _project(tmp_path, monkeypatch)
+    _unit_file(home).write_text(_unit_text(project / ".venv" / "bin" / "queuerd", drop=("RestartSec",)))
+    checks = _by_name(selfcheck.run_checks())
+    assert checks["unit exec"].status == OK and checks["unit settings"].status == WARN
+
+
+def test_a_stale_unit_alone_does_not_fail_the_doctor(monkeypatch, home, tmp_path):
+    """The settings check is a WARN, so exit code 1 stays reserved for real failures."""
+    project = _project(tmp_path, monkeypatch)
+    unit = _unit_file(home)
+    unit.write_text(_unit_text(project / ".venv" / "bin" / "queuerd", drop=("TimeoutStopSec",)))
+    monkeypatch.setattr(selfcheck, "_run", lambda argv: (0, "active"))
+    assert selfcheck.exit_code(selfcheck.check_unit()) == 0
+
+
+def test_doctor_fix_never_edits_the_unit(monkeypatch, home, tmp_path):
+    _quiet_world(monkeypatch)
+    project = _project(tmp_path, monkeypatch)
+    unit = _unit_file(home)
+    text = _unit_text(project / ".venv" / "bin" / "queuerd", drop=("TimeoutStopSec",))
+    unit.write_text(text)
+    unit.chmod(0o666)
+    selfcheck.run_checks(fix=True)
+    assert unit.read_text() == text and _mode(unit) == 0o666
+
+
+# ---------------------------------------------------------------------------
 # Telegram
 # ---------------------------------------------------------------------------
 

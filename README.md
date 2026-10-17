@@ -83,11 +83,11 @@ queuer status [--json]
 queuer show ID|RANGE [ID|RANGE...] [--json]
 queuer wait ID|RANGE [ID|RANGE...] | --channel N [--timeout DURATION] [--quiet] [--json]
 queuer history [--status S]... [--channel N] [--since DURATION|DATE] [--grep TEXT] [--limit N] [--full] [--json]
-queuer cancel [JOB_ID] [--channel N]
+queuer cancel [JOB_ID] [--channel N] [-s SIGNAL] [--grace SECONDS]
 queuer clear [--channel N]
 queuer rm ID
 queuer requeue ID
-queuer edit ID [--cmd CMD | -- <cmd...>] [--cwd DIR] [--timeout SECONDS] [--channel N] [--retries N] [--on-fail pause|continue] [--on-finish CMD] [--on-error CMD] [--delay DURATION | --at TIME | --clear-delay] [--depends-on IDS] [--after-any IDS] [--clear-deps] [--env KEY[=VAL]]...
+queuer edit ID [--cmd CMD | -- <cmd...>] [--cwd DIR] [--timeout SECONDS] [--channel N] [--retries N] [--on-fail pause|continue] [--on-finish CMD] [--on-error CMD] [--stop-signal SIG] [--stop-grace SECONDS] [--delay DURATION | --at TIME | --clear-delay] [--depends-on IDS] [--after-any IDS] [--clear-deps] [--env KEY[=VAL]]...
 queuer pause [--channel N]
 queuer resume [--channel N]
 queuer doctor [--fix] [--json]
@@ -310,7 +310,29 @@ position range. The daemon must be running (the check needs the queue).
 
 `--timeout SECONDS` kills the job automatically if it runs longer than
 that (SIGTERM, then SIGKILL if it doesn't exit within a grace period),
-and marks it `failed` with `note: timed out`.
+and marks it `failed` with `note: timed out`. The signal and the grace period are
+configurable per job, see below.
+
+**Stop signal and grace (`--stop-signal SIG`, `--stop-grace SECONDS`).** By default a job is
+stopped (by `qur cancel` or its `--timeout`) with SIGTERM to its whole process group and gets
+5 seconds before SIGKILL. A job that must shut down cleanly (write a checkpoint, flush
+output) can say how:
+
+```bash
+qur add --stop-signal INT --stop-grace 120 -- ./lmp -in run.in   # Ctrl-C, then up to 2 minutes
+```
+
+- `--stop-signal` is one of `TERM`, `INT`, `HUP`, `QUIT`, `USR1`, `USR2`, `KILL` (also `SIGINT`
+  or the number). `STOP`/`CONT` are refused: queuer uses them to freeze jobs for `--now`.
+- `--stop-grace` is a number of seconds, or a duration (`90s`, `2m`, `1h`), at most 1 day; `0`
+  sends SIGKILL right after the signal. The grace is how long the job's MAIN process gets to
+  exit; if it has not exited by then the whole group is killed.
+- Both apply to `qur cancel` and to a timeout. They do NOT apply when the daemon itself stops
+  (reboot, `qur daemon stop`): that keeps its fixed SIGTERM and 5-second budget so the stop
+  stays inside systemd's `TimeoutStopSec=30`.
+- Retries, requeues and sweeps copy them; `qur edit ID --stop-signal SIG --stop-grace N` changes
+  them on a queued job, an empty string goes back to the default. `qur show`, Telegram Details
+  and `qur add --dry-run` show them when set.
 
 ### `list`
 
@@ -449,8 +471,14 @@ qur export --channel 2 --status queued > ch2-queue.json
 
 With no `JOB_ID`, kills the currently running job on a channel (default 1;
 `--channel N` for another) — SIGTERM to its whole process group, then SIGKILL
-if it's still alive after the grace period. Errors clearly if nothing is
-running there.
+if it's still alive after the grace period (5 seconds). Errors clearly if
+nothing is running there.
+
+`-s/--signal SIG` and `--grace SECONDS` change that for this one cancel, for
+example `qur cancel 12 -s INT --grace 30` (Ctrl-C, then 30 seconds to write a
+checkpoint). They override the job's own `--stop-signal` / `--stop-grace` (see `add`).
+`--grace` is a number of seconds or a duration (`90s`, `2m`); `0` means SIGKILL at once.
+They have no effect on a job that is still queued.
 
 With a `JOB_ID`, cancels **that job**, wherever it is:
 
@@ -533,10 +561,12 @@ not fail it), so it also works in scripts.
 | `log dir`, `log writable`, `disk space` | log folder private and writable, at least 1 GB free where the logs go | under 1 GB WARN, under 100 MB FAIL, not writable FAIL |
 | `linger` | `loginctl` linger is on (the daemon survives logout) | WARN |
 | `unit file`, `service` | `~/.config/systemd/user/queuerd.service` exists and `systemctl --user is-active queuerd` says active | WARN |
+| `unit exec` | the unit's `ExecStart` program exists, is executable and is this project's `.venv/bin/queuerd` | no `ExecStart` or program missing (project moved or deleted) FAIL; a different project folder WARN |
+| `unit settings` | the installed unit has the restart/stop lines `install.sh` writes now (`Type`, `Restart`, `RestartSec`, `TimeoutStopSec`) and either all or none of the hardening lines (`UMask`, `NoNewPrivileges`, `LockPersonality`, `RestrictAddressFamilies`); `hardening: none` is fine (`QUEUER_HARDEN=none`, or systemd refused `basic`) | a missing/different setting or a half-hardened unit WARN: re-run `./install.sh` |
 | `telegram ...` | only if configured: one `getMe` per bot accepts the token | rejected token (401/404) FAIL; offline or other API error WARN; not configured is OK |
 
 `--fix` repairs **permission problems only**: it chmods files and folders you own to 0600/0700.
-It never starts services, edits the unit, deletes or moves anything, follows a symlink, or
+It never starts services, edits the unit (the two `unit ...` checks only read it), deletes or moves anything, follows a symlink, or
 touches the database contents. A folder you moved with `QUEUER_DB_PATH` / `QUEUER_LOG_DIR` /
 `QUEUER_NOTIFY_PATH` is reported but never chmod'ed (it may be `$HOME`; the same rule the daemon
 uses). A symlink or a path owned by someone else is only reported. `--json` prints

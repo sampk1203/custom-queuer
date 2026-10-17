@@ -3,11 +3,14 @@ syntax with -n, which runs nothing)."""
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
+
+from queuer import selfcheck
 
 SCRIPT = Path(__file__).resolve().parent.parent / "install.sh"
 
@@ -61,3 +64,25 @@ def test_bashrc_is_backed_up_before_completion_lines_are_removed():
     text = _text()
     assert "sed -i.queuer-bak" in text and ".bashrc.queuer-bak" in text
     assert "sed -i -e" not in text  # no in-place edit without a backup
+
+
+def _unit_template_lines() -> set[str]:
+    """Every `Key=Value` line install.sh writes into the unit (both heredocs)."""
+    text = _text()
+    hardening = text.split("<< 'EOT'\n", 1)[1].split("\nEOT", 1)[0]
+    unit = text.split('cat > "$SERVICE_FILE" << EOF\n', 1)[1].split("\nEOF", 1)[0]
+    lines = (hardening + "\n" + unit).splitlines()
+    return {line.strip() for line in lines if re.match(r"^[A-Za-z]+=", line.strip())}
+
+
+def test_unit_template_and_doctor_check_the_same_settings():
+    """qur doctor (F36) compares the installed unit with selfcheck.UNIT_SETTINGS /
+    HARDENING_SETTINGS; this fails when install.sh and those constants drift apart."""
+    expected = {f"{k}={v}" for k, v in {**selfcheck.UNIT_SETTINGS, **selfcheck.HARDENING_SETTINGS}.items()}
+    expected |= {
+        "ExecStart=$PROJECT_DIR/.venv/bin/queuerd",
+        "Description=queuer background job queue daemon",
+        "After=default.target",
+        "WantedBy=default.target",
+    }
+    assert _unit_template_lines() == expected

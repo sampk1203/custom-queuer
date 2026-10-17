@@ -2934,3 +2934,79 @@ def test_edit_sends_the_hooks_and_an_empty_string_removes_one(monkeypatch):
     calls = _edit_env(monkeypatch)
     assert runner.invoke(app, ["edit", "5", "--on-finish", "echo f", "--on-error", ""]).exit_code == 0
     assert _requests(calls)[0] == {"id": 5, "on_finish": "echo f", "on_error": ""}
+
+
+# ---------------------------------------------------------------------------
+# F11: --stop-signal / --stop-grace, qur cancel -s / --grace
+# ---------------------------------------------------------------------------
+
+def test_add_sends_the_stop_settings_and_prints_them(monkeypatch):
+    calls = _capture_send(monkeypatch, {"id": 4, "channel": 1})
+    res = runner.invoke(app, ["add", "--stop-signal", "int", "--stop-grace", "2m", "--", "true"], env={"COLUMNS": "200"})
+    assert res.exit_code == 0, res.output
+    assert calls[0][1]["stop_signal"] == "SIGINT" and calls[0][1]["stop_grace"] == 120
+    assert "stopped with SIGINT, SIGKILL after 2m0s" in res.output
+
+
+def test_add_stop_grace_takes_a_bare_number_as_seconds_and_zero(monkeypatch):
+    calls = _capture_send(monkeypatch, {"id": 4, "channel": 1})
+    assert runner.invoke(app, ["add", "--stop-grace", "30", "--", "true"]).exit_code == 0
+    assert calls[0][1]["stop_grace"] == 30 and calls[0][1]["stop_signal"] is None
+    assert runner.invoke(app, ["add", "--stop-grace", "0", "--", "true"]).exit_code == 0
+    assert calls[1][1]["stop_grace"] == 0
+
+
+def test_add_without_stop_settings_sends_none_and_prints_nothing(monkeypatch):
+    calls = _capture_send(monkeypatch, {"id": 4, "channel": 1})
+    res = runner.invoke(app, ["add", "--", "true"])
+    assert res.exit_code == 0, res.output
+    assert calls[0][1]["stop_signal"] is None and calls[0][1]["stop_grace"] is None
+    assert "stopped with" not in res.output
+
+
+@pytest.mark.parametrize("args", [["--stop-signal", "STOP"], ["--stop-signal", "bogus"], ["--stop-grace", "soon"], ["--stop-grace", "999999999"]])
+def test_add_rejects_bad_stop_settings_without_calling_the_daemon(monkeypatch, args):
+    calls = _capture_send(monkeypatch, {"id": 4, "channel": 1})
+    res = runner.invoke(app, ["add", *args, "--", "true"])
+    assert res.exit_code != 0 and calls == []
+
+
+def test_add_dry_run_prints_the_stop_settings(monkeypatch):
+    _capture_send(monkeypatch, _dry_reply(stop_signal="SIGINT", stop_grace=30))
+    res = runner.invoke(app, ["add", "--dry-run", "--stop-signal", "INT", "--stop-grace", "30", "--", "true"], env={"COLUMNS": "200"})
+    assert res.exit_code == 0, res.output
+    assert "stop: SIGINT, SIGKILL after 30s" in res.output
+
+
+def test_show_displays_the_stop_settings_only_when_set(monkeypatch):
+    monkeypatch.setattr(client, "send", lambda cmd, **kw: _job(5, stop_signal="SIGINT", stop_grace_secs=30))
+    out = runner.invoke(app, ["show", "5"], env={"COLUMNS": "200"}).output
+    assert "stop" in out and "SIGINT, SIGKILL after 30s" in out
+    monkeypatch.setattr(client, "send", lambda cmd, **kw: _job(5))
+    out = runner.invoke(app, ["show", "5"], env={"COLUMNS": "200"}).output
+    assert "SIGKILL after" not in out
+
+
+def test_cancel_sends_signal_and_grace_only_when_given(monkeypatch):
+    calls = _capture_send(monkeypatch, {"cancelled": 4, "channel": 1})
+    assert runner.invoke(app, ["cancel", "4"]).exit_code == 0
+    assert calls[0] == ("cancel", {"id": 4})
+    assert runner.invoke(app, ["cancel", "4", "-s", "int", "--grace", "30"]).exit_code == 0
+    assert calls[1] == ("cancel", {"id": 4, "signal": "SIGINT", "grace": 30})
+    assert runner.invoke(app, ["cancel", "--signal", "KILL", "--grace", "0"]).exit_code == 0
+    assert calls[2] == ("cancel", {"signal": "SIGKILL", "grace": 0})
+
+
+@pytest.mark.parametrize("args", [["-s", "STOP"], ["-s", "nope"], ["--grace", "-3"], ["--grace", "later"]])
+def test_cancel_rejects_bad_signal_or_grace_without_calling_the_daemon(monkeypatch, args):
+    calls = _capture_send(monkeypatch, {"cancelled": 4, "channel": 1})
+    res = runner.invoke(app, ["cancel", "4", *args])
+    assert res.exit_code != 0 and calls == []
+
+
+def test_edit_sends_the_stop_settings_and_an_empty_string_clears_them(monkeypatch):
+    calls = _edit_env(monkeypatch)
+    assert runner.invoke(app, ["edit", "5", "--stop-signal", "usr1", "--stop-grace", "45"]).exit_code == 0
+    assert _requests(calls)[0] == {"id": 5, "stop_signal": "SIGUSR1", "stop_grace": 45}
+    assert runner.invoke(app, ["edit", "5", "--stop-signal", "", "--stop-grace", ""]).exit_code == 0
+    assert _requests(calls)[1] == {"id": 5, "stop_signal": None, "stop_grace": None}

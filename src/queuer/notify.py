@@ -901,6 +901,9 @@ def _format_details(job: dict[str, Any], cfg: dict[str, Any], cmd_cap: int) -> s
         lines.append(row("on finish", job["on_finish_cmd"]))
     if job.get("on_error_cmd"):
         lines.append(row("on error", job["on_error_cmd"]))
+    if job.get("stop_signal") or job.get("stop_grace_secs") is not None:
+        grace = job.get("stop_grace_secs")
+        lines.append(row("stop", f"{job.get('stop_signal') or 'SIGTERM'}" + (f", SIGKILL after {_fmt_secs(grace)}" if grace is not None else "")))
     if job.get("not_before"):
         lines.append(row("not before", _local(job["not_before"])))
     if job.get("depends_on"):

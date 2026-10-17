@@ -554,7 +554,8 @@ class Daemon:
             else:
                 exit_code = await proc.wait()
         except asyncio.TimeoutError:
-            await self._kill_process_group(proc)
+            stop_sig, stop_grace = self._stop_settings(job)
+            await self._kill_process_group(proc, stop_grace, stop_sig)
             exit_code = await proc.wait()
             await log_task
             await self._stop_usage_sampling(usage_task)
@@ -1227,20 +1228,32 @@ class Daemon:
                 sample = _read_proc_usage(pid)
                 if sample is not None:
                     rss_kb, user_secs, sys_secs = sample
-                    usage["rss_kb"] = rss_kb
+                    if rss_kb is not None:  # a zombie (killed, not yet reaped) has no VmHWM: keep the last peak
+                        usage["rss_kb"] = rss_kb
                     usage["cpu_user"] = user_secs
                     usage["cpu_sys"] = sys_secs
                 await asyncio.sleep(RESOURCE_SAMPLE_SECS)
         except asyncio.CancelledError:
             pass
 
-    async def _kill_process_group(self, proc: asyncio.subprocess.Process, grace: float = DEFAULT_GRACE_SECS) -> None:
-        """SIGTERM the job's whole process group, wait up to `grace`
-        seconds for it to exit on its own, then SIGKILL if it's still
+    @staticmethod
+    def _stop_settings(job: dict[str, Any] | None, sig: str | None = None, grace: int | None = None) -> tuple[signal.Signals, float]:
+        """F11: (signal, grace seconds) to stop a job with. An explicit `sig` / `grace` (from
+        `qur cancel -s/--grace`) wins over the job's own `--stop-signal` / `--stop-grace`,
+        which win over SIGTERM / DEFAULT_GRACE_SECS."""
+        name = sig or (job or {}).get("stop_signal") or "SIGTERM"
+        secs = grace if grace is not None else (job or {}).get("stop_grace_secs")
+        return signal.Signals[name], float(DEFAULT_GRACE_SECS if secs is None else secs)
+
+    async def _kill_process_group(
+        self, proc: asyncio.subprocess.Process, grace: float = DEFAULT_GRACE_SECS, sig: signal.Signals = signal.SIGTERM,
+    ) -> None:
+        """Send `sig` (default SIGTERM) to the job's whole process group, wait up to
+        `grace` seconds for it to exit on its own, then SIGKILL if it's still
         alive. Used by both `cancel` and timeout enforcement."""
         pgid = proc.pid  # start_new_session=True makes pid == pgid (session leader)
         try:
-            os.killpg(pgid, signal.SIGTERM)
+            os.killpg(pgid, sig)
         except ProcessLookupError:
             return
         try:
@@ -1390,6 +1403,8 @@ class Daemon:
             raise ValueError(f"on_fail must be one of {', '.join(db.ON_FAIL_MODES)}")
         on_finish_cmd = db.check_hook(args.get("on_finish"), "on-finish command")
         on_error_cmd = db.check_hook(args.get("on_error"), "on-error command")
+        stop_signal = db.check_stop_signal(args.get("stop_signal"), "stop signal")
+        stop_grace_secs = db.check_stop_grace(args.get("stop_grace"), "stop grace")
         deps = self._dep_args(args)
         if now and deps:
             raise ValueError("--now cannot be combined with --depends-on/--after-any")
@@ -1484,13 +1499,17 @@ class Daemon:
                 retry_backoff=retry_backoff,
                 on_finish_cmd=on_finish_cmd,
                 on_error_cmd=on_error_cmd,
+                stop_signal=stop_signal,
+                stop_grace_secs=stop_grace_secs,
                 commit=False,
             ))
         if dry_run:
             # no await between the inserts above and this rollback, so nothing else can
             # see (or commit) the half-written rows
             try:
-                return self._dry_run_report(job_ids, prepared, env_extra, channel, cwd, now, deps, on_finish_cmd, on_error_cmd)
+                return self._dry_run_report(
+                    job_ids, prepared, env_extra, channel, cwd, now, deps, on_finish_cmd, on_error_cmd, stop_signal, stop_grace_secs,
+                )
             finally:
                 self.conn.rollback()
         self.conn.executemany(
@@ -1535,6 +1554,8 @@ class Daemon:
         deps: dict[int, str],
         on_finish_cmd: str | None = None,
         on_error_cmd: str | None = None,
+        stop_signal: str | None = None,
+        stop_grace_secs: int | None = None,
     ) -> dict[str, Any]:
         """What `add --dry-run` returns. Called while the not-yet-committed rows of the
         would-be jobs are in the open transaction (the caller rolls it back), so the
@@ -1566,6 +1587,8 @@ class Daemon:
             "env": env_extra,
             "on_finish": on_finish_cmd,
             "on_error": on_error_cmd,
+            "stop_signal": stop_signal,
+            "stop_grace": stop_grace_secs,
             "jobs": jobs,
         }
 
@@ -1718,6 +1741,10 @@ class Daemon:
         assert self.conn is not None
         job_id = self._int_arg(args, "id", required=False)
         channel = self._int_arg(args, "channel", required=False, positive=True)
+        # F11: -s / --grace for this cancel only (they win over the job's own stop settings);
+        # ignored for a job that is still queued, which has no process to signal
+        sig = db.check_stop_signal(args.get("signal"), "signal")
+        grace = db.check_stop_grace(args.get("grace"), "grace")
 
         if job_id is None:
             channel = channel or db.DEFAULT_CHANNEL
@@ -1725,7 +1752,7 @@ class Daemon:
             job_id = self._current_job_id.get(channel)
             if proc is None or job_id is None:
                 raise ValueError(f"no job is currently running on channel {channel}")
-            await self._cancel_running(job_id, proc)
+            await self._cancel_running(job_id, proc, sig=sig, grace=grace)
             return {"cancelled": job_id, "channel": channel}
 
         job = db.get_job(self.conn, job_id)
@@ -1745,7 +1772,7 @@ class Daemon:
             proc = self._current_proc.get(channel)
             if proc is None or self._current_job_id.get(channel) != job_id:
                 raise ValueError(f"job {job_id} is not running")
-            await self._cancel_running(job_id, proc)
+            await self._cancel_running(job_id, proc, sig=sig, grace=grace)
         elif status == "stopped":
             frozen = self._frozen.get(channel)
             if frozen is None or frozen[0] != job_id:
@@ -1753,12 +1780,16 @@ class Daemon:
             # drop it from the frozen slot first so the priority lane does
             # not try to resume a job that is about to die
             del self._frozen[channel]
-            await self._cancel_running(job_id, frozen[1], frozen=True)
+            await self._cancel_running(job_id, frozen[1], frozen=True, sig=sig, grace=grace)
         else:
             raise ValueError(f"job {job_id} is already {status}")
         return {"cancelled": job_id, "channel": channel}
 
-    async def _cancel_running(self, job_id: int, proc: asyncio.subprocess.Process, frozen: bool = False) -> None:
+    async def _cancel_running(
+        self, job_id: int, proc: asyncio.subprocess.Process, frozen: bool = False, sig: str | None = None, grace: int | None = None,
+    ) -> None:
+        assert self.conn is not None
+        stop_sig, stop_grace = self._stop_settings(db.get_job(self.conn, job_id), sig, grace)
         self._cancelled.add(job_id)
         if frozen:
             # a SIGSTOPped group never acts on SIGTERM until continued
@@ -1766,7 +1797,7 @@ class Daemon:
                 os.killpg(proc.pid, signal.SIGCONT)
             except ProcessLookupError:
                 pass
-        await self._kill_process_group(proc)
+        await self._kill_process_group(proc, stop_grace, stop_sig)
 
     async def _cmd_requeue(self, args: dict[str, Any]) -> dict[str, Any]:
         self._int_arg(args, "id")
@@ -1842,6 +1873,7 @@ class Daemon:
         `argv`/`raw_argv` (+ `path`, `virtual_env`, `python_path` of the editing shell: they
         replace the job's own), `cwd`, `timeout_secs` (null = none), `channel` (moves the job to
         the end of that channel), `max_retries`, `on_fail`, `on_finish` / `on_error` (hook commands; null or blank = remove),
+        `stop_signal` / `stop_grace` (F11; null or blank = back to the default),
         `not_before` (null = clear),
         `depends_on` / `after_any` (replace that kind of dependency), `clear_deps`, `env`
         (merged over the job's). `pid` is the editor's lock holder (see `edit_lock`); without it
@@ -1927,6 +1959,16 @@ class Daemon:
                 if hook != job[column]:
                     updates[column] = hook
                     changed.append(label)
+        if "stop_signal" in args:
+            stop_signal = db.check_stop_signal(args["stop_signal"], "stop signal")
+            if stop_signal != job["stop_signal"]:
+                updates["stop_signal"] = stop_signal
+                changed.append("stop signal")
+        if "stop_grace" in args:
+            stop_grace = db.check_stop_grace(args["stop_grace"], "stop grace")
+            if stop_grace != job["stop_grace_secs"]:
+                updates["stop_grace_secs"] = stop_grace
+                changed.append("stop grace")
         if "not_before" in args:
             not_before = self._parse_not_before(args["not_before"])
             if not_before != job["not_before"]:

@@ -27,7 +27,7 @@ from rich.table import Table
 from typer.core import TyperCommand
 
 from queuer import client, db, jobenv, logclean, notify, selfcheck
-from queuer.daemon import _default_db_path, _default_log_dir
+from queuer.daemon import DEFAULT_GRACE_SECS, _default_db_path, _default_log_dir
 from queuer.db import DEFAULT_CHANNEL
 from queuer.pathresolve import SHELL_INTERPRETERS
 
@@ -269,6 +269,35 @@ def _retry_delay_secs(delay: str | None, backoff: bool, retries: int) -> int | N
     if secs > db.MAX_RETRY_DELAY_SECS:
         _fail(f"--retry-delay is too long: at most {db.MAX_RETRY_DELAY_SECS // 86400} days")
     return secs
+
+
+def _fmt_stop(sig: str | None, grace: int | None) -> str:
+    """"SIGINT, SIGKILL after 30s" (what a job's stop settings mean; defaults spelled out)."""
+    after = DEFAULT_GRACE_SECS if grace is None else grace
+    return f"{sig or 'SIGTERM'}, SIGKILL after {_fmt_secs(after)}"
+
+
+def _stop_signal(value: str | None, flag: str) -> str | None:
+    """`-s` / `--stop-signal` -> canonical signal name (None = not given; blank = back to
+    the default, used by `qur edit`). Exits with an error for an unusable signal."""
+    try:
+        return db.check_stop_signal(value, flag)
+    except ValueError as e:
+        _fail(str(e))
+
+
+def _grace_secs(value: str | None, flag: str) -> int | None:
+    """`--grace` / `--stop-grace` -> whole seconds (None = not given or blank). A bare number
+    is seconds (`--grace 30`); units work too (`90s`, `2m`, `1h`). 0 is allowed: SIGKILL
+    right after the signal. Exits with an error for anything else."""
+    if value is None or not value.strip():
+        return None
+    text = value.strip()
+    try:
+        secs = int(text) if text.isdigit() else int(parse_delay(text).total_seconds())
+        return db.check_stop_grace(secs, flag)
+    except ValueError as e:
+        _fail(str(e))
 
 
 def _fmt_duration(job: dict[str, Any]) -> str:
@@ -554,6 +583,8 @@ def _render_dry_run(data: dict[str, Any], timeout: int | None) -> None:
         console.print(f"on finish hook: {escape(data['on_finish'])}")
     if data.get("on_error"):
         console.print(f"on error hook: {escape(data['on_error'])}")
+    if data.get("stop_signal") or data.get("stop_grace") is not None:
+        console.print(f"stop: {_fmt_stop(data.get('stop_signal'), data.get('stop_grace'))}")
     running, frozen = data.get("running_id"), data.get("frozen_id")
     where = str(first["position"]) if not sweep else f"{first['position']}-{jobs[-1]['position']}"
     label = "queue position" if not sweep else "queue positions"
@@ -666,6 +697,19 @@ def add(
         None, "--on-error", metavar="COMMAND",
         help="Hook like --on-finish, but only when the job ends `failed` (non-zero exit, timeout, failed "
         "start; the last failure when --retries is used). Runs after the global hook and --on-finish.",
+    ),
+    stop_signal: Optional[str] = typer.Option(
+        None, "--stop-signal", metavar="SIG",
+        help="Signal that stops this job when it is cancelled or times out, instead of SIGTERM: one of "
+        "TERM, INT, HUP, QUIT, USR1, USR2, KILL (or its number). It goes to the job's whole process group. "
+        "Use INT for a program that writes a checkpoint on Ctrl-C. `qur cancel -s` overrides it for one "
+        "cancel. A daemon stop (reboot, `qur daemon stop`) still uses SIGTERM.",
+    ),
+    stop_grace: Optional[str] = typer.Option(
+        None, "--stop-grace", metavar="SECONDS",
+        help="How long the job gets between the stop signal and SIGKILL (default 5 seconds): a number of "
+        "seconds, or a duration like 90s, 2m. 0 = SIGKILL at once. `qur cancel --grace` overrides it for "
+        "one cancel. Not used when the daemon itself stops.",
     ),
     delay: Optional[str] = typer.Option(
         None, "--delay", metavar="DURATION",
@@ -797,6 +841,8 @@ def add(
     # daemon-side) is where absolute executable/file paths belong.
     if on_fail not in db.ON_FAIL_MODES:
         _fail(f"--on-fail must be one of {', '.join(db.ON_FAIL_MODES)} (got {on_fail!r})")
+    stop_signal_name = _stop_signal(stop_signal, "--stop-signal")
+    stop_grace_secs = _grace_secs(stop_grace, "--stop-grace")
     sweep = _sweep_jobs(cmd, each, array)
     job_argv = _resolve_interpreter(_build_job_argv(cmd)) if sweep is None else []
     depends_ids = _parse_job_ids(depends_on, "--depends-on")
@@ -838,6 +884,8 @@ def add(
         retry_backoff=retry_backoff,
         on_finish=on_finish,
         on_error=on_error,
+        stop_signal=stop_signal_name,
+        stop_grace=stop_grace_secs,
         **({"dry_run": True} if dry_run else {}),
     )
     if dry_run:
@@ -868,6 +916,8 @@ def add(
         console.print(f"on finish: runs `{escape(on_finish)}`")
     if on_error:
         console.print(f"on error: runs `{escape(on_error)}`")
+    if stop_signal_name or stop_grace_secs is not None:
+        console.print(f"stopped with {_fmt_stop(stop_signal_name, stop_grace_secs)}")
     if retries:
         console.print(f"auto-retry on failure: up to {retries} time(s)")
     if retry_delay_secs:
@@ -1268,6 +1318,8 @@ def _render_job(job: dict[str, Any]) -> None:
         table.add_row("on finish", escape(job["on_finish_cmd"]))
     if job.get("on_error_cmd"):
         table.add_row("on error", escape(job["on_error_cmd"]))
+    if job.get("stop_signal") or job.get("stop_grace_secs") is not None:
+        table.add_row("stop", _fmt_stop(job.get("stop_signal"), job.get("stop_grace_secs")))
     if job.get("not_before"):
         waiting = " (still waiting)" if job["status"] == "queued" and _starts_in_future(job) else ""
         table.add_row("not before", _fmt_time(job["not_before"]) + waiting)
@@ -1578,6 +1630,16 @@ def cancel(
     channel: Optional[int] = typer.Option(
         None, "--channel", help="Channel whose running job to kill (default 1). With JOB_ID, must match the job's channel."
     ),
+    signal_name: Optional[str] = typer.Option(
+        None, "-s", "--signal", metavar="SIG",
+        help="Stop signal for this cancel: TERM (default), INT, HUP, QUIT, USR1, USR2 or KILL (or its number). "
+        "Overrides the job's --stop-signal. Ignored for a job that is still queued.",
+    ),
+    grace: Optional[str] = typer.Option(
+        None, "--grace", metavar="SECONDS",
+        help="Seconds the job gets between the signal and SIGKILL (default 5): a number, or a duration like "
+        "90s, 2m. 0 = SIGKILL at once. Overrides the job's --stop-grace. Ignored for a job that is still queued.",
+    ),
 ) -> None:
     """Cancel a job.
 
@@ -1586,8 +1648,9 @@ def cancel(
     queue (a queued job is kept in history as `cancelled`; `qur rm` deletes it
     instead). Queued jobs that needed it to succeed (--depends-on) become `skipped`.
 
-    Killing sends SIGTERM to the job's whole process group, then SIGKILL if it is
-    still alive after a short grace period. A cancelled job is never auto-retried.
+    Killing sends SIGTERM (or -s SIG, or the job's --stop-signal) to the job's whole
+    process group, then SIGKILL if it is still alive after a grace period (5 seconds,
+    or --grace, or the job's --stop-grace). A cancelled job is never auto-retried.
     Errors if nothing is running on the channel, or if the job is already finished.
 
     \b
@@ -1595,8 +1658,15 @@ def cancel(
       qur cancel
       qur cancel --channel 2
       qur cancel 12
+      qur cancel 12 -s INT --grace 30   # Ctrl-C, then 30 s to write a checkpoint
     """
     kwargs: dict[str, Any] = {}
+    sig_name = _stop_signal(signal_name, "--signal")
+    grace_secs = _grace_secs(grace, "--grace")
+    if sig_name is not None:
+        kwargs["signal"] = sig_name
+    if grace_secs is not None:
+        kwargs["grace"] = grace_secs
     if job_id is not None:
         kwargs["id"] = job_id
     if channel is not None:
@@ -1834,6 +1904,12 @@ def edit(
     on_error: Optional[str] = typer.Option(
         None, "--on-error", metavar="COMMAND", help="New --on-error hook; an empty string removes it.",
     ),
+    stop_signal: Optional[str] = typer.Option(
+        None, "--stop-signal", metavar="SIG", help="New --stop-signal; an empty string goes back to SIGTERM.",
+    ),
+    stop_grace: Optional[str] = typer.Option(
+        None, "--stop-grace", metavar="SECONDS", help="New --stop-grace; an empty string goes back to the default (5 s).",
+    ),
     delay: Optional[str] = typer.Option(None, "--delay", metavar="DURATION", help="Start no earlier than this from now."),
     at: Optional[str] = typer.Option(None, "--at", metavar="TIME", help="Start no earlier than this local time."),
     clear_delay: bool = typer.Option(False, "--clear-delay", help="Remove the start time."),
@@ -1885,7 +1961,7 @@ def edit(
     if cmd_text is not None and not cmd_text.strip():
         _fail("--cmd is empty")
     flagged = any(
-        v is not None for v in (cwd, timeout, channel, retries, on_fail, on_finish, on_error, delay, at, depends_on, after_any, env)
+        v is not None for v in (cwd, timeout, channel, retries, on_fail, on_finish, on_error, stop_signal, stop_grace, delay, at, depends_on, after_any, env)
     )
     if not words and not flagged and not clear_delay and not clear_deps:
         _edit_interactive(job_id)
@@ -1900,6 +1976,10 @@ def edit(
         request["on_finish"] = on_finish
     if on_error is not None:
         request["on_error"] = on_error
+    if stop_signal is not None:
+        request["stop_signal"] = _stop_signal(stop_signal, "--stop-signal")
+    if stop_grace is not None:
+        request["stop_grace"] = _grace_secs(stop_grace, "--stop-grace")
     if clear_delay and (delay is not None or at is not None):
         _fail("--clear-delay cannot be combined with --delay/--at")
     start = _start_time(delay, at)
@@ -2523,7 +2603,8 @@ def doctor(
 
     Checks: daemon reachable, socket mode and owner, config folder/file modes
     (notify.json 0600, folders 0700, no symlinks), database mode, log folder writable
-    and free disk space, systemd linger, unit file and service state, Telegram token
+    and free disk space, systemd linger, unit file (and whether it still matches what
+    install.sh writes) and service state, Telegram token
     (one getMe call, only if configured; offline is a warning), and the database
     schema version. Every problem comes with a fix hint.
 

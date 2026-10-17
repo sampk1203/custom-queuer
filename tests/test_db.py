@@ -1965,3 +1965,97 @@ def test_init_db_adds_the_hook_columns_to_a_pre_hooks_database(tmp_path):
     assert cols.count("on_finish_cmd") == 1 and cols.count("on_error_cmd") == 1
     assert db.get_job(c, old)["on_finish_cmd"] is None  # old rows untouched, no hook
     c.close()
+
+
+# ---------------------------------------------------------------------------
+# F11: stop signal / stop grace
+# ---------------------------------------------------------------------------
+
+def _stop_conn(tmp_path):
+    c = db.connect(tmp_path / "stop.db")
+    db.init_db(c)
+    return c
+
+
+@pytest.mark.parametrize("raw, name", [("INT", "SIGINT"), ("int", "SIGINT"), ("SIGINT", "SIGINT"), (" usr1 ", "SIGUSR1"), ("2", "SIGINT"), (15, "SIGTERM"), ("kill", "SIGKILL")])
+def test_check_stop_signal_accepts_names_and_numbers(raw, name):
+    assert db.check_stop_signal(raw) == name
+
+
+@pytest.mark.parametrize("raw", [None, "", "   "])
+def test_check_stop_signal_blank_means_default(raw):
+    assert db.check_stop_signal(raw) is None
+
+
+@pytest.mark.parametrize("raw", ["STOP", "CONT", "SIGSTOP", "bogus", "999", "-2", True, 1.5, ["INT"]])
+def test_check_stop_signal_rejects_the_rest(raw):
+    with pytest.raises(ValueError):
+        db.check_stop_signal(raw)
+
+
+def test_check_stop_grace():
+    assert db.check_stop_grace(None) is None
+    assert db.check_stop_grace(0) == 0 and db.check_stop_grace(30) == 30
+    assert db.check_stop_grace(db.MAX_STOP_GRACE_SECS) == db.MAX_STOP_GRACE_SECS
+    for bad in (-1, db.MAX_STOP_GRACE_SECS + 1, "30", 1.5, True):
+        with pytest.raises(ValueError):
+            db.check_stop_grace(bad)
+
+
+def _enqueue_stop(c, **kw):
+    return db.enqueue(c, raw_cmd=["a"], resolved_cmd=["/bin/a"], cwd="/tmp", log_path="x", **kw)
+
+
+def test_enqueue_stores_and_normalizes_the_stop_settings(tmp_path):
+    c = _stop_conn(tmp_path)
+    jid = _enqueue_stop(c, stop_signal="int", stop_grace_secs=30)
+    job = db.get_job(c, jid)
+    assert job["stop_signal"] == "SIGINT" and job["stop_grace_secs"] == 30
+    plain = db.get_job(c, _enqueue_stop(c))
+    assert plain["stop_signal"] is None and plain["stop_grace_secs"] is None
+    with pytest.raises(ValueError):
+        _enqueue_stop(c, stop_signal="STOP")
+    with pytest.raises(ValueError):
+        _enqueue_stop(c, stop_grace_secs=-5)
+    c.close()
+
+
+def test_requeue_copies_the_stop_settings(tmp_path):
+    c = _stop_conn(tmp_path)
+    jid = _enqueue_stop(c, stop_signal="HUP", stop_grace_secs=0)
+    db.mark_running(c, jid, pid=1, pgid=1)
+    db.mark_finished(c, jid, status="failed", exit_code=1, keep_backlog=10)
+    new_id = db.requeue(c, jid, log_path="y")
+    job = db.get_job(c, new_id)
+    assert job["stop_signal"] == "SIGHUP" and job["stop_grace_secs"] == 0
+    c.close()
+
+
+def test_edit_job_sets_validates_and_clears_the_stop_settings(tmp_path):
+    c = _stop_conn(tmp_path)
+    jid = _enqueue_stop(c)
+    db.edit_job(c, jid, updates={"stop_signal": "usr2", "stop_grace_secs": 12})
+    job = db.get_job(c, jid)
+    assert job["stop_signal"] == "SIGUSR2" and job["stop_grace_secs"] == 12
+    with pytest.raises(ValueError):
+        db.edit_job(c, jid, updates={"stop_signal": "STOP"})
+    with pytest.raises(ValueError):
+        db.edit_job(c, jid, updates={"stop_grace_secs": -1})
+    db.edit_job(c, jid, updates={"stop_signal": "", "stop_grace_secs": None})
+    job = db.get_job(c, jid)
+    assert job["stop_signal"] is None and job["stop_grace_secs"] is None
+    c.close()
+
+
+def test_migration_7_adds_the_stop_columns_to_a_version_6_database(tmp_path):
+    c = _stop_conn(tmp_path)
+    jid = _enqueue_stop(c)
+    c.execute("ALTER TABLE jobs DROP COLUMN stop_signal")
+    c.execute("ALTER TABLE jobs DROP COLUMN stop_grace_secs")
+    c.execute("UPDATE schema_version SET version = 6")
+    c.commit()
+    db.init_db(c)
+    assert db.get_schema_version(c) == db.SCHEMA_VERSION >= 7
+    job = db.get_job(c, jid)
+    assert job["stop_signal"] is None and job["stop_grace_secs"] is None
+    c.close()

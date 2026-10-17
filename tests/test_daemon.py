@@ -4800,3 +4800,156 @@ def test_an_unusable_global_hook_is_ignored_with_a_warning(tmp_path, monkeypatch
     d = Daemon(db_path=tmp_path / "q.db", socket_path=tmp_path / "q.sock", log_dir=tmp_path / "logs")
     assert d.post_job_hook is None
     assert "ignoring QUEUER_POST_JOB_HOOK" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# F11: configurable stop signal and grace
+# ---------------------------------------------------------------------------
+
+def _int_trap(out: Path) -> list[str]:
+    """A job that records SIGINT and exits 0; it is only stopped by INT (SIGTERM kills it, no record)."""
+    return ["sh", "-c", f'trap "echo got-int >> {out}; exit 0" INT; while :; do sleep 0.1; done']
+
+
+_IGNORE_TERM = ["sh", "-c", "trap '' TERM; while :; do sleep 0.1; done"]
+
+
+@pytest.mark.asyncio
+async def test_cancel_with_a_signal_sends_that_signal(daemon, tmp_path):
+    out = tmp_path / "sig"
+    a = await _add(daemon, _int_trap(out))
+    await wait_for_status(daemon.socket_path, a, {"running"})
+    await asyncio.sleep(0.3)
+    resp = await send(daemon.socket_path, "cancel", id=a, signal="int")
+    assert resp["ok"], resp
+    job = await wait_for_status(daemon.socket_path, a, {"cancelled"})
+    assert _lines(out) == ["got-int"] and job["exit_code"] == 0
+
+
+@pytest.mark.asyncio
+async def test_cancel_grace_zero_kills_a_job_that_ignores_sigterm_at_once(daemon):
+    a = await _add(daemon, _IGNORE_TERM)
+    await wait_for_status(daemon.socket_path, a, {"running"})
+    await asyncio.sleep(0.3)
+    t0 = time.monotonic()
+    assert (await send(daemon.socket_path, "cancel", id=a, grace=0))["ok"]
+    await wait_for_status(daemon.socket_path, a, {"cancelled"}, timeout=3)
+    assert time.monotonic() - t0 < 3  # the default grace is 5 s
+
+
+@pytest.mark.asyncio
+async def test_a_longer_grace_lets_the_job_finish_its_shutdown(daemon, tmp_path):
+    out = tmp_path / "late"
+    slow = ["sh", "-c", f'trap "sleep 1; echo saved >> {out}; exit 0" TERM; while :; do sleep 0.1; done']
+    a = await _add(daemon, slow)
+    await wait_for_status(daemon.socket_path, a, {"running"})
+    await asyncio.sleep(0.3)
+    assert (await send(daemon.socket_path, "cancel", id=a, grace=10))["ok"]
+    await wait_for_status(daemon.socket_path, a, {"cancelled"}, timeout=6)
+    assert _lines(out) == ["saved"]
+
+
+@pytest.mark.asyncio
+async def test_the_jobs_own_stop_settings_are_used_by_a_plain_cancel(daemon, tmp_path):
+    out = tmp_path / "own"
+    a = await _add(daemon, _int_trap(out), stop_signal="INT", stop_grace=10)
+    job = (await send(daemon.socket_path, "show", id=a))["data"]
+    assert job["stop_signal"] == "SIGINT" and job["stop_grace_secs"] == 10
+    await wait_for_status(daemon.socket_path, a, {"running"})
+    await asyncio.sleep(0.3)
+    assert (await send(daemon.socket_path, "cancel", id=a))["ok"]
+    await wait_for_status(daemon.socket_path, a, {"cancelled"})
+    assert _lines(out) == ["got-int"]
+
+
+@pytest.mark.asyncio
+async def test_cancel_flags_override_the_jobs_own_stop_settings(daemon, tmp_path):
+    a = await _add(daemon, _IGNORE_TERM, stop_grace=60)
+    await wait_for_status(daemon.socket_path, a, {"running"})
+    await asyncio.sleep(0.3)
+    t0 = time.monotonic()
+    assert (await send(daemon.socket_path, "cancel", id=a, grace=0))["ok"]
+    await wait_for_status(daemon.socket_path, a, {"cancelled"}, timeout=3)
+    assert time.monotonic() - t0 < 3
+
+
+@pytest.mark.asyncio
+async def test_a_timeout_uses_the_jobs_stop_signal(daemon, tmp_path):
+    out = tmp_path / "timeout"
+    a = await _add(daemon, _int_trap(out), timeout_secs=1, stop_signal="SIGINT")
+    job = await wait_for_status(daemon.socket_path, a, {"failed"}, timeout=8)
+    assert job["note"] == "timed out" and _lines(out) == ["got-int"]
+
+
+@pytest.mark.asyncio
+async def test_cancel_signal_is_ignored_for_a_queued_job(daemon):
+    run = await _add(daemon, ["sleep", "30"])
+    queued = await _add(daemon, ["true"])
+    await wait_for_status(daemon.socket_path, run, {"running"})
+    assert (await send(daemon.socket_path, "cancel", id=queued, signal="INT", grace=1))["ok"]
+    assert (await send(daemon.socket_path, "show", id=queued))["data"]["status"] == "cancelled"
+    await send(daemon.socket_path, "cancel", id=run)
+
+
+@pytest.mark.asyncio
+async def test_bad_stop_settings_are_rejected(daemon):
+    for kw in ({"stop_signal": "STOP"}, {"stop_signal": "bogus"}, {"stop_grace": -1}, {"stop_grace": "5"}, {"stop_grace": True}):
+        resp = await send(daemon.socket_path, "add", argv=["true"], cwd=CWD, **kw)
+        assert not resp["ok"], kw
+    run = await _add(daemon, ["sleep", "30"])
+    await wait_for_status(daemon.socket_path, run, {"running"})
+    for kw in ({"signal": "STOP"}, {"signal": "bogus"}, {"grace": -1}, {"grace": "5"}):
+        resp = await send(daemon.socket_path, "cancel", id=run, **kw)
+        assert not resp["ok"], kw
+    assert (await send(daemon.socket_path, "show", id=run))["data"]["status"] == "running"
+    await send(daemon.socket_path, "cancel", id=run)
+
+
+@pytest.mark.asyncio
+async def test_dry_run_reports_the_stop_settings_and_queues_nothing(daemon):
+    resp = await send(daemon.socket_path, "add", argv=["true"], cwd=CWD, dry_run=True, stop_signal="int", stop_grace=30)
+    assert resp["ok"] and resp["data"]["stop_signal"] == "SIGINT" and resp["data"]["stop_grace"] == 30
+    assert not (await send(daemon.socket_path, "show", id=resp["data"]["jobs"][0]["position"]))["ok"]  # nothing was queued
+
+
+@pytest.mark.asyncio
+async def test_edit_changes_and_clears_the_stop_settings(daemon):
+    run = await _add(daemon, ["sleep", "30"])
+    queued = await _add(daemon, ["true"])
+    await wait_for_status(daemon.socket_path, run, {"running"})
+    resp = await send(daemon.socket_path, "edit", id=queued, stop_signal="usr1", stop_grace=7)
+    assert resp["ok"] and set(resp["data"]["changed"]) == {"stop signal", "stop grace"}
+    job = (await send(daemon.socket_path, "show", id=queued))["data"]
+    assert job["stop_signal"] == "SIGUSR1" and job["stop_grace_secs"] == 7
+    resp = await send(daemon.socket_path, "edit", id=queued, stop_signal=None, stop_grace=None)
+    assert resp["ok"]
+    job = (await send(daemon.socket_path, "show", id=queued))["data"]
+    assert job["stop_signal"] is None and job["stop_grace_secs"] is None
+    bad = await send(daemon.socket_path, "edit", id=queued, stop_signal="STOP")
+    assert not bad["ok"]
+    await send(daemon.socket_path, "cancel", id=run)
+
+
+@pytest.mark.asyncio
+async def test_a_requeue_keeps_the_stop_settings(daemon):
+    a = await _add(daemon, ["false"], stop_signal="HUP", stop_grace=3)
+    await wait_for_status(daemon.socket_path, a, {"failed"})
+    new_id = (await send(daemon.socket_path, "requeue", id=a))["data"]["id"]
+    job = (await send(daemon.socket_path, "show", id=new_id))["data"]
+    assert job["stop_signal"] == "SIGHUP" and job["stop_grace_secs"] == 3
+
+
+@pytest.mark.asyncio
+async def test_usage_sampler_keeps_the_last_peak_rss_when_a_later_sample_has_none(tmp_path, monkeypatch):
+    """A killed job that is not reaped yet is a zombie: /proc still has its CPU times but no
+    VmHWM. That sample must not wipe the peak RSS read while the job was alive."""
+    samples = iter([(2048, 1.0, 0.5), (None, 2.0, 1.0)])
+    last = (None, 2.0, 1.0)
+    monkeypatch.setattr("queuer.daemon._read_proc_usage", lambda pid: next(samples, last))
+    monkeypatch.setattr("queuer.daemon.RESOURCE_SAMPLE_SECS", 0.01)
+    d = Daemon(db_path=tmp_path / "q.db", socket_path=tmp_path / "q.sock", log_dir=tmp_path / "logs")
+    usage = {"rss_kb": None, "cpu_user": None, "cpu_sys": None}
+    task = asyncio.create_task(d._sample_usage(1, usage))
+    await _until(lambda: usage["cpu_user"] == 2.0)
+    await d._stop_usage_sampling(task)
+    assert usage == {"rss_kb": 2048, "cpu_user": 2.0, "cpu_sys": 1.0}
