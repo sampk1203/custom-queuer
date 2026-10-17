@@ -97,9 +97,16 @@ async def daemon(tmp_path):
         except (asyncio.TimeoutError, ProcessLookupError):
             pass
 
-    task.cancel()
+    # Stop the daemon through its normal shutdown, not task.cancel(): jobs still in flight
+    # (an `echo` added at the very end of a test) get their pipes drained and closed by the
+    # daemon itself. A bare cancel left their subprocess transports open, to be
+    # garbage-collected after the loop closed (PytestUnraisableExceptionWarning: "Event loop
+    # is closed", blamed on whichever later test happened to trigger the GC).
+    d._stopping.set()
     try:
-        await task
+        await asyncio.wait_for(task, timeout=15)
+    except asyncio.TimeoutError:
+        pass  # wait_for already cancelled the task
     except asyncio.CancelledError:
         pass
 
@@ -1694,6 +1701,34 @@ async def test_logs_button_ignores_db_log_path(daemon, monkeypatch, tmp_path):
     _tg_cfg(daemon)
     await wait_calls(bot, "sendMessage", 1)
     assert "TOP-SECRET" not in bot.of("sendMessage")[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_finished_job_message_masks_secrets_in_the_command(daemon, monkeypatch):
+    bot = FakeBot()
+    monkeypatch.setattr(notify, "_api", bot.api)
+    _tg_cfg(daemon)
+    await _add(daemon, ["sh", "-c", "exit 0", "x", "--api-key=abc123", "TOKEN=xyz789"])
+    await wait_calls(bot, "sendMessage", 1)
+    text = bot.of("sendMessage")[0]["text"]
+    assert "abc123" not in text and "xyz789" not in text
+    assert "--api-key=***" in text and "TOKEN=***" in text
+
+
+@pytest.mark.asyncio
+async def test_details_and_logs_buttons_mask_secrets_but_local_data_is_untouched(daemon, monkeypatch):
+    job_id = await _add(daemon, ["sh", "-c", "echo API_KEY=s3cr3t-value", "x", "--password", "hunter2"])
+    await wait_for_status(daemon.socket_path, job_id, {"done"})
+    bot = FakeBot([[_press(1, job_id, action="sh"), _press(2, job_id, action="lg")]])
+    monkeypatch.setattr(notify, "_api", bot.api)
+    _tg_cfg(daemon)
+    await wait_calls(bot, "sendMessage", 2)
+    texts = [m["text"] for m in bot.of("sendMessage")]
+    assert all("s3cr3t-value" not in t and "hunter2" not in t for t in texts)
+    assert any("--password ***" in t for t in texts)  # Details: the command
+    assert any("<pre>API_KEY=***" in t for t in texts)  # Logs: the output
+    assert "s3cr3t-value" in (daemon.log_dir / f"{job_id}.log").read_text()  # the local log is as printed
+    assert "hunter2" in (await send(daemon.socket_path, "show", id=job_id))["data"]["raw_cmd"]  # so is `qur show`
 
 
 @pytest.mark.asyncio
@@ -4074,3 +4109,25 @@ async def test_edit_not_before_delays_the_job(daemon):
     await asyncio.sleep(0.4)
     assert (await send(daemon.socket_path, "show", id=b))["data"]["status"] == "queued"
     await wait_for_status(daemon.socket_path, b, {"done"}, timeout=4)
+
+
+# ---------------------------------------------------------------------------
+# B9 (DECIDED: keep): the channel waits for the whole process tree
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_backgrounded_child_keeps_the_channel_busy_until_it_ends(daemon):
+    """The job's main process exits at once but its backgrounded child still holds the
+    log pipe: the job stays `running` and the next job on the channel waits for the child."""
+    a = await _add(daemon, ["sh", "-c", "sleep 1.2 & echo started"])
+    b = await _add(daemon, ["echo", "after"])
+    await wait_for_status(daemon.socket_path, a, {"running"})
+    await asyncio.sleep(0.5)  # the shell is long gone, the child is not
+    assert (await send(daemon.socket_path, "show", id=a))["data"]["status"] == "running"
+    assert (await send(daemon.socket_path, "show", id=b))["data"]["status"] == "queued"
+    shown_a = await wait_for_status(daemon.socket_path, a, {"done"}, timeout=10)
+    await wait_for_status(daemon.socket_path, b, {"done"})
+    started = datetime.fromisoformat(shown_a["started_at"])
+    finished = datetime.fromisoformat(shown_a["finished_at"])
+    assert (finished - started).total_seconds() >= 1.0  # it waited for the child, not just the shell

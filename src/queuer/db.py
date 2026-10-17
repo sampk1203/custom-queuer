@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,7 @@ DEFAULT_KEEP = 200  # finished jobs kept per channel by the daemon (QUEUER_KEEP 
 LIST_BACKLOG = 10  # finished jobs `qur list` / the Telegram list show per channel
 MAX_HISTORY = 10000  # most rows one history query returns
 MAX_RETRY_DELAY_SECS = 30 * 86400  # longest wait before an automatic retry (also caps --retry-backoff)
+BUSY_TIMEOUT_MS = 5000  # how long a connection waits for another one's write lock before "database is locked"
 EDIT_LOCK_SECS = 30 * 60  # an edit lock older than this is stale and ignored (a crashed editor never blocks a channel)
 MAX_SWEEP = 1000  # most jobs one `add` creates (--each/--array) and most ids one dependency list holds
 
@@ -97,6 +99,11 @@ CREATE TABLE IF NOT EXISTS edit_locks (
     taken_at   TEXT NOT NULL,
     expires_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS schema_version (
+    id      INTEGER PRIMARY KEY CHECK (id = 1),
+    version INTEGER NOT NULL
+);
 """
 
 
@@ -111,9 +118,26 @@ def connect(db_path: Path | str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     # create the file 0600 ourselves; sqlite would use the umask
     os.close(os.open(db_path, os.O_RDWR | os.O_CREAT, 0o600))
     os.chmod(db_path, 0o600)
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=BUSY_TIMEOUT_MS / 1000)
     conn.row_factory = sqlite3.Row
+    # busy_timeout first: the journal_mode switch itself needs a lock when the daemon and a
+    # CLI command (clean-logs) connect at the same moment. WAL lets them read while another
+    # writes. On a filesystem that cannot do WAL sqlite silently keeps the old mode.
+    conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
+    conn.execute("PRAGMA journal_mode = WAL")
+    _secure_db_files(db_path)
     return conn
+
+
+def _secure_db_files(db_path: Path) -> None:
+    """The WAL side files hold the same data as the database: keep them 0600 too (sqlite
+    creates them with the main file's mode, this makes it explicit). They may not exist
+    (no WAL, or already checkpointed and removed)."""
+    for suffix in ("-wal", "-shm"):
+        try:
+            os.chmod(f"{db_path}{suffix}", 0o600)
+        except FileNotFoundError:
+            pass
 
 
 def _migrate_add_priority_lane(conn: sqlite3.Connection) -> None:
@@ -124,8 +148,8 @@ def _migrate_add_priority_lane(conn: sqlite3.Connection) -> None:
     cols = [r["name"] for r in conn.execute("PRAGMA table_info(jobs)").fetchall()]
     if "is_priority" in cols:
         return
-    conn.executescript("ALTER TABLE jobs RENAME TO jobs_old;")
-    conn.executescript(_JOBS_TABLE)
+    conn.execute("ALTER TABLE jobs RENAME TO jobs_old")
+    conn.execute(_JOBS_TABLE)
     conn.execute(
         """
         INSERT INTO jobs (id, channel, status, position, raw_cmd, resolved_cmd, cwd,
@@ -138,7 +162,6 @@ def _migrate_add_priority_lane(conn: sqlite3.Connection) -> None:
         """
     )
     conn.execute("DROP TABLE jobs_old")
-    conn.commit()
 
 
 def _migrate_add_retries(conn: sqlite3.Connection) -> None:
@@ -155,50 +178,42 @@ def _migrate_add_retries(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE jobs ADD COLUMN parent_id INTEGER")
     if "origin" not in cols:
         conn.execute("ALTER TABLE jobs ADD COLUMN origin TEXT")
-    conn.commit()
 
 
 def _migrate_add_deps_and_delay(conn: sqlite3.Connection) -> None:
     """DBs created before dependencies / delayed start / `--on-fail` lack the
     `interrupted` and `skipped` statuses (a CHECK constraint, so the table must be
     rebuilt) and the `not_before` / `on_fail` columns. The whole rebuild runs in ONE
-    transaction: a crash half-way leaves the old table untouched. No-op once migrated
+    transaction (the runner's): a crash half-way leaves the old table untouched. No-op once migrated
     (or on a fresh DB, which is created with the new schema). Runs after the two
     older migrations, so the old table already has every column up to `origin`."""
     row = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'jobs'").fetchone()
     if row is None or ("'interrupted'" in row["sql"] and "not_before" in row["sql"]):
         return
-    conn.commit()  # no half-open implicit transaction when we BEGIN
-    conn.execute("BEGIN")
-    try:
-        seq = conn.execute("SELECT seq FROM sqlite_sequence WHERE name = 'jobs'").fetchone()
-        conn.execute("DROP TABLE IF EXISTS jobs_new")
-        conn.execute(_JOBS_DDL.format(name="jobs_new"))
-        conn.execute(
-            """
-            INSERT INTO jobs_new (id, channel, status, position, raw_cmd, resolved_cmd, cwd,
-                                  env_extra, pid, pgid, enqueued_at, started_at, finished_at,
-                                  exit_code, log_path, note, timeout_secs, is_priority,
-                                  max_retries, attempt, parent_id, origin)
-            SELECT id, channel, status, position, raw_cmd, resolved_cmd, cwd,
-                   env_extra, pid, pgid, enqueued_at, started_at, finished_at,
-                   exit_code, log_path, note, timeout_secs, is_priority,
-                   max_retries, attempt, parent_id, origin
-            FROM jobs
-            """
-        )
-        conn.execute("DROP TABLE jobs")
-        conn.execute("ALTER TABLE jobs_new RENAME TO jobs")
-        if seq is not None:
-            # AUTOINCREMENT must never hand out an id that was used before (pruned
-            # history rows included): dependencies refer to jobs by id
-            cur = conn.execute("UPDATE sqlite_sequence SET seq = MAX(seq, ?) WHERE name = 'jobs'", (seq["seq"],))
-            if cur.rowcount == 0:
-                conn.execute("INSERT INTO sqlite_sequence (name, seq) VALUES ('jobs', ?)", (seq["seq"],))
-        conn.commit()
-    except BaseException:
-        conn.rollback()
-        raise
+    seq = conn.execute("SELECT seq FROM sqlite_sequence WHERE name = 'jobs'").fetchone()
+    conn.execute("DROP TABLE IF EXISTS jobs_new")
+    conn.execute(_JOBS_DDL.format(name="jobs_new"))
+    conn.execute(
+        """
+        INSERT INTO jobs_new (id, channel, status, position, raw_cmd, resolved_cmd, cwd,
+                              env_extra, pid, pgid, enqueued_at, started_at, finished_at,
+                              exit_code, log_path, note, timeout_secs, is_priority,
+                              max_retries, attempt, parent_id, origin)
+        SELECT id, channel, status, position, raw_cmd, resolved_cmd, cwd,
+               env_extra, pid, pgid, enqueued_at, started_at, finished_at,
+               exit_code, log_path, note, timeout_secs, is_priority,
+               max_retries, attempt, parent_id, origin
+        FROM jobs
+        """
+    )
+    conn.execute("DROP TABLE jobs")
+    conn.execute("ALTER TABLE jobs_new RENAME TO jobs")
+    if seq is not None:
+        # AUTOINCREMENT must never hand out an id that was used before (pruned
+        # history rows included): dependencies refer to jobs by id
+        cur = conn.execute("UPDATE sqlite_sequence SET seq = MAX(seq, ?) WHERE name = 'jobs'", (seq["seq"],))
+        if cur.rowcount == 0:
+            conn.execute("INSERT INTO sqlite_sequence (name, seq) VALUES ('jobs', ?)", (seq["seq"],))
 
 
 def _migrate_add_retry_delay(conn: sqlite3.Connection) -> None:
@@ -210,16 +225,69 @@ def _migrate_add_retry_delay(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE jobs ADD COLUMN retry_delay_secs INTEGER")
     if "retry_backoff" not in cols:
         conn.execute("ALTER TABLE jobs ADD COLUMN retry_backoff INTEGER NOT NULL DEFAULT 0")
-    conn.commit()
+
+
+# Numbered migrations, run in order, each in its own transaction that also bumps the
+# single-row `schema_version` table. To change the schema: append ONE new
+# (number, function) entry (never edit or reorder old ones) and, if a fresh DB needs the
+# change, put it in _SCHEMA / _JOBS_DDL too. A step must not commit (the runner does) and
+# must not use executescript (it commits). Steps 1-4 probe the table first because a DB from
+# before `schema_version` existed can be at any of those states.
+_MIGRATIONS: tuple[tuple[int, Callable[[sqlite3.Connection], None]], ...] = (
+    (1, _migrate_add_priority_lane),
+    (2, _migrate_add_retries),
+    (3, _migrate_add_deps_and_delay),
+    (4, _migrate_add_retry_delay),
+)
+SCHEMA_VERSION = _MIGRATIONS[-1][0]
+
+
+def get_schema_version(conn: sqlite3.Connection) -> int | None:
+    """The DB's schema version, or None when the table or its row does not exist yet."""
+    has = conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'").fetchone()
+    if has is None:
+        return None
+    row = conn.execute("SELECT version FROM schema_version WHERE id = 1").fetchone()
+    return None if row is None else int(row["version"])
+
+
+def _run_migration(conn: sqlite3.Connection, version: int, step: Callable[[sqlite3.Connection], None]) -> None:
+    conn.commit()  # never BEGIN on top of a half-open implicit transaction
+    conn.execute("BEGIN IMMEDIATE")  # the write lock: two processes cannot run the same step
+    try:
+        row = conn.execute("SELECT version FROM schema_version WHERE id = 1").fetchone()
+        if row is not None and row["version"] >= version:
+            conn.rollback()  # another process just did it
+            return
+        step(conn)
+        conn.execute("UPDATE schema_version SET version = ? WHERE id = 1", (version,))
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
 
 
 def init_db(conn: sqlite3.Connection) -> None:
-    conn.executescript(_SCHEMA)
+    """Create what is missing and bring an older DB up to SCHEMA_VERSION, without losing
+    data. A fresh DB is created at the latest version; a DB without a `schema_version`
+    row (made before it existed) counts as version 0 and runs every step. Safe to call
+    again and from several processes."""
     conn.commit()
-    _migrate_add_priority_lane(conn)
-    _migrate_add_retries(conn)
-    _migrate_add_deps_and_delay(conn)
-    _migrate_add_retry_delay(conn)
+    fresh = conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'jobs'").fetchone() is None
+    conn.executescript(_SCHEMA)
+    conn.execute("INSERT OR IGNORE INTO schema_version (id, version) VALUES (1, ?)", (SCHEMA_VERSION if fresh else 0,))
+    conn.commit()
+    current = get_schema_version(conn)
+    if current is None:  # cannot happen (inserted above); keeps mypy and a hand-edited DB honest
+        raise RuntimeError("schema_version row is missing")
+    if current > SCHEMA_VERSION:
+        raise RuntimeError(
+            f"the database is at schema version {current}, newer than this queuer supports "
+            f"({SCHEMA_VERSION}); upgrade queuer instead of using an old copy"
+        )
+    for version, step in _MIGRATIONS:
+        if version > current:
+            _run_migration(conn, version, step)
 
 
 def _now() -> str:

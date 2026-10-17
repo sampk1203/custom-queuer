@@ -1567,9 +1567,9 @@ class Daemon:
             channel=channel, holder_pid=pid,
         )
         if "dependencies" in changed:
-            verdict, dep_id = db.dep_verdict(self.conn, job_id)
-            if verdict in ("failed", "removed") and dep_id is not None:
-                self._skip_blocked(job_id, verdict, dep_id)  # a dependency already ended badly: it can never run
+            verdict, blocker = db.dep_verdict(self.conn, job_id)
+            if verdict in ("failed", "removed") and blocker is not None:
+                self._skip_blocked(job_id, verdict, blocker)  # a dependency already ended badly: it can never run
         self._wake_worker(job["channel"])
         if channel is not None:
             self._wake_worker(channel)

@@ -2,14 +2,15 @@
 # Installs / re-installs queuerd as a systemd --user service, or uninstalls it.
 # Safe to re-run any time (e.g. after moving the project or pulling updates).
 #
-#   ./install.sh              asks: Enter = install, 1 = uninstall
-#   ./install.sh install      skip the question
-#   ./install.sh uninstall    skip the question
+#   ./install.sh                         asks: Enter = install, 1 = uninstall
+#   ./install.sh install                 skip the question
+#   ./install.sh uninstall               skip the question
+#   ./install.sh install --skip-tests    install without running the test suite first
 #
 # Order of operations, and why: bootstrap uv -> sync venv -> run full test
-# suite -> install CLI + shell completion -> only then touch the running service. If the tests fail, the
-# script stops there and the previously-installed (working) daemon, if
-# any, is left running untouched.
+# suite (unless --skip-tests) -> install CLI + shell completion -> only then touch the
+# running service. If the tests fail, the script stops there and the previously-installed
+# (working) daemon, if any, is left running untouched.
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -28,7 +29,20 @@ ask() {  # ask "prompt" -> sets REPLY; empty when there is no terminal
     if [ -t 0 ]; then read -r -p "$1" REPLY || REPLY=""; fi
 }
 
-ACTION="${1:-}"
+ACTION=""
+SKIP_TESTS=no
+for arg in "$@"; do
+    case "$arg" in
+        install|uninstall) ACTION="$arg" ;;
+        --skip-tests) SKIP_TESTS=yes ;;
+        "") ;;
+        *)
+            echo "Usage: $0 [install|uninstall] [--skip-tests]" >&2
+            exit 2
+            ;;
+    esac
+done
+
 if [ -z "$ACTION" ]; then
     echo "What do you want to do?"
     echo "  [Enter]  install (or re-install)"
@@ -128,7 +142,7 @@ if [ "$ACTION" = "uninstall" ]; then
 fi
 
 if [ "$ACTION" != "install" ]; then
-    echo "Usage: $0 [install|uninstall]" >&2
+    echo "Usage: $0 [install|uninstall] [--skip-tests]" >&2
     exit 2
 fi
 
@@ -192,14 +206,18 @@ uv sync
 # 3. Run the full test suite -- installation stops here if anything fails
 # ---------------------------------------------------------------------------
 
-echo "==> Running test suite"
-if ! uv run pytest -v; then
-    echo "" >&2
-    echo "ERROR: tests failed. Install aborted -- the daemon has NOT been" >&2
-    echo "touched. Fix the failing tests, then re-run this script." >&2
-    exit 1
+if [ "$SKIP_TESTS" = yes ]; then
+    echo "==> Skipping the test suite (--skip-tests)"
+else
+    echo "==> Running test suite"
+    if ! uv run pytest -v; then
+        echo "" >&2
+        echo "ERROR: tests failed. Install aborted -- the daemon has NOT been" >&2
+        echo "touched. Fix the failing tests, then re-run this script (or --skip-tests to install anyway)." >&2
+        exit 1
+    fi
+    echo "==> All tests passed"
 fi
-echo "==> All tests passed"
 
 # ---------------------------------------------------------------------------
 # 3b. Install the CLI (queuer / qur / queuerd) onto PATH as real executables

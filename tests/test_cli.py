@@ -2362,3 +2362,228 @@ def test_show_displays_the_edit_lock(monkeypatch):
     monkeypatch.setattr(client, "send", lambda cmd, **kw: job)
     out = runner.invoke(app, ["show", "5"], env={"COLUMNS": "200"}).output
     assert "editing" in out and "4242" in out
+
+
+# ---------------------------------------------------------------------------
+# qur doctor / qur daemon (F32/U8, U9)
+# ---------------------------------------------------------------------------
+
+from queuer import selfcheck  # noqa: E402
+
+
+def _checks(*pairs):
+    return [selfcheck.Check(name, status, detail, hint) for name, status, detail, hint in pairs]
+
+
+def test_doctor_prints_status_detail_and_fix_hint(monkeypatch):
+    monkeypatch.setattr(selfcheck, "run_checks", lambda fix=False: _checks(
+        ("daemon", "OK", "answers on /run/q.sock", ""),
+        ("linger", "WARN", "not enabled", "loginctl enable-linger $USER"),
+    ))
+    res = runner.invoke(app, ["doctor"], env={"COLUMNS": "200"})
+    assert res.exit_code == 0  # warnings do not fail
+    assert "OK" in res.output and "WARN" in res.output
+    assert "answers on /run/q.sock" in res.output
+    assert "fix: loginctl enable-linger $USER" in res.output
+    assert "1 ok, 1 warning(s), 0 failure(s)" in res.output
+
+
+def test_doctor_exits_1_on_a_failure(monkeypatch):
+    monkeypatch.setattr(selfcheck, "run_checks", lambda fix=False: _checks(
+        ("daemon", "FAIL", "queuerd is not running", "qur daemon start"),
+    ))
+    res = runner.invoke(app, ["doctor"], env={"COLUMNS": "200"})
+    assert res.exit_code == 1
+    assert "FAIL" in res.output and "qur daemon start" in res.output
+
+
+def test_doctor_does_not_treat_brackets_in_paths_as_markup(monkeypatch):
+    monkeypatch.setattr(selfcheck, "run_checks", lambda fix=False: _checks(
+        ("db file", "OK", "/data/[red]x[/red]/queuer.db mode 600", ""),
+    ))
+    res = runner.invoke(app, ["doctor"], env={"COLUMNS": "200"})
+    assert "[red]x[/red]" in res.output
+
+
+def test_doctor_json(monkeypatch):
+    monkeypatch.setattr(selfcheck, "run_checks", lambda fix=False: _checks(
+        ("daemon", "FAIL", "down", "qur daemon start"),
+        ("linger", "OK", "enabled", ""),
+    ))
+    res = runner.invoke(app, ["doctor", "--json"])
+    assert res.exit_code == 1  # still reflects the failure
+    data = json.loads(res.output)
+    assert data["ok"] is False
+    assert data["summary"] == {"OK": 1, "WARN": 0, "FAIL": 1}
+    assert data["checks"][0] == {"name": "daemon", "status": "FAIL", "detail": "down", "hint": "qur daemon start", "fixed": False}
+
+
+def test_doctor_json_ok_when_nothing_fails(monkeypatch):
+    monkeypatch.setattr(selfcheck, "run_checks", lambda fix=False: _checks(("a", "OK", "fine", "")))
+    res = runner.invoke(app, ["doctor", "--json"])
+    assert res.exit_code == 0 and json.loads(res.output)["ok"] is True
+
+
+def test_doctor_fix_flag_is_passed_on(monkeypatch):
+    seen = []
+    monkeypatch.setattr(selfcheck, "run_checks", lambda fix=False: seen.append(fix) or _checks(("a", "OK", "x", "")))
+    runner.invoke(app, ["doctor"])
+    runner.invoke(app, ["doctor", "--fix"])
+    assert seen == [False, True]
+
+
+class _Svc:
+    """Records the argv `qur daemon ...` would run, returns a canned exit code, and fakes the
+    daemon's `status` reply (running jobs) for the stop/restart warning."""
+
+    def __init__(self, monkeypatch, code=0, running=(), daemon_up=True):
+        self.argvs = []
+        self.code = code
+        self.running = running
+        self.daemon_up = daemon_up
+        monkeypatch.setattr(cli_mod, "_run_service_tool", self._run)
+        monkeypatch.setattr(client, "send", self._send)
+
+    def _run(self, argv):
+        self.argvs.append(argv)
+        return self.code
+
+    def _send(self, cmd, **kw):
+        assert cmd == "status"
+        if not self.daemon_up:
+            raise client.DaemonNotRunning("queuerd is not running")
+        chans = {str(i): {"running": {"id": jid}, "frozen": None} for i, jid in enumerate(self.running, start=1)}
+        return {"channels": chans}
+
+
+def test_daemon_start_runs_systemctl_start(monkeypatch):
+    svc = _Svc(monkeypatch)
+    res = runner.invoke(app, ["daemon", "start"])
+    assert res.exit_code == 0 and "started" in res.output
+    assert svc.argvs == [["systemctl", "--user", "start", "queuerd"]]
+
+
+def test_daemon_start_failure_passes_the_exit_code_on(monkeypatch):
+    svc = _Svc(monkeypatch, code=5)
+    res = runner.invoke(app, ["daemon", "start"])
+    assert res.exit_code == 5
+    assert "qur daemon logs" in res.output
+    assert len(svc.argvs) == 1
+
+
+def test_daemon_stop_without_running_jobs_does_not_ask(monkeypatch):
+    svc = _Svc(monkeypatch)
+    res = runner.invoke(app, ["daemon", "stop"])
+    assert res.exit_code == 0 and "stopped" in res.output
+    assert svc.argvs == [["systemctl", "--user", "stop", "queuerd"]]
+
+
+def test_daemon_stop_with_unreachable_daemon_does_not_ask(monkeypatch):
+    svc = _Svc(monkeypatch, daemon_up=False)
+    res = runner.invoke(app, ["daemon", "stop"])
+    assert res.exit_code == 0
+    assert svc.argvs == [["systemctl", "--user", "stop", "queuerd"]]
+
+
+@pytest.mark.parametrize("verb", ["stop", "restart"])
+def test_daemon_stop_and_restart_warn_and_abort_on_no(monkeypatch, verb):
+    svc = _Svc(monkeypatch, running=(7, 9))
+    res = runner.invoke(app, ["daemon", verb], input="n\n", env={"COLUMNS": "200"})
+    assert res.exit_code == 1
+    assert "#7" in res.output and "#9" in res.output and "interrupted" in res.output
+    assert svc.argvs == []
+
+
+@pytest.mark.parametrize("verb", ["stop", "restart"])
+def test_daemon_stop_and_restart_proceed_on_yes_answer(monkeypatch, verb):
+    svc = _Svc(monkeypatch, running=(7,))
+    res = runner.invoke(app, ["daemon", verb], input="y\n")
+    assert res.exit_code == 0
+    assert svc.argvs == [["systemctl", "--user", verb, "queuerd"]]
+
+
+@pytest.mark.parametrize("flag", ["--yes", "-y"])
+def test_daemon_yes_skips_the_question(monkeypatch, flag):
+    svc = _Svc(monkeypatch, running=(7,))
+    res = runner.invoke(app, ["daemon", "restart", flag])
+    assert res.exit_code == 0 and "interrupted" not in res.output
+    assert svc.argvs == [["systemctl", "--user", "restart", "queuerd"]]
+
+
+def test_daemon_stop_counts_a_frozen_job_too(monkeypatch):
+    svc = _Svc(monkeypatch)
+
+    def send(cmd, **kw):
+        return {"channels": {"1": {"running": None, "frozen": {"id": 12}}}}
+
+    monkeypatch.setattr(client, "send", send)
+    res = runner.invoke(app, ["daemon", "stop"], input="n\n")
+    assert res.exit_code == 1 and "#12" in res.output
+    assert svc.argvs == []
+
+
+def test_daemon_status_mirrors_systemctls_exit_code(monkeypatch):
+    svc = _Svc(monkeypatch, code=3)
+    res = runner.invoke(app, ["daemon", "status"])
+    assert res.exit_code == 3
+    assert svc.argvs == [["systemctl", "--user", "status", "queuerd", "--no-pager"]]
+
+
+def test_daemon_logs_argv(monkeypatch):
+    svc = _Svc(monkeypatch)
+    assert runner.invoke(app, ["daemon", "logs"]).exit_code == 0
+    assert runner.invoke(app, ["daemon", "logs", "-n", "20", "--follow"]).exit_code == 0
+    assert svc.argvs == [
+        ["journalctl", "--user", "-u", "queuerd", "-n", "50", "--no-pager"],
+        ["journalctl", "--user", "-u", "queuerd", "-n", "20", "--no-pager", "-f"],
+    ]
+
+
+def test_daemon_logs_rejects_a_bad_line_count(monkeypatch):
+    svc = _Svc(monkeypatch)
+    res = runner.invoke(app, ["daemon", "logs", "-n", "0"])
+    assert res.exit_code != 0 and svc.argvs == []
+
+
+def test_daemon_without_a_subcommand_shows_help(monkeypatch):
+    _Svc(monkeypatch)
+    res = runner.invoke(app, ["daemon"])
+    for word in ("start", "stop", "restart", "status", "logs"):
+        assert word in res.output
+
+
+def test_help_all_includes_daemon_and_doctor():
+    res = runner.invoke(app, ["--help-all"], env={"COLUMNS": "200"})
+    assert res.exit_code == 0
+    assert "doctor" in res.output and "daemon" in res.output
+
+
+def test_run_service_tool_runs_the_fixed_argv_without_a_shell(monkeypatch):
+    seen = {}
+
+    def fake(argv, **kw):
+        seen.update(argv=argv, kw=kw)
+        return types.SimpleNamespace(returncode=4)
+
+    monkeypatch.setattr(cli_mod.subprocess, "run", fake)
+    assert cli_mod._run_service_tool(["systemctl", "--user", "start", "queuerd"]) == 4
+    assert seen["argv"] == ["systemctl", "--user", "start", "queuerd"]
+    assert not seen["kw"].get("shell")
+
+
+def test_run_service_tool_missing_program_is_a_clean_error(monkeypatch):
+    def fake(argv, **kw):
+        raise FileNotFoundError(argv[0])
+
+    monkeypatch.setattr(cli_mod.subprocess, "run", fake)
+    res = runner.invoke(app, ["daemon", "start"])
+    assert res.exit_code == 1
+    assert "systemctl not found" in res.output
+
+
+def test_run_service_tool_ctrl_c_while_following_exits_130(monkeypatch):
+    def fake(argv, **kw):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli_mod.subprocess, "run", fake)
+    assert cli_mod._run_service_tool(["journalctl", "--user", "-f"]) == 130

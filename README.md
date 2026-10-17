@@ -39,6 +39,9 @@ per archive).
 
 Running `./install.sh` asks what to do: **Enter** installs (or re-installs), **1**
 uninstalls. `./install.sh install` / `./install.sh uninstall` skip the question.
+`./install.sh install --skip-tests` skips the test suite (about 50 s) and goes straight to
+installing; without the flag nothing changes: a failing test still stops the install before
+the running daemon is touched.
 
 **Uninstall** lists what it will remove and asks to proceed (default no), then asks
 separately whether to delete the job logs and whether to disable linger (both
@@ -54,7 +57,8 @@ for that.
 
 To confirm it worked:
 ```bash
-systemctl --user status queuerd
+qur doctor
+qur daemon status
 qur status
 ```
 
@@ -78,6 +82,8 @@ queuer requeue ID
 queuer edit ID [--cmd CMD | -- <cmd...>] [--cwd DIR] [--timeout SECONDS] [--channel N] [--retries N] [--on-fail pause|continue] [--delay DURATION | --at TIME | --clear-delay] [--depends-on IDS] [--after-any IDS] [--clear-deps] [--env KEY[=VAL]]...
 queuer pause [--channel N]
 queuer resume [--channel N]
+queuer doctor [--fix] [--json]
+queuer daemon start | stop [--yes] | restart [--yes] | status | logs [-n N] [-f]
 queuer logs ID [--tail]
 queuer clean-logs [--days N] [--dry-run]
 queuer connect [--export | --import STRING | --from [USER@]HOST | --add-bot | --off] [--id NAME] [--listen | --no-listen] [--list] [--remove-chat CHAT_ID] [--remove-bot [--all]] [--bot ID_OR_@NAME]
@@ -399,6 +405,55 @@ channels are not affected.
 any) keeps running to completion. State persists across daemon
 restarts, so a paused queue doesn't silently resume after a crash.
 
+### `doctor [--fix] [--json]`
+
+Checks that queuer is set up and locked down, prints one line per check (`OK` / `WARN` /
+`FAIL`) and, under every problem, a `fix:` hint. Exit code 1 if any check FAILs (warnings do
+not fail it), so it also works in scripts.
+
+| Check | OK when | Otherwise |
+|---|---|---|
+| `daemon` | `queuerd` answers on the socket | FAIL |
+| `socket` / `socket dir` | a socket you own, mode 0600 (and the private `/tmp/queuer-<uid>` fallback folder 0700) | loose mode or foreign owner FAIL; missing WARN |
+| `config dir`, `notify.json`, `redact.json` | files 0600, folder 0700, real files you own, no symlinks | loose file FAIL, loose folder WARN, symlink/foreign owner FAIL |
+| `db dir`, `db file`, `db wal/shm` | database and its `-wal`/`-shm` files 0600, folder 0700 | same rules |
+| `schema` | database at this queuer's schema version (read only, never migrates) | older WARN (the daemon upgrades it on start), newer FAIL |
+| `log dir`, `log writable`, `disk space` | log folder private and writable, at least 1 GB free where the logs go | under 1 GB WARN, under 100 MB FAIL, not writable FAIL |
+| `linger` | `loginctl` linger is on (the daemon survives logout) | WARN |
+| `unit file`, `service` | `~/.config/systemd/user/queuerd.service` exists and `systemctl --user is-active queuerd` says active | WARN |
+| `telegram ...` | only if configured: one `getMe` per bot accepts the token | rejected token (401/404) FAIL; offline or other API error WARN; not configured is OK |
+
+`--fix` repairs **permission problems only**: it chmods files and folders you own to 0600/0700.
+It never starts services, edits the unit, deletes or moves anything, follows a symlink, or
+touches the database contents. A folder you moved with `QUEUER_DB_PATH` / `QUEUER_LOG_DIR` /
+`QUEUER_NOTIFY_PATH` is reported but never chmod'ed (it may be `$HOME`; the same rule the daemon
+uses). A symlink or a path owned by someone else is only reported. `--json` prints
+`{"ok", "summary", "checks": [{"name", "status", "detail", "hint", "fixed"}]}`.
+
+```bash
+qur doctor
+qur doctor --fix
+qur doctor --json | jq '.checks[] | select(.status != "OK")'
+```
+
+### `daemon start|stop|restart|status|logs`
+
+Thin wrappers over `systemctl --user` and `journalctl --user -u queuerd` (fixed argument lists,
+no shell), so you do not have to remember them:
+
+| Command | Runs |
+|---|---|
+| `qur daemon start` | `systemctl --user start queuerd` |
+| `qur daemon stop [--yes]` | `systemctl --user stop queuerd` |
+| `qur daemon restart [--yes]` | `systemctl --user restart queuerd` |
+| `qur daemon status` | `systemctl --user status queuerd --no-pager` (exit code is systemctl's; 3 = not running) |
+| `qur daemon logs [-n N] [-f]` | `journalctl --user -u queuerd -n N --no-pager [-f]` (default 50 lines; `-f` follows, Ctrl-C stops) |
+
+`stop` and `restart` first ask the daemon whether a job is running (or frozen by `--now`). If so
+they say which and that it will be recorded as `interrupted` (not failed, not retried), and ask
+`Continue? [y/N]`; `--yes` / `-y` skips the question. A daemon that cannot be reached is not asked about.
+These need systemd; on a machine without `systemctl` they say so and exit 1.
+
 ### `connect`
 
 Telegram messages when a job finishes, from every machine running qur, into
@@ -419,18 +474,56 @@ several machines you can see exactly which one a message came from. A job with
 `--retries` stays silent while retries remain; you get one message for its
 final outcome, marked `attempt 3/3`. Messages show the command as you typed it
 (one line, capped at 1000 characters) but never the working directory, resolved
-paths or raw error text — use `qur show ID` on that machine for those.
+paths or raw error text — use `qur show ID` on that machine for those. Secrets in the
+command are masked as `***` first (see [Secret redaction](#secret-redaction-telegram-only)).
 
 **Details button.** Replies with everything `qur show ID` prints (raw and
 resolved command, cwd, timestamps, duration, exit code, timeout, origin, environment, pid, log
 path, note), laid out for Telegram: bold labels, monospace commands and paths.
 This is the one place paths leave the machine, and only to your paired chats, on
-request. `qur show` itself is unchanged.
+request. `qur show` itself is unchanged. Secrets are masked as `***` here too.
 
 **Logs button.** Replies with the last ~20 lines of the job's output (colour codes
-stripped). Whatever the job printed, secrets included, then goes through Telegram, to
-your paired chats only and only when you press it. Don't press it for jobs that print
-secrets.
+stripped), to your paired chats only and only when you press it. Known secret shapes are
+masked as `***` first, but a log can hold things no pattern can recognise: don't press it
+for jobs that print secrets.
+
+#### Secret redaction (Telegram only)
+
+Everything sent to Telegram (finished-job message, Details, the Logs tail, and the list and
+status text) is masked first. `qur show`, `qur logs` and `qur list` on the machine are NOT
+redacted: you see your own data. What is masked (replaced by `***`):
+
+- `NAME=VALUE` when NAME ends in key/token/secret/password/passwd/passphrase (`API_KEY=`,
+  `GITHUB_TOKEN=`, `db.password=`, also inside URLs: `?access_token=...`), or has a
+  `secret`/`password` part (`SECRET_KEY_BASE=`). Names that only *contain* the word are left
+  alone, so `--tokenizer=gpt2`, `max_tokens=100` and `token_count=5` stay readable.
+- `--password=VAL`, `--password VAL`, `--api-key VAL`, `--access-token VAL` (same name rule;
+  `--key-file PATH` is not touched).
+- `Authorization: Bearer ...` (also Basic/Token) and a bare `Bearer <long token>`.
+- AWS access key ids (`AKIA...`), GitHub tokens (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`,
+  `github_pat_`), Telegram bot tokens (`123456789:AAH...`).
+- The password in `scheme://user:pass@host`.
+
+Your own patterns go in `~/.config/queuer/redact.json` (or the path in `QUEUER_REDACT_PATH`;
+`redact.json` sits next to `notify.json` if you moved that one): a JSON list of regexes,
+for example
+
+```json
+["hunter\\d", "internal-host-\\w+", "my-project-(\\w+)-secret"]
+```
+
+A match is replaced by `***`; if the regex has a group, only the first group is replaced
+(the third example keeps `my-project-` and `-secret`). The file must be yours and not
+writable by others; a loose read mode is tightened to 0600, a symlink or someone else's
+file is ignored. A pattern that is not a valid regex, or that matches the empty string, is
+skipped and the daemon logs one line to the journal (never the pattern itself); it can never
+stop the daemon. Changes are picked up without a restart.
+
+This is pattern matching, not a guarantee. A secret in a plain argument (`mysql -pSECRET`,
+`sshpass -p SECRET`) or printed without a label is not recognised. **Pass secrets through the
+environment or a file, not through command arguments** (`--env` values are stored in the job
+row, so a file is better still; see Environment above).
 
 **Requeue button.** Pressing it re-runs the finished job exactly like
 `qur requeue ID` (same command, cwd, timeout, retries and retry delay; end of its channel's
@@ -541,11 +634,16 @@ is capped at 50MB; once hit, further output is dropped and a single
 ## Managing the daemon
 
 ```bash
-systemctl --user status queuerd          # is it running
-systemctl --user restart queuerd         # restart it
-systemctl --user stop queuerd            # stop it (queue state is preserved)
-journalctl --user -u queuerd -f          # daemon's own logs (not job logs)
+qur daemon status                        # is it running (systemctl --user status queuerd)
+qur daemon restart                       # restart it; asks first if a job is running
+qur daemon stop                          # stop it (queue state is preserved)
+qur daemon logs -f                       # daemon's own logs (not job logs)
+qur doctor                               # check the whole setup
 ```
+
+These wrap `systemctl --user` / `journalctl --user -u queuerd`, which still work directly
+(`systemctl --user restart queuerd`, `journalctl --user -u queuerd -f`). See `doctor` and
+`daemon` in the command reference.
 
 Job output goes to `~/.local/state/queuer/logs/<id>.log` (via `queuer
 logs`), separate from the daemon's own stderr/stdout, which systemd
@@ -581,7 +679,10 @@ from outside (e.g. a ping from another machine).
 
 Queued jobs and the finished-job history (last 200 per channel, see `history`) persist in SQLite at
 `~/.local/state/queuer/queuer.db` and survive daemon restarts and
-reboots without any special handling.
+reboots without any special handling. The database runs in SQLite WAL mode (so `clean-logs` and
+the daemon can use it at the same time; you will see `queuer.db-wal` and `-shm` next to it, also 0600)
+and carries a `schema_version`: an older database is upgraded automatically, in transactions,
+the first time the daemon (or `clean-logs`) opens it. A database written by a newer queuer is refused.
 
 ## File locations
 
@@ -591,10 +692,11 @@ reboots without any special handling.
 | Job logs | `~/.local/state/queuer/logs/<id>.log` |
 | Socket | `$XDG_RUNTIME_DIR/queuer.sock`, or `/tmp/queuer-<uid>/queuer.sock` (private dir) if that is unset |
 | Notification config (bot token, chats, this qur's id) | `~/.config/queuer/notify.json` (0600) |
+| Extra Telegram redaction patterns (optional, JSON list of regexes) | `~/.config/queuer/redact.json` (0600) |
 | systemd unit | `~/.config/systemd/user/queuerd.service` |
 
 The database, log, socket and notification paths can be overridden with `QUEUER_DB_PATH`,
-`QUEUER_LOG_DIR`, `QUEUER_SOCKET_PATH`, and `QUEUER_NOTIFY_PATH` env vars (and `QUEUER_KEEP`, the
+`QUEUER_LOG_DIR`, `QUEUER_SOCKET_PATH`, `QUEUER_NOTIFY_PATH` and `QUEUER_REDACT_PATH` env vars (and `QUEUER_KEEP`, the
 number of finished jobs kept per channel, default 200) — mainly useful for
 running the daemon against a scratch location during manual testing,
 without touching real state.
@@ -625,6 +727,9 @@ boundary. What is enforced:
   `QUEUER_DB_PATH` / `QUEUER_LOG_DIR` is never chmod'ed (it could be `$HOME`); the files in
   it are still 0600 and the daemon prints a warning in the journal if the folder is open to
   other users. Job logs hold whatever your jobs print and the database holds your commands.
+- **Accepted risk: your own processes.** Any process running as your user can queue commands
+  through the socket (and read your 0600 files). There is no client auth token by design;
+  the daemon only keeps other users out.
 - **Bad requests.** A request that isn't valid JSON, isn't UTF-8, or is longer than 64 KB
   gets `invalid request` and the daemon carries on (it used to log a traceback and
   send no reply). `add` rejects wrongly typed fields (timeout, channel, argv, cwd,
@@ -648,15 +753,20 @@ boundary. What is enforced:
   `notify.json` and its folder (regular file, yours, no group/other access): a loose
   mode is tightened to 600/700 and logged, a symlink or someone else's file is logged as
   a warning. `qur connect --list` prints the same warning. Anything running as **you**
-  can still read the file (like `~/.ssh` keys).
+  can still read the file (like `~/.ssh` keys). The token stays in that plain 0600 file by
+  design (no keyring or encrypted store).
 - **Telegram buttons.** The update offset is saved in the database, so a press that was
   already handled is not replayed after a restart, and a repeated press of the same
   button (double tap) is handled once. A press on a message Telegram no longer shows
   gets an answer ("message too old") instead of a spinner.
 - **Telegram.** Only chats paired with a bot can press its buttons, and pairing needs your
   own random code. Finished-job messages include the command as typed (up to 1000
-  characters; Details up to 1200 per command), and the **Logs** button sends output (see above). Don't put secrets in
-  command arguments, and don't press Logs for jobs that print them.
+  characters; Details up to 1200 per command), and the **Logs** button sends output (see above).
+  Known secret shapes (`KEY=...`, `--password ...`, bearer tokens, cloud keys, `user:pass@`
+  URLs, plus your own `redact.json` patterns) are masked as `***` before anything is sent, and
+  only there: local `qur show` / `qur logs` are unchanged. It is pattern matching: pass secrets
+  through the environment or a file, not as arguments, and don't press Logs for jobs that
+  print them.
 - **Errors you may see.** `permission denied on <socket>` means the socket isn't yours
   with mode 0600 (is `queuerd` running as another user?). `stale socket` means the
   file exists but nothing answers: `systemctl --user restart queuerd`. The CLI gives up
@@ -693,6 +803,9 @@ For a design/architecture writeup and the phase-by-phase build plan, see
 - Serial within a channel — one job at a time per channel (channels run in parallel). To run
   jobs in parallel, use several channels.
 - A job waiting on a dependency blocks the jobs behind it on its channel (strict FIFO).
+- A job ends only when its whole process tree has ended: a command that backgrounds a child
+  (`cmd &`) keeps its channel busy until that child exits too. `qur cancel` kills the whole
+  group.
 - Retries are opt-in per job (`--retries`), immediate unless `--retry-delay` is set, and go to the end of the queue.
 - Notifications are Telegram-only, best-effort (a send that fails is dropped,
   not retried), and visible to Telegram. Pair one machine at a time (see

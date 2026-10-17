@@ -24,7 +24,7 @@ from rich.markup import escape
 from rich.table import Table
 from typer.core import TyperCommand
 
-from queuer import client, db, jobenv, notify
+from queuer import client, db, jobenv, notify, selfcheck
 from queuer.daemon import _default_db_path, _default_log_dir
 from queuer.db import DEFAULT_CHANNEL
 from queuer.pathresolve import SHELL_INTERPRETERS
@@ -2301,6 +2301,150 @@ def clean_logs(
         console.print(f"  {f}")
         if not dry_run:
             f.unlink()
+
+
+# ---------------------------------------------------------------------------
+# doctor
+# ---------------------------------------------------------------------------
+
+_DOCTOR_STYLES = {selfcheck.OK: "green", selfcheck.WARN: "yellow", selfcheck.FAIL: "bold red"}
+
+
+@app.command()
+def doctor(
+    fix: bool = typer.Option(False, "--fix", help="Repair permission problems only (loose modes on files/folders you own); nothing else is changed"),
+    as_json: bool = typer.Option(False, "--json", help="Print the results as JSON"),
+) -> None:
+    """Check that queuer is set up and locked down properly.
+
+    Checks: daemon reachable, socket mode and owner, config folder/file modes
+    (notify.json 0600, folders 0700, no symlinks), database mode, log folder writable
+    and free disk space, systemd linger, unit file and service state, Telegram token
+    (one getMe call, only if configured; offline is a warning), and the database
+    schema version. Every problem comes with a fix hint.
+
+    Exit code 1 if any check FAILs (warnings do not fail), so it works in scripts.
+
+    \b
+    Examples:
+      qur doctor
+      qur doctor --fix
+      qur doctor --json
+    """
+    checks = selfcheck.run_checks(fix=fix)
+    code = selfcheck.exit_code(checks)
+    counts = selfcheck.summary(checks)
+    if as_json:
+        _print_json({"ok": code == 0, "summary": counts, "checks": [c.as_dict() for c in checks]})
+        raise typer.Exit(code=code)
+    width = max(len(c.name) for c in checks)
+    for c in checks:
+        style = _DOCTOR_STYLES[c.status]
+        console.print(f"[{style}]{c.status:<4}[/{style}]  {escape(c.name):<{width}}  {escape(c.detail)}", highlight=False)
+        if c.hint:
+            console.print(f"      {'':<{width}}  [dim]fix: {escape(c.hint)}[/dim]", highlight=False)
+    console.print(f"\n{counts[selfcheck.OK]} ok, {counts[selfcheck.WARN]} warning(s), {counts[selfcheck.FAIL]} failure(s)")
+    raise typer.Exit(code=code)
+
+
+# ---------------------------------------------------------------------------
+# daemon (thin wrappers over systemctl / journalctl)
+# ---------------------------------------------------------------------------
+
+daemon_app = typer.Typer(
+    help="Start, stop and inspect the queuerd service (thin wrappers over `systemctl --user` and `journalctl --user`).",
+    no_args_is_help=True,
+)
+app.add_typer(daemon_app, name="daemon")
+
+
+def _run_service_tool(argv: list[str]) -> int:
+    """Run systemctl/journalctl with a fixed argv on the terminal; return its exit code."""
+    try:
+        # fixed argv built from constants and one validated integer, no shell
+        return subprocess.run(argv, check=False).returncode  # nosec B603 B607
+    except FileNotFoundError:
+        _fail(f"{argv[0]} not found; these commands need systemd")
+    except KeyboardInterrupt:  # Ctrl-C while following the logs
+        return 130
+
+
+def _running_job_ids() -> list[int]:
+    """Ids of jobs the daemon is running (or has frozen); empty if it cannot be asked."""
+    try:
+        data = client.send("status")
+    except (client.DaemonNotRunning, client.DaemonError):
+        return []
+    ids: list[int] = []
+    for chan in data.get("channels", {}).values():
+        for key in ("running", "frozen"):
+            job = chan.get(key)
+            if job:
+                ids.append(int(job["id"]))
+    return sorted(ids)
+
+
+def _confirm_stop(verb: str, yes: bool) -> None:
+    ids = _running_job_ids()
+    if not ids or yes:
+        return
+    jobs = ", ".join(f"#{i}" for i in ids)
+    console.print(
+        f"[yellow]{len(ids)} job(s) running ({jobs}).[/yellow] A {verb} kills them; they are recorded "
+        "as [magenta]interrupted[/magenta] (not failed, not retried) and the queue continues afterwards."
+    )
+    if not typer.confirm("Continue?", default=False):
+        raise typer.Exit(code=1)
+
+
+def _service_action(action: str, done: str) -> None:
+    code = _run_service_tool(["systemctl", "--user", action, selfcheck.UNIT_NAME])
+    if code != 0:
+        typer.echo(f"Error: systemctl {action} failed (exit {code}); see: qur daemon logs", err=True)
+        raise typer.Exit(code=code)
+    console.print(f"[green]{done}[/green]")
+
+
+@daemon_app.command("start")
+def daemon_start() -> None:
+    """Start the queuerd service (`systemctl --user start queuerd`)."""
+    _service_action("start", "queuerd started")
+
+
+@daemon_app.command("stop")
+def daemon_stop(
+    yes: bool = typer.Option(False, "--yes", "-y", help="Do not ask when a job is running"),
+) -> None:
+    """Stop the queuerd service. Queued jobs stay queued; a running job is killed and recorded as interrupted."""
+    _confirm_stop("stop", yes)
+    _service_action("stop", "queuerd stopped")
+
+
+@daemon_app.command("restart")
+def daemon_restart(
+    yes: bool = typer.Option(False, "--yes", "-y", help="Do not ask when a job is running"),
+) -> None:
+    """Restart the queuerd service. A running job is killed and recorded as interrupted; the queue then continues."""
+    _confirm_stop("restart", yes)
+    _service_action("restart", "queuerd restarted")
+
+
+@daemon_app.command("status")
+def daemon_status() -> None:
+    """Show the service state (`systemctl --user status queuerd`). Exit code is systemctl's (3 = not running)."""
+    raise typer.Exit(code=_run_service_tool(["systemctl", "--user", "status", selfcheck.UNIT_NAME, "--no-pager"]))
+
+
+@daemon_app.command("logs")
+def daemon_logs(
+    lines: int = typer.Option(50, "--lines", "-n", min=1, help="How many of the latest lines to show"),
+    follow: bool = typer.Option(False, "--follow", "-f", help="Keep following new lines (Ctrl-C to stop)"),
+) -> None:
+    """Show the daemon's own log (`journalctl --user -u queuerd`), not a job's output (that is `qur logs ID`)."""
+    argv = ["journalctl", "--user", "-u", selfcheck.UNIT_NAME, "-n", str(lines), "--no-pager"]
+    if follow:
+        argv.append("-f")
+    raise typer.Exit(code=_run_service_tool(argv))
 
 
 if __name__ == "__main__":

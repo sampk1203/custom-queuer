@@ -880,3 +880,97 @@ def test_format_details_shows_the_retry_delay_only_when_set():
     t = notify.format_details(_job(**base, retry_delay_secs=90, retry_backoff=0), CFG)
     assert "1m30s" in t and "doubling" not in t
     assert "retry delay" not in notify.format_details(_job(**base), CFG)
+
+
+# ---------------------------------------------------------------------------
+# secret redaction (F31/S4/S5): only Telegram text is masked
+# ---------------------------------------------------------------------------
+
+def test_finished_message_masks_secrets_in_the_command(monkeypatch):
+    monkeypatch.setattr(notify.socket, "gethostname", lambda: "bigbox")
+    argv = ["run", "--password", "hunter2", "--api-key=abc", "DB_TOKEN=xyz", "https://u:pw@h/x"]
+    t = notify.format_job(_job(raw_cmd=json.dumps(argv)), CFG)
+    assert "$ run --password *** --api-key=*** DB_TOKEN=*** https://u:***@h/x" in t
+    for secret in ("hunter2", "abc", "xyz", ":pw@"):
+        assert secret not in t
+
+
+def test_normal_commands_are_not_changed_by_redaction(monkeypatch):
+    monkeypatch.setattr(notify.socket, "gethostname", lambda: "bigbox")
+    argv = ["python", "train.py", "--tokenizer=gpt2", "--max_tokens", "100", "--seed=3"]
+    assert "$ python train.py --tokenizer=gpt2 --max_tokens 100 --seed=3\n" in notify.format_job(_job(raw_cmd=json.dumps(argv)), CFG)
+
+
+def test_details_mask_both_commands_env_and_note():
+    argv = ["run", "--token", "tok-123", "API_KEY=key-456"]
+    extra = {"GH": "ghp_" + "a" * 36, "MY_PW": "pw-789"}  # a secret by shape, and a plain name holding one
+    job = _job(raw_cmd=json.dumps(argv), resolved_cmd=json.dumps(["/bin/run", *argv[1:]]), env_extra=json.dumps(extra),
+               status="failed", note="failed to start: DB_PASSWORD=note-000", cwd="/work")
+    t = notify.format_details(job, CFG)
+    for secret in ("tok-123", "key-456", "ghp_", "note-000"):
+        assert secret not in t
+    assert t.count("--token ***") == 2 and t.count("API_KEY=***") == 2
+    assert "GH=***" in t and "DB_PASSWORD=***" in t
+    assert "MY_PW=pw-789" in t  # a name that does not look secret and a value with no secret shape: shown as before
+    assert "<code>/work</code>" in t
+
+
+def test_details_environment_keeps_its_separators():
+    t = notify.format_details(_job(env_extra=json.dumps({"API_TOKEN": "s", "B": "2"})), CFG)
+    assert "<code>API_TOKEN=***, B=2</code>" in t
+
+
+def test_log_tail_is_masked_and_normal_lines_are_kept():
+    job = {"id": 3, "status": "done"}
+    tail = "start\nstep 10 loss=0.5 tokens/s=1200\nTOKEN=abc123\nAuthorization: Bearer xyz\nghp_" + "a" * 36 + "\nok"
+    t = notify.format_log(job, tail, CFG)
+    for secret in ("abc123", "xyz", "ghp_"):
+        assert secret not in t
+    assert "TOKEN=***" in t and "Authorization: Bearer ***" in t
+    assert "start" in t and "step 10 loss=0.5 tokens/s=1200" in t and t.rstrip().endswith("ok</pre>")
+
+
+def test_log_tail_masking_cannot_overflow_the_message():
+    job = {"id": 3, "status": "done"}
+    assert len(notify.format_log(job, "\n".join("API_KEY=" + "x" * 200 for _ in range(100)), CFG)) <= notify.TG_MAX_CHARS
+
+
+def test_list_and_status_mask_secrets():
+    secret = "s3cr3t-value"
+    queued = _list_job(1, ["train", "--token", secret])
+    running = _list_job(2, ["x", f"API_KEY={secret}"])
+    done = _list_job(3, ["curl", f"https://u:{secret}@h/x"])
+    data = {"channels": {1: {"running": running, "frozen": None, "paused": False, "priority_queue": [],
+                             "queue": [queued], "backlog": [done]}}}
+    text = notify.format_list(data, CFG, 1) + notify.format_status(data, CFG) + notify._short_cmd(queued)
+    assert secret not in text
+    assert "train --token ***" in text and "API_KEY=***" in text and "https://u:***@h/x" in text
+
+
+def test_user_patterns_apply_to_telegram_text(tmp_path, monkeypatch):
+    p = tmp_path / "my-redact.json"
+    p.write_text(json.dumps([r"project-x\d"]))
+    os.chmod(p, 0o600)
+    monkeypatch.setenv("QUEUER_REDACT_PATH", str(p))
+    t = notify.format_job(_job(raw_cmd=json.dumps(["run", "project-x1"])), CFG)
+    assert "$ run ***" in t and "project-x1" not in t
+    assert "project-x1" not in notify.format_log({"id": 1, "status": "done"}, "using project-x1 now", CFG)
+
+
+def test_a_broken_user_patterns_file_does_not_break_messages(tmp_path, monkeypatch, capsys):
+    from queuer import redact
+
+    monkeypatch.setattr(redact, "_warned", set())  # the warning is printed once per process
+    monkeypatch.setattr(redact, "_extra_cache", None)
+    p = tmp_path / "my-redact.json"
+    p.write_text('["(broken"]')
+    os.chmod(p, 0o600)
+    monkeypatch.setenv("QUEUER_REDACT_PATH", str(p))
+    t = notify.format_job(_job(raw_cmd=json.dumps(["run", "API_KEY=abc"])), CFG)
+    assert "API_KEY=***" in t and "abc" not in t  # built-ins still apply
+    assert "[queuerd] redact:" in capsys.readouterr().err
+
+
+def test_malformed_command_json_still_gives_a_message():
+    assert notify.format_job(_job(raw_cmd="not json"), CFG).startswith("✅ done")
+    assert notify._short_cmd(_job(raw_cmd="5")) == "-"  # a number is not an argv

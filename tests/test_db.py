@@ -1600,3 +1600,173 @@ def test_edit_job_move_that_would_deadlock_is_rejected(conn):
         db.edit_job(conn, a, updates={}, channel=2)
     assert db.get_job(conn, a)["channel"] == 1
     assert [j["id"] for j in db.get_queue(conn, 2)] == [b, c]
+
+
+# ---------------------------------------------------------------------------
+# Q7: numbered migrations + schema_version, Q8: WAL / busy_timeout / 0600
+# ---------------------------------------------------------------------------
+
+
+def _old_jobs_db(path):
+    """A DB from before `schema_version` AND before the priority lane (oldest shape), 1 queued job."""
+    import sqlite3
+
+    raw = sqlite3.connect(path)
+    raw.executescript(
+        """
+        CREATE TABLE jobs (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel       INTEGER NOT NULL DEFAULT 1,
+            status        TEXT NOT NULL CHECK (status IN
+                            ('queued','running','done','failed','cancelled')),
+            position      INTEGER, raw_cmd TEXT NOT NULL, resolved_cmd TEXT NOT NULL,
+            cwd           TEXT NOT NULL, env_extra TEXT, pid INTEGER, pgid INTEGER,
+            enqueued_at   TEXT NOT NULL, started_at TEXT, finished_at TEXT,
+            exit_code     INTEGER, log_path TEXT NOT NULL, note TEXT, timeout_secs INTEGER
+        );
+        INSERT INTO jobs (channel, status, position, raw_cmd, resolved_cmd, cwd, enqueued_at, log_path)
+        VALUES (1, 'queued', 0, '["a"]', '["/usr/bin/a"]', '/tmp', '2026-01-01', '/tmp/a.log');
+        """
+    )
+    raw.commit()
+    raw.close()
+
+
+def test_fresh_database_is_created_at_the_latest_schema_version(tmp_path):
+    c = db.connect(tmp_path / "fresh.db")
+    assert db.get_schema_version(c) is None  # nothing there before init_db
+    db.init_db(c)
+    assert db.get_schema_version(c) == db.SCHEMA_VERSION
+    assert c.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0] == 1  # single row
+    c.close()
+
+
+def test_old_database_without_schema_version_is_brought_up_to_date_without_data_loss(tmp_path):
+    path = tmp_path / "old.db"
+    _old_jobs_db(path)
+    c = db.connect(path)
+    db.init_db(c)
+    assert db.get_schema_version(c) == db.SCHEMA_VERSION
+    job = db.get_job(c, 1)
+    assert job["status"] == "queued" and job["raw_cmd"] == '["a"]'
+    cols = {r["name"] for r in c.execute("PRAGMA table_info(jobs)").fetchall()}
+    assert {"is_priority", "max_retries", "not_before", "on_fail", "retry_delay_secs", "retry_backoff"} <= cols
+    c.close()
+
+
+def test_current_shape_database_without_the_version_table_just_gets_the_version(tmp_path):
+    """A DB made by the last release (full schema, no schema_version table yet)."""
+    path = tmp_path / "cur.db"
+    c = db.connect(path)
+    db.init_db(c)
+    c.execute("DROP TABLE schema_version")
+    c.commit()
+    assert db.get_schema_version(c) is None
+    db.init_db(c)
+    assert db.get_schema_version(c) == db.SCHEMA_VERSION
+    c.close()
+
+
+def test_init_db_twice_changes_nothing(tmp_path):
+    path = tmp_path / "old.db"
+    _old_jobs_db(path)
+    c = db.connect(path)
+    db.init_db(c)
+    db.init_db(c)
+    assert db.get_schema_version(c) == db.SCHEMA_VERSION
+    assert c.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 1
+    assert c.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0] == 1
+    c.close()
+
+
+def test_migrations_are_numbered_in_order_and_each_bumps_the_version(tmp_path, monkeypatch):
+    seen: list[int] = []
+
+    def step(n):
+        def run(conn):
+            seen.append(n)
+            conn.execute("CREATE TABLE IF NOT EXISTS t%d (x INTEGER)" % n)
+
+        return run
+
+    path = tmp_path / "old.db"
+    _old_jobs_db(path)
+    c = db.connect(path)
+    db.init_db(c)  # real steps first: now at SCHEMA_VERSION
+    top = db.SCHEMA_VERSION
+    monkeypatch.setattr(db, "_MIGRATIONS", db._MIGRATIONS + ((top + 1, step(top + 1)), (top + 2, step(top + 2))))
+    monkeypatch.setattr(db, "SCHEMA_VERSION", top + 2)
+    db.init_db(c)
+    assert seen == [top + 1, top + 2]
+    assert db.get_schema_version(c) == top + 2
+    db.init_db(c)
+    assert seen == [top + 1, top + 2]  # never re-run
+    c.close()
+
+
+def test_a_failing_migration_rolls_back_and_keeps_the_old_version(tmp_path, monkeypatch):
+    path = tmp_path / "x.db"
+    c = db.connect(path)
+    db.init_db(c)
+    top = db.SCHEMA_VERSION
+
+    def boom(conn):
+        conn.execute("CREATE TABLE half_done (x INTEGER)")
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(db, "_MIGRATIONS", db._MIGRATIONS + ((top + 1, boom),))
+    monkeypatch.setattr(db, "SCHEMA_VERSION", top + 1)
+    with pytest.raises(RuntimeError, match="boom"):
+        db.init_db(c)
+    assert db.get_schema_version(c) == top
+    assert c.execute("SELECT 1 FROM sqlite_master WHERE name = 'half_done'").fetchone() is None  # rolled back
+    assert not c.in_transaction
+    c.close()
+
+
+def test_a_database_from_a_newer_queuer_is_refused(tmp_path):
+    c = db.connect(tmp_path / "new.db")
+    db.init_db(c)
+    c.execute("UPDATE schema_version SET version = ?", (db.SCHEMA_VERSION + 1,))
+    c.commit()
+    with pytest.raises(RuntimeError, match="newer"):
+        db.init_db(c)
+    c.close()
+
+
+def test_connect_uses_wal_and_a_busy_timeout(tmp_path):
+    c = db.connect(tmp_path / "w.db")
+    assert c.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    assert c.execute("PRAGMA busy_timeout").fetchone()[0] == db.BUSY_TIMEOUT_MS
+    c.close()
+
+
+def test_the_wal_side_files_are_0600_too(tmp_path):
+    path = tmp_path / "m.db"
+    c = db.connect(path)
+    db.init_db(c)
+    _mk(c)  # a write, so the -wal file certainly exists
+    for suffix in ("", "-wal", "-shm"):
+        f = tmp_path / f"m.db{suffix}"
+        assert f.exists(), suffix
+        assert (f.stat().st_mode & 0o777) == 0o600, suffix
+    c.close()
+
+
+def test_two_connections_can_read_and_write(tmp_path):
+    path = tmp_path / "two.db"
+    a = db.connect(path)
+    db.init_db(a)
+    b = db.connect(path)
+    db.init_db(b)  # a second process starting up while the first is open
+    first = _mk(a, "one")
+    assert db.get_job(b, first) is not None  # a's write is visible to b
+    # an open write transaction of `a` does not stop `b` reading (WAL), and `b` can write after it commits
+    a.execute("BEGIN IMMEDIATE")
+    a.execute("UPDATE jobs SET note = 'x' WHERE id = ?", (first,))
+    assert db.get_job(b, first) is not None  # reader not blocked
+    a.commit()
+    second = _mk(b, "two")
+    assert db.get_job(a, second) is not None
+    a.close()
+    b.close()

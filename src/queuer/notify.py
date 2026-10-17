@@ -29,6 +29,10 @@ never exported, so every qur keeps its own id in the messages it sends.
 Most functions work on a flat single-bot view `{"qur_id", "token",
 "chat_ids", "listen"}`; `bot_cfgs` produces one per connected bot.
 
+Everything that carries job data (commands, Details, log tails, list and status
+text) is passed through `queuer.redact` before it is formatted: secrets become `***`.
+Local `qur show` / `qur logs` are not redacted.
+
 Stdlib only (urllib); every network call goes through `_api` so tests can
 replace it.
 """
@@ -54,7 +58,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from queuer import jobenv
+from queuer import jobenv, redact
 
 API_BASE = "https://api.telegram.org"
 SEND_TIMEOUT_SECS = 10
@@ -694,6 +698,9 @@ def _display_quote(word: str) -> str:
         return "''"
     if shlex.quote(word) == word:
         return word
+    rest = word.replace(redact.MASK, "")  # a masked secret stays bare: --token=***, not "--token=***"
+    if redact.MASK in word and (not rest or shlex.quote(rest) == rest):
+        return word
     if not any(c in word for c in '"$`\\\n'):
         return f'"{word}"'
     return shlex.quote(word)
@@ -703,11 +710,17 @@ def _display_join(argv: list[str]) -> str:
     return " ".join(_display_quote(w) for w in argv)
 
 
+def _safe_argv_text(raw: str) -> str:
+    """A job's argv (JSON) as one display line, secrets masked (F31). Raises like
+    json.loads / iteration on malformed input; callers already handle that."""
+    return _display_join(redact.redact_argv(json.loads(raw)))
+
+
 def _command(job: dict[str, Any]) -> str | None:
     """The command as typed (raw, not the resolved absolute-path form),
     collapsed to one line and capped."""
     try:
-        text = " ".join(_display_join(json.loads(job["raw_cmd"])).split())
+        text = " ".join(_safe_argv_text(job["raw_cmd"]).split())
     except (KeyError, TypeError, ValueError):
         return None
     if len(text) > CMD_MAX_CHARS:
@@ -787,12 +800,14 @@ def _format_details(job: dict[str, Any], cfg: dict[str, Any], cmd_cap: int) -> s
     esc = html.escape
     field_cap = min(cmd_cap, DETAIL_FIELD_MAX_CHARS)
 
-    def row(label: str, value: str, code: bool = False) -> str:
+    def row(label: str, value: str, code: bool = False, mask: bool = True) -> str:
+        if mask:  # cwd, log path, note... (commands are already masked word by word)
+            value = redact.redact_text(value)
         return f"<b>{label}</b> " + (f"<code>{esc(value)}</code>" if code else esc(value))
 
     def cmd(key: str) -> str:
         try:
-            return _cap(" ".join(_display_join(json.loads(job[key])).split()), cmd_cap)
+            return _cap(" ".join(_safe_argv_text(job[key]).split()), cmd_cap)
         except (KeyError, TypeError, ValueError):
             return "-"
 
@@ -839,9 +854,9 @@ def _format_details(job: dict[str, Any], cfg: dict[str, Any], cmd_cap: int) -> s
         lines.append(row("after any", _id_list(job["after_any"])))
     if job.get("waiting_on"):
         lines.append(row("waiting on", _id_list(job["waiting_on"])))
-    env_lines = jobenv.describe(job.get("env_extra"))
+    env_lines = [redact.redact_text(line) for line in jobenv.describe(job.get("env_extra"))]  # one by one: keeps the ", "
     if env_lines:
-        lines.append(row("environment", _cap(", ".join(env_lines), field_cap), code=True))
+        lines.append(row("environment", _cap(", ".join(env_lines), field_cap), code=True, mask=False))
     lines.append(row("pid", str(job["pid"]) if job.get("pid") else "-"))
     lines.append(row("log", _cap(job.get("log_path") or "-", field_cap), code=True))
     if job.get("note"):
@@ -856,7 +871,7 @@ def _format_details(job: dict[str, Any], cfg: dict[str, Any], cmd_cap: int) -> s
 
 def _short_cmd(job: dict[str, Any], limit: int = LIST_CMD_MAX_CHARS) -> str:
     try:
-        text = " ".join(_display_join(json.loads(job["raw_cmd"])).split())
+        text = " ".join(_safe_argv_text(job["raw_cmd"]).split())
     except (KeyError, TypeError, ValueError):
         return "-"
     return text if len(text) <= limit else text[: limit - 1] + "…"
@@ -966,7 +981,7 @@ def format_log(job: dict[str, Any], tail: str | None, cfg: dict[str, Any]) -> st
     head = f"📄 <b>Log · job #{job['id']}</b> · {html.escape(job['status'])}\n{html.escape(_who(cfg))}\n"
     if tail is None:
         return head + "(no log file)"
-    tail = tail.rstrip()
+    tail = redact.redact_text(tail.rstrip())
     if not tail:
         return head + "(log is empty)"
     cut = ""
