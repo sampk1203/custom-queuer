@@ -18,6 +18,7 @@ import pwd
 import shutil
 import sqlite3
 import stat
+
 # only used with fixed argv (loginctl / systemctl), never a shell
 import subprocess  # nosec B404
 from dataclasses import asdict, dataclass
@@ -25,7 +26,12 @@ from pathlib import Path
 from typing import Any
 
 from queuer import client, db, notify, redact
-from queuer.daemon import _default_db_path, _default_log_dir, _default_socket_path, _fallback_socket_dir
+from queuer.daemon import (
+    _default_db_path,
+    _default_log_dir,
+    _default_socket_path,
+    _fallback_socket_dir,
+)
 
 OK = "OK"
 WARN = "WARN"
