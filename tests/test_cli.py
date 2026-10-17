@@ -14,6 +14,7 @@ from queuer import client
 from queuer.cli import (
     _build_job_argv,
     _fmt_elapsed,
+    _fmt_mem_kb,
     _fmt_origin,
     _fmt_secs,
     _needs_shell,
@@ -2097,6 +2098,116 @@ def test_show_displays_the_retry_delay_only_when_set(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# F16: qur add --dry-run
+# ---------------------------------------------------------------------------
+
+def _dry_reply(**kw):
+    base = {
+        "dry_run": True, "channel": 1, "cwd": "/work", "priority": False, "queued_before": 2,
+        "running_id": 7, "frozen_id": None, "paused": False,
+        "env": {"PATH": "/usr/bin", "QUR_ENV_PASSTHROUGH": "OMP_NUM_THREADS", "OMP_NUM_THREADS": "4", "FOO": "bar", "MY_TOKEN": "s3cret"},
+        "jobs": [{
+            "index": None, "raw_argv": ["python", "train.py"], "argv": ["/usr/bin/python", "train.py"],
+            "position": 3, "dep_verdict": "ready", "dep_id": None,
+        }],
+    }
+    base.update(kw)
+    return base
+
+
+def test_add_dry_run_asks_the_daemon_for_a_dry_run_and_prints_the_plan(monkeypatch):
+    calls = _capture_send(monkeypatch, _dry_reply())
+    res = runner.invoke(app, ["add", "--dry-run", "--timeout", "60", "--", "python", "train.py"], env={"COLUMNS": "200"})
+    assert res.exit_code == 0, res.output
+    assert calls[0][0] == "add" and calls[0][1]["dry_run"] is True
+    out = res.output
+    assert "Dry run" in out and "nothing was queued" in out
+    assert "Queued as job" not in out
+    assert "raw command: python train.py" in out and "resolved command: /usr/bin/python train.py" in out
+    assert "cwd: /work" in out and "timeout: 60s" in out
+    assert "queue position: 3 (2 queued ahead; job 7 is running now)" in out
+    # environment: names only for what was copied/set by queuer, values for the rest, secrets masked
+    assert "PYTHONUNBUFFERED=1" in out and "FOO=bar" in out and "MY_TOKEN=***" in out and "s3cret" not in out
+    assert "OMP_NUM_THREADS=4" not in out and "OMP_NUM_THREADS" in out
+
+
+def test_add_without_dry_run_does_not_send_the_flag(monkeypatch):
+    calls = _capture_send(monkeypatch, {"id": 4, "channel": 1})
+    res = runner.invoke(app, ["add", "--", "true"])
+    assert res.exit_code == 0, res.output
+    assert "dry_run" not in calls[0][1]
+    assert "Queued as job 4" in res.output and "Dry run" not in res.output
+
+
+def test_add_dry_run_still_validates_locally_without_calling_the_daemon(monkeypatch):
+    calls = _capture_send(monkeypatch, _dry_reply())
+    res = runner.invoke(app, ["add", "--dry-run", "--retry-delay", "5m", "--", "true"])
+    assert res.exit_code == 1 and "--retries" in res.output
+    assert calls == []
+
+
+def test_add_dry_run_shows_the_extra_settings_like_a_real_add(monkeypatch):
+    _capture_send(monkeypatch, _dry_reply(paused=True, running_id=None))
+    res = runner.invoke(
+        app,
+        ["add", "--dry-run", "--on-fail", "pause", "--retries", "2", "--depends-on", "5", "--delay", "10m", "--", "true"],
+        env={"COLUMNS": "200"},
+    )
+    assert res.exit_code == 0, res.output
+    assert "runs only if job(s) 5 finish successfully" in res.output
+    assert "starts no earlier than" in res.output
+    assert "on failure: this channel will be paused" in res.output
+    assert "auto-retry on failure: up to 2 time(s)" in res.output
+    assert "channel 1 is paused" in res.output and "the channel is idle" in res.output
+
+
+def test_add_dry_run_priority_lane_and_skip_warning(monkeypatch):
+    reply = _dry_reply(priority=True)
+    reply["jobs"][0]["position"] = 1
+    _capture_send(monkeypatch, reply)
+    res = runner.invoke(app, ["add", "--dry-run", "--now", "--", "true"], env={"COLUMNS": "200"})
+    assert res.exit_code == 0, res.output
+    assert "queue position: 1 on the --now lane of channel 1" in res.output
+    assert "job 7 (running now) would be frozen" in res.output
+    assert "current job on this channel frozen" not in res.output  # that line is for a real --now add
+    reply = _dry_reply()
+    reply["jobs"][0].update(dep_verdict="failed", dep_id=5)
+    _capture_send(monkeypatch, reply)
+    res = runner.invoke(app, ["add", "--dry-run", "--depends-on", "5", "--", "true"], env={"COLUMNS": "200"})
+    assert "would be skipped right away" in res.output and "dependency 5 has already failed" in res.output
+
+
+def test_add_dry_run_sweep_lists_the_first_jobs_and_the_position_range(monkeypatch):
+    jobs = [
+        {"index": n, "raw_argv": ["echo", str(n)], "argv": ["/bin/echo", str(n)], "position": n,
+         "dep_verdict": "ready", "dep_id": None}
+        for n in range(1, 9)
+    ]
+    calls = _capture_send(monkeypatch, _dry_reply(jobs=jobs, queued_before=0, running_id=None))
+    res = runner.invoke(app, ["add", "--dry-run", "--array", "1-8", "--", "echo", "x"], env={"COLUMNS": "200"})
+    assert res.exit_code == 0, res.output
+    assert len(calls[0][1]["jobs"]) == 8 and calls[0][1]["dry_run"] is True
+    out = res.output
+    assert "would add 8 jobs on channel 1" in out and "queue positions: 1-8 (0 queued ahead; the channel is idle)" in out
+    assert "QUR_INDEX=1: raw command: echo 1" in out and "QUR_INDEX=5:" in out and "QUR_INDEX=6:" not in out
+    assert "... and 3 more" in out
+
+
+def test_add_dry_run_daemon_error_is_reported_and_exits_nonzero(monkeypatch):
+    def boom(cmd, **kw):
+        raise client.DaemonError("working directory does not exist: /x")
+
+    monkeypatch.setattr(client, "send", boom)
+    res = runner.invoke(app, ["add", "--dry-run", "--", "true"])
+    assert res.exit_code == 1 and "working directory does not exist" in res.output
+
+
+def test_add_help_mentions_dry_run():
+    res = runner.invoke(app, ["add", "--help"], env={"COLUMNS": "200"})
+    assert "--dry-run" in res.output
+
+
+# ---------------------------------------------------------------------------
 # F8: qur edit
 # ---------------------------------------------------------------------------
 
@@ -2587,3 +2698,239 @@ def test_run_service_tool_ctrl_c_while_following_exits_130(monkeypatch):
 
     monkeypatch.setattr(cli_mod.subprocess, "run", fake)
     assert cli_mod._run_service_tool(["journalctl", "--user", "-f"]) == 130
+
+
+# ---------------------------------------------------------------------------
+# F24: qur history --csv, qur export
+# ---------------------------------------------------------------------------
+
+def test_history_csv_has_a_header_and_one_row_per_job(monkeypatch):
+    import csv as csv_mod
+    import io
+
+    _capture_send(monkeypatch, {"jobs": _history_rows()})
+    res = runner.invoke(app, ["history", "--csv"])
+    assert res.exit_code == 0, res.output
+    rows = list(csv_mod.reader(io.StringIO(res.output)))
+    assert rows[0] == ["id", "channel", "status", "command", "cwd", "origin", "enqueued_at", "started_at",
+                       "finished_at", "duration_secs", "exit_code", "note"]
+    assert len(rows) == 3
+    assert rows[1][:5] == ["7", "2", "failed", "python train.py", "/tmp"]
+    assert rows[1][9] == "3600.0" and rows[1][10] == "1"
+    assert rows[2][9] == ""  # never started -> no duration
+    assert "History" not in res.output  # no table, no Rich markup
+
+
+def test_history_csv_empty_is_just_the_header(monkeypatch):
+    _capture_send(monkeypatch, {"jobs": []})
+    res = runner.invoke(app, ["history", "--csv"])
+    assert res.exit_code == 0 and res.output.count("\n") == 1 and res.output.startswith("id,channel,status")
+
+
+def test_history_csv_quotes_commas_and_neutralises_formulas(monkeypatch):
+    import csv as csv_mod
+    import io
+
+    rows = [_job(1, status="done", exit_code=0, finished_at="2026-10-14T10:00:00+00:00",
+                 raw_cmd=json.dumps(["echo", "a,b", 'say "hi"']), note="=HYPERLINK(1)")]
+    _capture_send(monkeypatch, {"jobs": rows})
+    parsed = list(csv_mod.reader(io.StringIO(runner.invoke(app, ["history", "--csv"]).output)))
+    assert len(parsed[1]) == 12 and parsed[1][3].startswith("echo ") and "a,b" in parsed[1][3]  # one cell, not split
+    assert parsed[1][11] == "'=HYPERLINK(1)"  # a leading = would run as a formula in a spreadsheet
+
+
+def test_history_csv_full_uses_resolved_commands_and_sends_filters(monkeypatch):
+    calls = _capture_send(monkeypatch, {"jobs": _history_rows()})
+    res = runner.invoke(app, ["history", "--csv", "--full", "--status", "done", "--channel", "1"])
+    assert res.exit_code == 0 and "/bin/echo" in res.output
+    assert calls[0][1]["statuses"] == ["done"] and calls[0][1]["channel"] == 1
+
+
+def test_history_csv_and_json_exclude_each_other(monkeypatch):
+    calls = _capture_send(monkeypatch, {"jobs": []})
+    res = runner.invoke(app, ["history", "--csv", "--json"])
+    assert res.exit_code == 1 and "cannot be combined" in res.output and calls == []
+
+
+def test_export_prints_a_json_list_of_every_row(monkeypatch):
+    rows = [_job(1), _job(2, status="running"), _job(3, status="done", exit_code=0)]
+    calls = _capture_send(monkeypatch, {"jobs": rows})
+    res = runner.invoke(app, ["export"])
+    assert res.exit_code == 0, res.output
+    assert calls == [("export", {"statuses": None, "channel": None})]
+    data = json.loads(res.output)  # plain JSON on stdout, safe to redirect to a file
+    assert [j["id"] for j in data] == [1, 2, 3] and json.loads(data[0]["raw_cmd"]) == ["echo", "1"]
+
+
+def test_export_sends_filters(monkeypatch):
+    calls = _capture_send(monkeypatch, {"jobs": []})
+    res = runner.invoke(app, ["export", "--channel", "2", "--status", "queued", "--status", "failed"])
+    assert res.exit_code == 0 and json.loads(res.output) == []
+    assert calls == [("export", {"statuses": ["queued", "failed"], "channel": 2})]
+
+
+@pytest.mark.parametrize("flags", [["--status", "bogus"], ["--channel", "0"]])
+def test_export_rejects_bad_options_without_calling_the_daemon(monkeypatch, flags):
+    calls = _capture_send(monkeypatch, {"jobs": []})
+    assert runner.invoke(app, ["export", *flags]).exit_code != 0 and calls == []
+
+
+# ---------------------------------------------------------------------------
+# U1: `qur add` echoes the command and cwd; U6: `qur logs --running`
+# ---------------------------------------------------------------------------
+
+def test_add_echoes_the_command_and_cwd(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    calls = _capture_send(monkeypatch, {"id": 9, "channel": 1})
+    res = runner.invoke(app, ["add", "--", "true"], env={"COLUMNS": "300"})
+    assert res.exit_code == 0, res.output
+    assert calls[0][1]["argv"]  # what was sent is what gets echoed
+    assert "command:" in res.output and "true" in res.output
+    assert f"cwd: {tmp_path}" in res.output
+
+
+def test_add_sweep_echoes_cwd_but_no_single_command(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    _capture_send(monkeypatch, {"id": 9, "ids": [9, 10], "channel": 1})
+    res = runner.invoke(app, ["add", "--each", "a", "b", "--", "echo", "{}"], env={"COLUMNS": "300"})
+    assert res.exit_code == 0, res.output
+    assert "cwd:" in res.output and "command:" not in res.output
+
+
+def _running_status(channel_id, job_id):
+    return {"channels": {str(channel_id): {"running": _job(job_id, channel=channel_id, status="running"),
+                                           "frozen": None, "paused": False}}}
+
+
+def test_logs_running_follows_the_job_running_on_the_channel(tmp_path, monkeypatch):
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "7.log").write_text("hello\nworld\n")
+    monkeypatch.setenv("QUEUER_LOG_DIR", str(log_dir))
+    calls = _capture_send(monkeypatch, _running_status(1, 7))
+    res = CliRunner().invoke(app, ["logs", "--running"])
+    assert res.exit_code == 0, res.output
+    assert calls == [("status", {})]
+    assert "hello\nworld\n" in res.output and "(job 7)" in res.output
+
+
+def test_logs_running_uses_the_given_channel(tmp_path, monkeypatch):
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "8.log").write_text("a\nb\nc\n")
+    monkeypatch.setenv("QUEUER_LOG_DIR", str(log_dir))
+    _capture_send(monkeypatch, _running_status(2, 8))
+    res = CliRunner().invoke(app, ["logs", "--running", "--channel", "2", "-n", "1"])
+    assert res.exit_code == 0 and res.output.endswith("c\n") and "a\nb" not in res.output
+
+
+def test_logs_running_with_nothing_running_fails_cleanly(monkeypatch):
+    _capture_send(monkeypatch, {"channels": {"1": {"running": None, "frozen": None, "paused": False}}})
+    res = CliRunner().invoke(app, ["logs", "--running"])
+    assert res.exit_code == 1 and "no job is running on channel 1" in res.output
+    _capture_send(monkeypatch, {"channels": {}})
+    assert CliRunner().invoke(app, ["logs", "--running", "--channel", "3"]).exit_code == 1
+
+
+def test_logs_needs_an_id_or_running_but_not_both(monkeypatch):
+    calls = _capture_send(monkeypatch, {"channels": {}})
+    res = CliRunner().invoke(app, ["logs"])
+    assert res.exit_code == 1 and "job ID" in res.output
+    res = CliRunner().invoke(app, ["logs", "5", "--running"])
+    assert res.exit_code == 1 and "not both" in res.output and calls == []
+
+
+# ---------------------------------------------------------------------------
+# F10: resource accounting in `qur show`
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "kb, text",
+    [
+        (0, "0 KB"),
+        (512, "512 KB"),
+        (1023, "1023 KB"),
+        (1024, "1 MB"),
+        (20 * 1024, "20 MB"),
+        (1024 * 1024, "1.0 GB"),
+        (30 * 1024 * 1024, "30.0 GB"),
+        (31_457_280, "30.0 GB"),
+    ],
+)
+def test_fmt_mem_kb(kb, text):
+    assert _fmt_mem_kb(kb) == text
+
+
+def test_show_displays_peak_rss_and_cpu_time_when_captured(monkeypatch):
+    job = _job(5, status="done", max_rss_kb=31_457_280, cpu_user_secs=134.0, cpu_sys_secs=3.0)
+    monkeypatch.setattr(client, "send", lambda cmd, **kw: job)
+    out = runner.invoke(app, ["show", "5"], env={"COLUMNS": "200"}).output
+    assert "peak RSS" in out and "30.0 GB" in out
+    assert "cpu time" in out and "2m14s user + 3s sys" in out
+
+
+def test_show_displays_only_the_usage_that_was_captured(monkeypatch):
+    monkeypatch.setattr(client, "send", lambda cmd, **kw: _job(5, status="done", max_rss_kb=20 * 1024))
+    out = runner.invoke(app, ["show", "5"], env={"COLUMNS": "200"}).output
+    assert "peak RSS" in out and "20 MB" in out and "cpu time" not in out
+    monkeypatch.setattr(client, "send", lambda cmd, **kw: _job(5, status="done", cpu_user_secs=1.0, cpu_sys_secs=None))
+    out = runner.invoke(app, ["show", "5"], env={"COLUMNS": "200"}).output
+    assert "cpu time" in out and "1s user + 0s sys" in out and "peak RSS" not in out
+
+
+def test_show_has_no_usage_rows_for_a_job_that_was_never_sampled(monkeypatch):
+    monkeypatch.setattr(client, "send", lambda cmd, **kw: _job(5, status="done"))
+    out = runner.invoke(app, ["show", "5"], env={"COLUMNS": "200"}).output
+    assert "peak RSS" not in out and "cpu time" not in out
+    # rows from an older daemon/DB (no usage keys at all) are fine too
+    monkeypatch.setattr(client, "send", lambda cmd, **kw: _job(5, status="queued"))
+    assert runner.invoke(app, ["show", "5"], env={"COLUMNS": "200"}).exit_code == 0
+
+
+def test_show_json_carries_the_usage_fields(monkeypatch):
+    job = _job(5, status="done", max_rss_kb=2048, cpu_user_secs=1.5, cpu_sys_secs=0.25)
+    monkeypatch.setattr(client, "send", lambda cmd, **kw: job)
+    data = json.loads(runner.invoke(app, ["show", "5", "--json"]).output)
+    assert (data["max_rss_kb"], data["cpu_user_secs"], data["cpu_sys_secs"]) == (2048, 1.5, 0.25)
+
+
+# ---------------------------------------------------------------------------
+# F12: --on-finish / --on-error hooks
+# ---------------------------------------------------------------------------
+
+def test_add_sends_the_hooks_and_prints_them(monkeypatch):
+    calls = _capture_send(monkeypatch, {"id": 4, "channel": 1})
+    res = runner.invoke(app, ["add", "--on-finish", "rsync -a out/ host:r/", "--on-error", "echo bad", "--", "true"], env={"COLUMNS": "200"})
+    assert res.exit_code == 0, res.output
+    assert calls[0][1]["on_finish"] == "rsync -a out/ host:r/" and calls[0][1]["on_error"] == "echo bad"
+    assert "on finish: runs `rsync -a out/ host:r/`" in res.output and "on error: runs `echo bad`" in res.output
+
+
+def test_add_without_hooks_sends_none_and_prints_nothing(monkeypatch):
+    calls = _capture_send(monkeypatch, {"id": 4, "channel": 1})
+    res = runner.invoke(app, ["add", "--", "true"])
+    assert res.exit_code == 0, res.output
+    assert calls[0][1]["on_finish"] is None and calls[0][1]["on_error"] is None
+    assert "on finish" not in res.output and "on error" not in res.output
+
+
+def test_add_dry_run_prints_the_hooks(monkeypatch):
+    _capture_send(monkeypatch, _dry_reply(on_finish="echo done", on_error=None))
+    res = runner.invoke(app, ["add", "--dry-run", "--on-finish", "echo done", "--", "true"], env={"COLUMNS": "200"})
+    assert res.exit_code == 0, res.output
+    assert "on finish hook: echo done" in res.output and "on error hook" not in res.output
+
+
+def test_show_displays_the_hooks_only_when_set(monkeypatch):
+    monkeypatch.setattr(client, "send", lambda cmd, **kw: _job(5, on_finish_cmd="echo f", on_error_cmd="echo e"))
+    out = runner.invoke(app, ["show", "5"], env={"COLUMNS": "200"}).output
+    assert "on finish" in out and "echo f" in out and "on error" in out and "echo e" in out
+    monkeypatch.setattr(client, "send", lambda cmd, **kw: _job(5))
+    out = runner.invoke(app, ["show", "5"], env={"COLUMNS": "200"}).output
+    assert "on finish" not in out and "on error" not in out
+
+
+def test_edit_sends_the_hooks_and_an_empty_string_removes_one(monkeypatch):
+    calls = _edit_env(monkeypatch)
+    assert runner.invoke(app, ["edit", "5", "--on-finish", "echo f", "--on-error", ""]).exit_code == 0
+    assert _requests(calls)[0] == {"id": 5, "on_finish": "echo f", "on_error": ""}

@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
+import shlex
 import signal
 import socket
 import sqlite3
@@ -33,7 +35,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from queuer import db, jobenv, notify
+from queuer import db, jobenv, logclean, notify
 from queuer.pathresolve import resolve_command
 
 MAX_LOG_BYTES = 50 * 1024 * 1024  # 50MB per-job log cap
@@ -54,7 +56,16 @@ SHUTDOWN_WAIT_SECS = 8
 SHUTDOWN_NOTIFY_SECS = 8
 EDIT_LOCK_RECHECK_SECS = 5  # a worker whose head job is locked for editing rechecks this often (a dead editor frees it)
 STOP_RACE_SECS = 1.0  # systemd signals jobs and daemon together: how long a signal-death waits for our own SIGTERM
+LOG_CLEAN_FIRST_SECS = 60  # first automatic log clean this long after the daemon starts
+LOG_CLEAN_DEFAULT_HOURS = 6.0  # then every this often (QUEUER_LOG_CLEAN_HOURS)
+LOG_CLEAN_MIN_SECS = 60.0  # an interval from the environment is never shorter than this
+HOOK_TIMEOUT_SECS = 300  # F12: a hook still running after this long is killed (it never holds a channel)
+HOOK_OUTPUT_BYTES = 65536  # F12: most hook output appended to the job's log; the rest is dropped
+POST_JOB_HOOK_ENV = "QUEUER_POST_JOB_HOOK"  # F12: global hook command, set in the daemon's environment
+HOOK_STATUSES = ("done", "failed", "cancelled")  # outcomes that run hooks (not skipped, not interrupted)
 STOP_NOTE = "daemon stopped"  # note of a job the daemon's stop (or a crash/reboot) cut short
+RESOURCE_SAMPLE_SECS = 0.2  # F10: how often /proc is polled for a running job's peak RSS / CPU time
+_CLK_TCK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100  # ticks/sec for /proc/<pid>/stat
 # exit codes of a job that died to SIGHUP/SIGINT/SIGKILL/SIGTERM: negative = killed by the signal
 # itself, 128+n = a shell/wrapper that reported it
 _SIGNAL_EXITS = frozenset({-1, -2, -9, -15, 129, 130, 137, 143})
@@ -79,6 +90,84 @@ def _default_keep() -> int:
         print(f"[queuerd] ignoring QUEUER_KEEP={raw!r} (need a positive integer); keeping {db.DEFAULT_KEEP}", file=sys.stderr)
         return db.DEFAULT_KEEP
     return keep
+
+
+def _env_positive_int(name: str) -> int | None:
+    """A positive integer from the environment, or None if unset/empty. A bad value is
+    ignored with a warning rather than stopping the daemon."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value < 1:
+        print(f"[queuerd] ignoring {name}={raw!r} (need a positive integer)", file=sys.stderr)
+        return None
+    return value
+
+
+def _read_proc_usage(pid: int) -> tuple[int | None, float, float] | None:
+    """F10: one best-effort snapshot of a running process's own (not its
+    children's) resource use, read straight from /proc -- no os.wait4 /
+    RUSAGE_CHILDREN involved, so it works per-job even with several channels
+    reaping children at the same time. Returns (peak_rss_kb, user_secs,
+    sys_secs), or None if `pid` is gone (already exited, or not Linux).
+    peak_rss_kb is None if /proc/<pid>/status has no VmHWM line. user_secs /
+    sys_secs are cumulative since the process started, so the latest sample is
+    the final value; VmHWM is already a kernel-maintained high-water mark, so
+    the latest sample is already the peak -- no running-max needed here."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            stat_line = f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    # comm (field 2) is in parens and may itself contain spaces/parens/newlines;
+    # split after the LAST ')' so the numeric fields can't be confused with it
+    rparen = stat_line.rfind(")")
+    if rparen == -1:
+        return None
+    fields = stat_line[rparen + 2:].split()
+    try:
+        utime_ticks = int(fields[11])  # field 14 overall: utime
+        stime_ticks = int(fields[12])  # field 15 overall: stime
+    except (IndexError, ValueError):
+        return None
+    user_secs = utime_ticks / _CLK_TCK
+    sys_secs = stime_ticks / _CLK_TCK
+    rss_kb: int | None = None
+    try:
+        with open(f"/proc/{pid}/status", "rb") as f:
+            for line in f:
+                if line.startswith(b"VmHWM:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        try:
+                            rss_kb = int(parts[1])
+                        except ValueError:
+                            rss_kb = None
+                    break
+    except OSError:
+        pass
+    return rss_kb, user_secs, sys_secs
+
+
+def _default_log_clean_secs() -> float:
+    """Seconds between automatic log cleans: `QUEUER_LOG_CLEAN_HOURS` (a positive number,
+    at least one minute) or LOG_CLEAN_DEFAULT_HOURS."""
+    raw = os.environ.get("QUEUER_LOG_CLEAN_HOURS")
+    default = LOG_CLEAN_DEFAULT_HOURS * 3600
+    if raw is None or not raw.strip():
+        return default
+    try:
+        hours = float(raw)
+    except ValueError:
+        hours = 0.0
+    if not math.isfinite(hours) or hours <= 0:
+        print(f"[queuerd] ignoring QUEUER_LOG_CLEAN_HOURS={raw!r} (need a positive number); using {LOG_CLEAN_DEFAULT_HOURS:g}", file=sys.stderr)
+        return default
+    return max(LOG_CLEAN_MIN_SECS, hours * 3600)
 
 
 def _default_socket_path() -> Path:
@@ -152,8 +241,22 @@ class Daemon:
         log_dir: Path | None = None,
         notify_path: Path | None = None,
         keep: int | None = None,
+        log_max_age_days: int | None = None,
+        log_max_mb: int | None = None,
+        log_clean_secs: float | None = None,
+        post_job_hook: str | None = None,
     ) -> None:
         self.keep = keep if keep is not None else _default_keep()  # finished jobs kept per channel
+        # F14 automatic log cleaning: off unless an age and/or a size limit is set
+        self.log_max_age_days = log_max_age_days if log_max_age_days is not None else _env_positive_int("QUEUER_LOG_MAX_AGE_DAYS")
+        self.log_max_mb = log_max_mb if log_max_mb is not None else _env_positive_int("QUEUER_LOG_MAX_MB")
+        self.log_clean_secs = log_clean_secs if log_clean_secs is not None else _default_log_clean_secs()
+        # F12 global post-job hook: a shell command run after every job's final outcome
+        self.post_job_hook: str | None = None
+        try:
+            self.post_job_hook = db.check_hook(post_job_hook if post_job_hook is not None else os.environ.get(POST_JOB_HOOK_ENV), POST_JOB_HOOK_ENV)
+        except ValueError as e:
+            print(f"[queuerd] ignoring {POST_JOB_HOOK_ENV}: {e}", file=sys.stderr)
         self.db_path = db_path or _default_db_path()
         self.socket_path = socket_path or _default_socket_path()
         self.log_dir = log_dir or _default_log_dir()
@@ -177,6 +280,7 @@ class Daemon:
 
         # in-flight notification sends (kept so they aren't garbage-collected)
         self._notify_tasks: set[asyncio.Task] = set()
+        self._hook_tasks: set[asyncio.Task] = set()  # F12: hook runs in flight
         self._tg_offsets: dict[str, int] = {}  # bot token -> next getUpdates offset
         self._tg_alive: dict[str, float] = {}  # bot token -> time of its last good poll
         self._tg_alive_saved: dict[str, float] = {}  # bot token -> when that was last written to the DB
@@ -433,6 +537,12 @@ class Daemon:
         self._current_job_id[channel] = job_id
 
         log_task = asyncio.create_task(self._pump_log(proc, log_path))
+        # F10: peak RSS / user+system CPU time, sampled from /proc while the job runs
+        # (see _read_proc_usage -- not os.wait4/RUSAGE_CHILDREN, which asyncio's own
+        # child-reaping already forecloses and which can't be diffed cleanly across
+        # channels running in parallel anyway).
+        usage: dict[str, Any] = {"rss_kb": None, "cpu_user": None, "cpu_sys": None}
+        usage_task = asyncio.create_task(self._sample_usage(proc.pid, usage))
         timeout = job["timeout_secs"]
         if self._stopping.is_set():
             # the stop began while the process was being spawned, so _shutdown did not see it
@@ -447,13 +557,18 @@ class Daemon:
             await self._kill_process_group(proc)
             exit_code = await proc.wait()
             await log_task
-            db.mark_finished(self.conn, job_id, status="failed", exit_code=exit_code, note="timed out", keep_backlog=self.keep)
+            await self._stop_usage_sampling(usage_task)
+            db.mark_finished(
+                self.conn, job_id, status="failed", exit_code=exit_code, note="timed out", keep_backlog=self.keep,
+                max_rss_kb=usage["rss_kb"], cpu_user_secs=usage["cpu_user"], cpu_sys_secs=usage["cpu_sys"],
+            )
             self._cancelled.discard(job_id)
             self._release(channel, job_id)
             self._after_finish(job_id)
             return
 
         await log_task
+        await self._stop_usage_sampling(usage_task)
 
         note: str | None = None
         if job_id in self._cancelled:
@@ -464,9 +579,20 @@ class Daemon:
             note = STOP_NOTE
         else:
             status = "done" if exit_code == 0 else "failed"
-        db.mark_finished(self.conn, job_id, status=status, exit_code=exit_code, note=note, keep_backlog=self.keep)
+        db.mark_finished(
+            self.conn, job_id, status=status, exit_code=exit_code, note=note, keep_backlog=self.keep,
+            max_rss_kb=usage["rss_kb"], cpu_user_secs=usage["cpu_user"], cpu_sys_secs=usage["cpu_sys"],
+        )
         self._release(channel, job_id)
         self._after_finish(job_id)
+
+    @staticmethod
+    async def _stop_usage_sampling(usage_task: asyncio.Task[None]) -> None:
+        usage_task.cancel()
+        try:
+            await usage_task
+        except asyncio.CancelledError:
+            pass
 
     async def _cut_short_by_stop(self, exit_code: int) -> bool:
         """True if the daemon's stop ended this job. Under systemd's default
@@ -523,6 +649,140 @@ class Daemon:
         if not self._maybe_auto_retry(job_id):
             self._notify_finished(job_id)
             self._pause_if_asked(job_id)
+            self._start_hooks(job_id)
+
+    def _hooks_for(self, job: dict[str, Any]) -> list[tuple[str, str]]:
+        """F12: the (kind, command) hooks to run for a job that just reached its FINAL
+        outcome, in order: the global post-job hook, `--on-finish`, then `--on-error`
+        (failed only). Only a job that ran and ended done, failed or cancelled has hooks:
+        skipped jobs never ran, interrupted ones were cut short by a daemon stop, and a
+        job cancelled while still queued never started."""
+        if job["status"] not in HOOK_STATUSES or (job["status"] == "cancelled" and not job["started_at"]):
+            return []
+        hooks: list[tuple[str, str]] = []
+        if self.post_job_hook:
+            hooks.append(("post-job", self.post_job_hook))
+        if job.get("on_finish_cmd"):
+            hooks.append(("on-finish", job["on_finish_cmd"]))
+        if job["status"] == "failed" and job.get("on_error_cmd"):
+            hooks.append(("on-error", job["on_error_cmd"]))
+        return hooks
+
+    def _start_hooks(self, job_id: int) -> None:
+        """Run the job's hooks in the background (one task, hooks one after another): a
+        slow or hung hook never holds the channel; each is killed after HOOK_TIMEOUT_SECS."""
+        assert self.conn is not None
+        job = db.get_job(self.conn, job_id)
+        if job is None:
+            return
+        hooks = self._hooks_for(job)
+        if not hooks:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(self._run_hooks(job, hooks))
+        self._hook_tasks.add(task)
+        task.add_done_callback(self._hook_tasks.discard)
+
+    @staticmethod
+    def _hook_env(kind: str, job: dict[str, Any]) -> dict[str, str]:
+        """The job's own environment plus QUR_* facts about how it ended."""
+        env = {"PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", "")}
+        env.update(jobenv.job_environment(json.loads(job["env_extra"]) if job["env_extra"] else {}))
+        duration = ""
+        if job["started_at"] and job["finished_at"]:
+            secs = (datetime.fromisoformat(job["finished_at"]) - datetime.fromisoformat(job["started_at"])).total_seconds()
+            duration = str(int(max(secs, 0)))
+        env.update({
+            "QUR_HOOK": kind,
+            "QUR_JOB_ID": str(job["id"]),
+            "QUR_STATUS": job["status"],
+            "QUR_EXIT_CODE": "" if job["exit_code"] is None else str(job["exit_code"]),
+            "QUR_CHANNEL": str(job["channel"]),
+            "QUR_CWD": job["cwd"],
+            "QUR_LOG": job["log_path"],
+            "QUR_COMMAND": shlex.join(json.loads(job["raw_cmd"])),
+            "QUR_DURATION_SECS": duration,
+        })
+        return env
+
+    @staticmethod
+    def _append_to_log(log_path: str, text: str) -> None:
+        """Append to the job's log (0600, never through a symlink); a failure only warns."""
+        try:
+            fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            with os.fdopen(fd, "ab") as f:
+                f.write(text.encode("utf-8", "replace"))
+        except OSError as e:
+            print(f"[queuerd] cannot write to log {log_path}: {e}", file=sys.stderr)
+
+    async def _run_hooks(self, job: dict[str, Any], hooks: list[tuple[str, str]]) -> None:
+        for kind, command in hooks:
+            try:
+                await self._run_hook(kind, command, job)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # a broken hook must never reach the daemon
+                print(f"[queuerd] job {job['id']} hook {kind} crashed: {type(e).__name__}: {e}", file=sys.stderr)
+
+    async def _run_hook(self, kind: str, command: str, job: dict[str, Any]) -> None:
+        """Run one hook through `/bin/sh -c` in the job's cwd, with the job's environment
+        and QUR_* variables. Its output (capped) and exit code are appended to the job's
+        log, so `qur logs` shows what the hook did; a non-zero exit also goes to the journal."""
+        log_path = job["log_path"]
+        self._append_to_log(log_path, f"\n[queuer] hook {kind}: {command}\n")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "/bin/sh", "-c", command,
+                cwd=job["cwd"],
+                env=self._hook_env(kind, job),
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                start_new_session=True,
+            )
+        except (OSError, ValueError) as e:
+            self._append_to_log(log_path, f"[queuer] hook {kind} could not start: {e}\n")
+            print(f"[queuerd] job {job['id']} hook {kind} could not start: {e}", file=sys.stderr)
+            return
+        output = b""
+        outcome = ""
+        try:
+            output = await asyncio.wait_for(self._drain_hook(proc), timeout=HOOK_TIMEOUT_SECS)
+            code = await proc.wait()
+            outcome = f"exited {code}"
+            if code != 0:
+                print(f"[queuerd] job {job['id']} hook {kind} exited {code}", file=sys.stderr)
+        except asyncio.TimeoutError:
+            await self._kill_process_group(proc)
+            await proc.wait()
+            outcome = f"killed after {HOOK_TIMEOUT_SECS}s (timed out)"
+            print(f"[queuerd] job {job['id']} hook {kind} timed out", file=sys.stderr)
+        except asyncio.CancelledError:  # the daemon is stopping: do not leave the hook behind
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            raise
+        if output:
+            self._append_to_log(log_path, output.decode("utf-8", "replace"))
+            if not output.endswith(b"\n"):
+                self._append_to_log(log_path, "\n")
+        self._append_to_log(log_path, f"[queuer] hook {kind} {outcome}\n")
+
+    @staticmethod
+    async def _drain_hook(proc: asyncio.subprocess.Process) -> bytes:
+        """Read a hook's combined output to the end, keeping at most HOOK_OUTPUT_BYTES."""
+        assert proc.stdout is not None
+        kept = b""
+        while True:
+            chunk = await proc.stdout.read(65536)
+            if not chunk:
+                return kept
+            if len(kept) < HOOK_OUTPUT_BYTES:
+                kept += chunk[: HOOK_OUTPUT_BYTES - len(kept)]
 
     def _pause_if_asked(self, job_id: int) -> None:
         """`--on-fail pause`: a job that ended `failed` (not cancelled, skipped or
@@ -624,6 +884,40 @@ class Daemon:
             if bcfg["token"] == token:
                 return bcfg if bcfg["chat_ids"] and notify.listening(bcfg) else None
         return None
+
+    def _clean_logs_once(self) -> tuple[int, int]:
+        """One automatic log clean (F14), with its own DB connection so it can run in a
+        thread. Returns (logs deleted, bytes freed)."""
+        conn = db.connect(self.db_path)
+        try:
+            files = logclean.plan(
+                conn,
+                self.log_dir,
+                max_age_days=self.log_max_age_days,
+                max_bytes=self.log_max_mb * 1024 * 1024 if self.log_max_mb is not None else None,
+            )
+        finally:
+            conn.close()
+        return logclean.delete(files)
+
+    async def _log_cleaner(self) -> None:
+        """Timer for automatic log cleaning. Does nothing at all unless an age or size limit
+        is set. No error may escape: a failure is reported once and the timer carries on."""
+        if self.log_max_age_days is None and self.log_max_mb is None:
+            return
+        delay: float = LOG_CLEAN_FIRST_SECS
+        while True:
+            await asyncio.sleep(delay)
+            delay = self.log_clean_secs
+            try:
+                count, freed = await asyncio.to_thread(self._clean_logs_once)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # the timer must survive anything
+                notify.warn_once(f"automatic log clean failed: {type(e).__name__}: {e}")
+                continue
+            if count:
+                print(f"[queuerd] cleaned {count} log(s), {freed / 1024:.0f} KB", file=sys.stderr)
 
     async def _telegram_listener(self) -> None:
         """Supervisor: one poller task per connected bot that has `listen`
@@ -918,8 +1212,27 @@ class Daemon:
             if f is not None:
                 try:
                     f.close()
-                except OSError:
-                    pass
+                except OSError as e:
+                    print(f"[queuerd] cannot close log {log_path}: {e}", file=sys.stderr)
+
+    async def _sample_usage(self, pid: int, usage: dict[str, Any]) -> None:
+        """F10: poll `pid` (the job's direct process, not its whole tree --
+        see _read_proc_usage) every RESOURCE_SAMPLE_SECS and keep the latest
+        reading in `usage` (shared with the caller). Runs for as long as the
+        job does; the caller cancels it once the job exits. A job that exits
+        before the first poll leaves `usage` at its initial all-None state --
+        there is nothing to report for it."""
+        try:
+            while True:
+                sample = _read_proc_usage(pid)
+                if sample is not None:
+                    rss_kb, user_secs, sys_secs = sample
+                    usage["rss_kb"] = rss_kb
+                    usage["cpu_user"] = user_secs
+                    usage["cpu_sys"] = sys_secs
+                await asyncio.sleep(RESOURCE_SAMPLE_SECS)
+        except asyncio.CancelledError:
+            pass
 
     async def _kill_process_group(self, proc: asyncio.subprocess.Process, grace: float = DEFAULT_GRACE_SECS) -> None:
         """SIGTERM the job's whole process group, wait up to `grace`
@@ -993,8 +1306,14 @@ class Daemon:
             for t in tasks:
                 if not t.done():
                     t.cancel()
-        if self._notify_tasks:
-            await asyncio.wait(set(self._notify_tasks), timeout=SHUTDOWN_NOTIFY_SECS)
+        pending: set[asyncio.Task[Any]] = set(self._notify_tasks) | set(self._hook_tasks)
+        if pending:
+            await asyncio.wait(pending, timeout=SHUTDOWN_NOTIFY_SECS)
+            for t in self._hook_tasks:  # a hook still running is killed (see _run_hook)
+                if not t.done():
+                    t.cancel()
+            if self._hook_tasks:
+                await asyncio.wait(set(self._hook_tasks), timeout=1)
 
     # -- request handlers --------------------------------------------------
 
@@ -1021,7 +1340,9 @@ class Daemon:
         """Queue one job, or -- with `jobs` (a list of {argv, raw_argv, index}, from
         `--each` / `--array`) -- one independent job per entry, all-or-nothing, with
         the same channel/cwd/timeout/flags/dependencies. `index` becomes the job's
-        QUR_INDEX env var."""
+        QUR_INDEX env var. With `dry_run` (F16) everything is validated and placed
+        exactly as for a real add, then rolled back: nothing is queued and no worker
+        is woken; the reply describes what would happen."""
         # `raw_argv` is exactly what the user typed after `--`, with no
         # interpreter-pinning or bash-wrapping applied -- kept separate from
         # `argv` (which is what's actually resolved/exec'd) so `raw command`
@@ -1067,6 +1388,8 @@ class Daemon:
         on_fail = args.get("on_fail") or "continue"
         if on_fail not in db.ON_FAIL_MODES:  # also catches non-strings: they are never in the tuple
             raise ValueError(f"on_fail must be one of {', '.join(db.ON_FAIL_MODES)}")
+        on_finish_cmd = db.check_hook(args.get("on_finish"), "on-finish command")
+        on_error_cmd = db.check_hook(args.get("on_error"), "on-error command")
         deps = self._dep_args(args)
         if now and deps:
             raise ValueError("--now cannot be combined with --depends-on/--after-any")
@@ -1085,6 +1408,11 @@ class Daemon:
             raise ValueError("--retry-backoff needs --retry-delay")
         if retry_delay_secs is not None and not max_retries:
             raise ValueError("--retry-delay needs --retries")
+        dry_run = args.get("dry_run")
+        if dry_run is None:
+            dry_run = False
+        if type(dry_run) is not bool:  # strict: a falsy non-bool must never turn into a real add
+            raise ValueError("dry_run must be true or false")
 
         for key in ("path", "virtual_env", "python_path"):
             if args.get(key) is not None and not isinstance(args[key], str):
@@ -1154,8 +1482,17 @@ class Daemon:
                 on_fail=on_fail,
                 retry_delay_secs=retry_delay_secs,
                 retry_backoff=retry_backoff,
+                on_finish_cmd=on_finish_cmd,
+                on_error_cmd=on_error_cmd,
                 commit=False,
             ))
+        if dry_run:
+            # no await between the inserts above and this rollback, so nothing else can
+            # see (or commit) the half-written rows
+            try:
+                return self._dry_run_report(job_ids, prepared, env_extra, channel, cwd, now, deps, on_finish_cmd, on_error_cmd)
+            finally:
+                self.conn.rollback()
         self.conn.executemany(
             "UPDATE jobs SET log_path = ? WHERE id = ?",
             [(str(self.log_dir / f"{i}.log"), i) for i in job_ids],
@@ -1186,6 +1523,51 @@ class Daemon:
         else:
             self._wake_worker(channel)
         return result
+
+    def _dry_run_report(
+        self,
+        job_ids: list[int],
+        prepared: list[tuple[list[str], list[str], int | None]],
+        env_extra: dict[str, str],
+        channel: int,
+        cwd: str,
+        now: bool,
+        deps: dict[int, str],
+        on_finish_cmd: str | None = None,
+        on_error_cmd: str | None = None,
+    ) -> dict[str, Any]:
+        """What `add --dry-run` returns. Called while the not-yet-committed rows of the
+        would-be jobs are in the open transaction (the caller rolls it back), so the
+        positions and dependency verdicts are the real ones."""
+        assert self.conn is not None
+        lane = [j["id"] for j in db.get_queue(self.conn, channel, now)]
+        running = db.get_running(self.conn, channel)
+        stopped = db.get_stopped(self.conn, channel)
+        jobs: list[dict[str, Any]] = []
+        for new_id, (raw_argv, resolved, index) in zip(job_ids, prepared, strict=True):
+            verdict, dep_id = db.dep_verdict(self.conn, new_id) if deps else ("ready", None)
+            jobs.append({
+                "index": index,
+                "raw_argv": raw_argv,
+                "argv": resolved,
+                "position": lane.index(new_id) + 1,
+                "dep_verdict": verdict,
+                "dep_id": dep_id,
+            })
+        return {
+            "dry_run": True,
+            "channel": channel,
+            "cwd": cwd,
+            "priority": now,
+            "queued_before": len(lane) - len(job_ids),
+            "running_id": running["id"] if running else None,
+            "frozen_id": stopped["id"] if stopped else None,
+            "paused": db.get_paused(self.conn, channel),
+            "env": env_extra,
+            "on_finish": on_finish_cmd,
+            "on_error": on_error_cmd,
+            "jobs": jobs,
+        }
 
     @staticmethod
     def _dep_args(args: dict[str, Any]) -> dict[int, str]:
@@ -1265,6 +1647,20 @@ class Daemon:
             self.conn, statuses=statuses, channel=channel, since=since, grep=grep or None, limit=limit
         )
         return {"jobs": jobs}
+
+    async def _cmd_export(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Every job row with its dependencies, oldest first (F24, `qur export`). Optional
+        args: `statuses` (list of job statuses, queued/running/stopped or terminal) and
+        `channel`. No logs, just the rows."""
+        assert self.conn is not None
+        statuses = args.get("statuses")
+        if statuses is not None and (
+            not isinstance(statuses, list) or not all(isinstance(s, str) for s in statuses)
+        ):
+            raise ValueError("statuses must be a list of strings")
+        channel = self._int_arg(args, "channel", required=False, positive=True)
+        jobs = db.get_export(self.conn, statuses=statuses, channel=channel)
+        return {"jobs": [self._with_deps(j) for j in jobs]}
 
     async def _cmd_status(self, args: dict[str, Any]) -> dict[str, Any]:
         assert self.conn is not None
@@ -1445,7 +1841,8 @@ class Daemon:
         """Change a queued job, all or nothing. Only the keys present are changed:
         `argv`/`raw_argv` (+ `path`, `virtual_env`, `python_path` of the editing shell: they
         replace the job's own), `cwd`, `timeout_secs` (null = none), `channel` (moves the job to
-        the end of that channel), `max_retries`, `on_fail`, `not_before` (null = clear),
+        the end of that channel), `max_retries`, `on_fail`, `on_finish` / `on_error` (hook commands; null or blank = remove),
+        `not_before` (null = clear),
         `depends_on` / `after_any` (replace that kind of dependency), `clear_deps`, `env`
         (merged over the job's). `pid` is the editor's lock holder (see `edit_lock`); without it
         the job must not be locked by someone else. Returns {"id", "changed": [...]}."""
@@ -1524,6 +1921,12 @@ class Daemon:
             if on_fail != job["on_fail"]:
                 updates["on_fail"] = on_fail
                 changed.append("on-fail")
+        for key, column, label in (("on_finish", "on_finish_cmd", "on-finish"), ("on_error", "on_error_cmd", "on-error")):
+            if key in args:
+                hook = db.check_hook(args[key], f"{label} command")  # null or blank removes the hook
+                if hook != job[column]:
+                    updates[column] = hook
+                    changed.append(label)
         if "not_before" in args:
             not_before = self._parse_not_before(args["not_before"])
             if not_before != job["not_before"]:
@@ -1685,6 +2088,7 @@ class Daemon:
 
         async with server:
             listener = asyncio.create_task(self._telegram_listener())
+            cleaner = asyncio.create_task(self._log_cleaner())
             serving = asyncio.create_task(server.serve_forever())
             stop_wait = asyncio.ensure_future(self._stopping.wait())
             loop = asyncio.get_running_loop()
@@ -1709,6 +2113,7 @@ class Daemon:
                 stop_wait.cancel()
                 serving.cancel()
                 listener.cancel()
+                cleaner.cancel()
             # a stop request, or a worker/server that ended: either way the daemon is going
             # down, so running jobs are recorded as interrupted before the process exits
             await self._shutdown(server)

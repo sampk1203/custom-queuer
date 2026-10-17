@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 import os
 import re
@@ -24,7 +26,7 @@ from rich.markup import escape
 from rich.table import Table
 from typer.core import TyperCommand
 
-from queuer import client, db, jobenv, notify, selfcheck
+from queuer import client, db, jobenv, logclean, notify, selfcheck
 from queuer.daemon import _default_db_path, _default_log_dir
 from queuer.db import DEFAULT_CHANNEL
 from queuer.pathresolve import SHELL_INTERPRETERS
@@ -278,6 +280,16 @@ def _fmt_duration(job: dict[str, Any]) -> str:
     return _fmt_secs((end - start).total_seconds())
 
 
+def _fmt_mem_kb(kb: float) -> str:
+    """F10: a peak-RSS reading in KB as a short human size, e.g. "31 GB"."""
+    mb = kb / 1024
+    if mb >= 1024:
+        return f"{mb / 1024:.1f} GB"
+    if mb >= 1:
+        return f"{mb:.0f} MB"
+    return f"{kb:.0f} KB"
+
+
 _STATUS_STYLES = {"done": "green", "failed": "red", "cancelled": "yellow", "interrupted": "magenta", "skipped": "dim"}
 
 
@@ -515,6 +527,53 @@ def _fmt_ids(ids: list[int]) -> str:
     return ", ".join(parts)
 
 
+def _render_dry_run(data: dict[str, Any], timeout: int | None) -> None:
+    """Print what `qur add --dry-run` found out (F16): the daemon validated the request and
+    placed it exactly as a real add would, then threw the rows away."""
+    jobs: list[dict[str, Any]] = data["jobs"]
+    first = jobs[0]
+    sweep = first["index"] is not None
+    console.print("[bold]Dry run[/bold]: nothing was queued.")
+    if sweep:
+        console.print(f"would add {len(jobs)} jobs on channel [bold]{data['channel']}[/bold] (one per value, QUR_INDEX set per job)")
+    else:
+        console.print(f"would be queued on channel [bold]{data['channel']}[/bold]")
+    shown = jobs if not sweep else jobs[:5]
+    for job in shown:
+        prefix = f"job with QUR_INDEX={job['index']}: " if sweep else ""
+        console.print(f"{prefix}raw command: {escape(_display_join(job['raw_argv']))}")
+        console.print(f"{prefix}resolved command: {escape(_display_join(job['argv']))}")
+    if sweep and len(jobs) > len(shown):
+        console.print(f"... and {len(jobs) - len(shown)} more")
+    console.print(f"cwd: {escape(data['cwd'])}")
+    env_lines = jobenv.describe({**jobenv.DEFAULT_JOB_ENV, **data["env"]})
+    console.print(f"environment: {escape(', '.join(env_lines))}")
+    if timeout:
+        console.print(f"timeout: {timeout}s")
+    if data.get("on_finish"):
+        console.print(f"on finish hook: {escape(data['on_finish'])}")
+    if data.get("on_error"):
+        console.print(f"on error hook: {escape(data['on_error'])}")
+    running, frozen = data.get("running_id"), data.get("frozen_id")
+    where = str(first["position"]) if not sweep else f"{first['position']}-{jobs[-1]['position']}"
+    label = "queue position" if not sweep else "queue positions"
+    if data["priority"]:
+        console.print(f"{label}: {where} on the --now lane of channel {data['channel']}")
+        if running:
+            console.print(f"job {running} (running now) would be frozen and resumed after the --now jobs")
+    else:
+        ahead = f"{data['queued_before']} queued ahead" if first["position"] == data["queued_before"] + 1 else "inserted among queued jobs"
+        busy = f"; job {running} is running now" if running else ("; a job is frozen" if frozen else "; the channel is idle")
+        console.print(f"{label}: {where} ({ahead}{busy})")
+    if data["paused"]:
+        console.print(f"[yellow]channel {data['channel']} is paused[/yellow]: nothing starts until `qur resume`")
+    for job in jobs:
+        if job["dep_verdict"] in ("failed", "removed"):
+            what = "was removed" if job["dep_verdict"] == "removed" else "has already failed"
+            console.print(f"[yellow]would be skipped right away:[/yellow] dependency {job['dep_id']} {what}")
+            break
+
+
 def _help_all(ctx: typer.Context, value: bool) -> None:
     if not value or ctx.resilient_parsing:
         return
@@ -594,6 +653,20 @@ def add(
         "`qur resume`. Only `failed` counts (non-zero exit, timeout, failed start): not cancelled, skipped "
         "or interrupted jobs, and not a failure that --retries requeues (only the last one).",
     ),
+    on_finish: Optional[str] = typer.Option(
+        None, "--on-finish", metavar="COMMAND",
+        help="Hook: a shell command (run with /bin/sh -c) started after this job's FINAL outcome: done, "
+        "failed or cancelled while running (not skipped or interrupted jobs, and not a failure that --retries "
+        "requeues). It runs in the job's cwd with the job's environment plus QUR_JOB_ID, QUR_STATUS, "
+        "QUR_EXIT_CODE, QUR_CHANNEL, QUR_CWD, QUR_LOG, QUR_COMMAND, QUR_DURATION_SECS and QUR_HOOK, in the "
+        "background (it never holds the channel; killed after 5 minutes). Its output and exit code are "
+        "appended to the job's log. Example: --on-finish 'rsync -a out/ host:results/'.",
+    ),
+    on_error: Optional[str] = typer.Option(
+        None, "--on-error", metavar="COMMAND",
+        help="Hook like --on-finish, but only when the job ends `failed` (non-zero exit, timeout, failed "
+        "start; the last failure when --retries is used). Runs after the global hook and --on-finish.",
+    ),
     delay: Optional[str] = typer.Option(
         None, "--delay", metavar="DURATION",
         help="Do not start this job until this long from now: a number with a unit s/m/h/d "
@@ -639,6 +712,12 @@ def add(
         help="Double the --retry-delay for every retry already made (5m, 10m, 20m, ...; capped at 30d). "
         "Needs --retry-delay.",
     ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run",
+        help="Check and place the job as a real add would, but queue nothing: prints the raw and resolved "
+        "command, cwd, environment, channel and the queue position it would get (and whether it would be "
+        "skipped at once). Errors are the same as for a real add. Works with every other option.",
+    ),
     now: bool = typer.Option(
         False, "--now",
         help="Jump the channel's queue: freeze (SIGSTOP) the running job and run this first. "
@@ -665,6 +744,8 @@ def add(
       qur add --retries 3 --retry-delay 5m -- ./flaky.sh   # wait 5 min before each retry
       qur add --retries 4 --retry-delay 1m --retry-backoff -- ./flaky.sh   # 1m, 2m, 4m, 8m
       qur add --on-fail pause -- ./step1.sh          # a failure pauses the channel
+      qur add --on-finish 'rsync -a out/ host:results/' -- ./run.sh   # hook after the job ends
+      qur add --on-error 'notify-send failed' -- ./run.sh             # hook only if it fails
       qur add --env CUDA_VISIBLE_DEVICES=1 --env OMP_NUM_THREADS=8 -- python train.py
       qur add --env MY_SETTING -- ./run.sh            # copy MY_SETTING from this shell
       qur add --after 12 -- python eval.py
@@ -678,6 +759,7 @@ def add(
       qur add --at 22:00 -- ./overnight.sh           # start at 22:00 (tomorrow if it is past)
       qur add --at "2026-12-01 06:30" -- ./run.sh
       qur add --now -- python urgent_eval.py
+      qur add --dry-run --delay 2h -- python train.py   # check it, queue nothing
       qur add -- curl -d '{"key": "value"}' https://example.com/api
       qur add -- 'g16 < input.gjf > output.log'
       qur add -- 'az login && ./deploy.sh'
@@ -754,13 +836,22 @@ def add(
         on_fail=on_fail,
         retry_delay_secs=retry_delay_secs,
         retry_backoff=retry_backoff,
+        on_finish=on_finish,
+        on_error=on_error,
+        **({"dry_run": True} if dry_run else {}),
     )
-    if sweep is None:
+    if dry_run:
+        _render_dry_run(data, timeout)
+    elif sweep is None:
         console.print(f"Queued as job [bold]{data['id']}[/bold] on channel [bold]{data['channel']}[/bold]")
     else:
         ids = data.get("ids") or [data["id"]]
         span = f"{ids[0]}-{ids[-1]}" if len(ids) > 1 and ids == list(range(ids[0], ids[-1] + 1)) else _fmt_ids(ids)
         console.print(f"added jobs [bold]{span}[/bold] ({len(ids)}) on channel [bold]{data['channel']}[/bold]")
+    if sweep is None and not dry_run:
+        console.print(f"command: {escape(_display_join(job_argv))}")
+    if not dry_run:
+        console.print(f"cwd: {escape(os.getcwd())}")
     if depends_ids:
         console.print(f"runs only if job(s) {_fmt_ids(depends_ids)} finish successfully")
     if after_any_ids:
@@ -769,15 +860,19 @@ def add(
         console.print(f"starts no earlier than {_fmt_time(not_before)}")
     if data.get("skipped"):
         console.print(f"[yellow]skipped right away:[/yellow] {escape(str(data['skipped']))}")
-    if env_explicit:
+    if env_explicit and not dry_run:
         console.print(f"environment: {escape(', '.join(env_explicit))}")
     if on_fail == "pause":
         console.print("on failure: this channel will be paused (`qur resume` to continue)")
+    if on_finish:
+        console.print(f"on finish: runs `{escape(on_finish)}`")
+    if on_error:
+        console.print(f"on error: runs `{escape(on_error)}`")
     if retries:
         console.print(f"auto-retry on failure: up to {retries} time(s)")
     if retry_delay_secs:
         console.print(f"each retry waits {_fmt_secs(retry_delay_secs)}" + (", doubling every attempt" if retry_backoff else ""))
-    if now:
+    if now and not dry_run:
         console.print("[yellow]--now[/yellow]: current job on this channel frozen (if any); this runs first")
 
 
@@ -964,6 +1059,7 @@ def history(
     limit: int = typer.Option(50, "--limit", "-n", min=1, max=db.MAX_HISTORY, help="Most rows to show (newest first)"),
     full: bool = typer.Option(False, "--full", help="Show resolved absolute paths instead of what you typed"),
     as_json: bool = typer.Option(False, "--json", help="Print the jobs as a JSON list instead of a table"),
+    as_csv: bool = typer.Option(False, "--csv", help="Print the jobs as CSV (header row first) instead of a table"),
 ) -> None:
     """Search finished jobs (done, failed, cancelled, skipped, interrupted), newest first.
 
@@ -978,7 +1074,10 @@ def history(
       qur history --status failed --status interrupted --channel 2
       qur history --since 2026-10-01 --grep train.py --limit 200
       qur history --json
+      qur history --status failed --csv > failed.csv
     """
+    if as_json and as_csv:
+        _fail("--json and --csv cannot be combined")
     for s in status or []:
         if s not in db.TERMINAL_STATUSES:
             _fail(f"--status: {s!r} is not one of {', '.join(db.TERMINAL_STATUSES)}")
@@ -994,6 +1093,9 @@ def history(
     jobs = data["jobs"]
     if as_json:
         console.print_json(json.dumps(jobs))
+        return
+    if as_csv:
+        typer.echo(_history_csv(jobs, full), nl=False)
         return
     if not jobs:
         console.print("[dim](no matching jobs)[/dim]")
@@ -1021,6 +1123,72 @@ def history(
     console.print(table)
     if len(jobs) >= limit:
         console.print(f"[dim](limit {limit} reached; use --limit to see more)[/dim]")
+
+
+CSV_COLUMNS = (
+    "id", "channel", "status", "command", "cwd", "origin", "enqueued_at", "started_at", "finished_at",
+    "duration_secs", "exit_code", "note",
+)
+
+
+def _csv_cell(value: Any) -> str:
+    """One CSV cell. A text starting with = + - @ (or tab/CR) would run as a formula when the
+    file is opened in a spreadsheet, so it gets a leading apostrophe."""
+    text = "" if value is None else str(value)
+    if text[:1] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + text
+    return text
+
+
+def _job_csv_row(job: dict[str, Any], full: bool) -> list[str]:
+    secs: str = ""
+    if job.get("started_at") and job.get("finished_at"):
+        secs = f"{(datetime.fromisoformat(job['finished_at']) - datetime.fromisoformat(job['started_at'])).total_seconds():.1f}"
+    values: list[Any] = [
+        job["id"], job["channel"], job["status"], _cmd_str(job, full), job.get("cwd"), _fmt_origin(job),
+        job.get("enqueued_at"), job.get("started_at"), job.get("finished_at"), secs, job.get("exit_code"),
+        job.get("note"),
+    ]
+    return [_csv_cell(v) for v in values]
+
+
+def _history_csv(jobs: list[dict[str, Any]], full: bool) -> str:
+    """The `qur history --csv` text: a header row, then one row per job (UTC ISO timestamps)."""
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\n")
+    writer.writerow(CSV_COLUMNS)
+    for job in jobs:
+        writer.writerow(_job_csv_row(job, full))
+    return buf.getvalue()
+
+
+_EXPORT_STATUSES = db.ACTIVE_STATUSES + db.TERMINAL_STATUSES
+_EXPORT_STATUS_HELP = f"Only jobs in this state ({', '.join(_EXPORT_STATUSES)}); repeat for several."  # module level: ruff B008 forbids calls in defaults
+
+
+@app.command(name="export")
+def export_jobs(
+    status: Optional[list[str]] = typer.Option(
+        None, "--status", metavar="STATUS",
+        help=_EXPORT_STATUS_HELP,
+    ),
+    channel: Optional[int] = typer.Option(None, "--channel", min=1, help="Only this channel (default: all)"),
+) -> None:
+    """Print every job row as a JSON list (oldest first): commands, cwd, env, times, exit codes.
+
+    Queued, running and finished jobs; no logs. Redirect it to a file. Values passed with
+    `--env` are written as stored (unmasked), so keep the file private.
+
+    \b
+    Examples:
+      qur export > jobs.json
+      qur export --channel 2 --status failed --status done > ch2.json
+    """
+    for s in status or []:
+        if s not in _EXPORT_STATUSES:
+            _fail(f"--status: {s!r} is not one of {', '.join(_EXPORT_STATUSES)}")
+    data = _call("export", statuses=list(status) if status else None, channel=channel)
+    typer.echo(json.dumps(data["jobs"], indent=2))
 
 
 # ---------------------------------------------------------------------------
@@ -1087,8 +1255,19 @@ def _render_job(job: dict[str, Any]) -> None:
     table.add_row("exit code", str(job["exit_code"]) if job["exit_code"] is not None else "-")
     table.add_row("timeout", f"{job['timeout_secs']}s" if job["timeout_secs"] else "none")
     table.add_row("origin", _fmt_origin(job))
+    if job.get("max_rss_kb") is not None:
+        table.add_row("peak RSS", _fmt_mem_kb(job["max_rss_kb"]))
+    if job.get("cpu_user_secs") is not None or job.get("cpu_sys_secs") is not None:
+        table.add_row(
+            "cpu time",
+            f"{_fmt_secs(job.get('cpu_user_secs') or 0.0)} user + {_fmt_secs(job.get('cpu_sys_secs') or 0.0)} sys",
+        )
     if job.get("on_fail") == "pause":
         table.add_row("on fail", "pause the channel")
+    if job.get("on_finish_cmd"):
+        table.add_row("on finish", escape(job["on_finish_cmd"]))
+    if job.get("on_error_cmd"):
+        table.add_row("on error", escape(job["on_error_cmd"]))
     if job.get("not_before"):
         waiting = " (still waiting)" if job["status"] == "queued" and _starts_in_future(job) else ""
         table.add_row("not before", _fmt_time(job["not_before"]) + waiting)
@@ -1624,8 +1803,12 @@ def _edit_interactive(job_id: int) -> None:
         if not applied:  # abandoned or failed: let the channel go on
             try:
                 client.send("edit_unlock", id=job_id, pid=pid)
-            except (client.DaemonNotRunning, client.DaemonError):
-                pass
+            except (client.DaemonNotRunning, client.DaemonError) as e:
+                typer.echo(
+                    f"Warning: could not release the edit lock on job {job_id} ({e}); "
+                    "the daemon drops it by itself when the lock gets stale",
+                    err=True,
+                )
 
 
 @app.command()
@@ -1645,6 +1828,12 @@ def edit(
     ),
     retries: Optional[int] = typer.Option(None, "--retries", min=0, help="New --retries count."),
     on_fail: Optional[str] = typer.Option(None, "--on-fail", metavar="pause|continue", help="New --on-fail."),
+    on_finish: Optional[str] = typer.Option(
+        None, "--on-finish", metavar="COMMAND", help="New --on-finish hook; an empty string removes it.",
+    ),
+    on_error: Optional[str] = typer.Option(
+        None, "--on-error", metavar="COMMAND", help="New --on-error hook; an empty string removes it.",
+    ),
     delay: Optional[str] = typer.Option(None, "--delay", metavar="DURATION", help="Start no earlier than this from now."),
     at: Optional[str] = typer.Option(None, "--at", metavar="TIME", help="Start no earlier than this local time."),
     clear_delay: bool = typer.Option(False, "--clear-delay", help="Remove the start time."),
@@ -1695,7 +1884,9 @@ def edit(
         words = [cmd_text]
     if cmd_text is not None and not cmd_text.strip():
         _fail("--cmd is empty")
-    flagged = any(v is not None for v in (cwd, timeout, channel, retries, on_fail, delay, at, depends_on, after_any, env))
+    flagged = any(
+        v is not None for v in (cwd, timeout, channel, retries, on_fail, on_finish, on_error, delay, at, depends_on, after_any, env)
+    )
     if not words and not flagged and not clear_delay and not clear_deps:
         _edit_interactive(job_id)
         return
@@ -1705,6 +1896,10 @@ def edit(
         if on_fail not in db.ON_FAIL_MODES:
             _fail(f"--on-fail must be one of {', '.join(db.ON_FAIL_MODES)} (got {on_fail!r})")
         request["on_fail"] = on_fail
+    if on_finish is not None:
+        request["on_finish"] = on_finish
+    if on_error is not None:
+        request["on_error"] = on_error
     if clear_delay and (delay is not None or at is not None):
         _fail("--clear-delay cannot be combined with --delay/--at")
     start = _start_time(delay, at)
@@ -2177,7 +2372,11 @@ def _tail_offset(f: Any, n: int) -> int:
 
 @app.command()
 def logs(
-    job_id: int = typer.Argument(..., help="Job ID"),
+    job_id: Optional[int] = typer.Argument(None, help="Job ID (not needed with --running)"),
+    running: bool = typer.Option(
+        False, "--running", help="Use the job running now on a channel instead of an ID (see --channel)"
+    ),
+    channel: int = typer.Option(DEFAULT_CHANNEL, "--channel", min=1, help="Channel for --running (default 1)"),
     tail: bool = typer.Option(False, "--tail", help="Follow the log as it grows (Ctrl-C to stop)"),
     lines: Optional[int] = typer.Option(
         None, "--lines", "-n", min=1,
@@ -2196,7 +2395,22 @@ def logs(
       qur logs 12 -n 50
       qur logs 12 --tail
       qur logs 12 -n 20 --tail
+      qur logs --running --tail
+      qur logs --running --channel 2 -n 30
     """
+    if running:
+        if job_id is not None:
+            _fail("give a job ID or --running, not both")
+        data = _call("status")
+        chan = data["channels"].get(str(channel)) or data["channels"].get(channel) or {}
+        current = chan.get("running")
+        if not current:
+            _fail(f"no job is running on channel {channel}")
+        job_id = int(current["id"])
+        typer.echo(f"(job {job_id})", err=True)
+    elif job_id is None:
+        _fail("give a job ID, or --running")
+    assert job_id is not None
     log_path = _default_log_dir() / f"{job_id}.log"
     if not log_path.exists():
         typer.echo(f"Error: no log found for job {job_id} at {log_path}", err=True)
@@ -2237,19 +2451,27 @@ def logs(
 @app.command(name="clean-logs")
 def clean_logs(
     days: int = typer.Option(30, "--days", help="Delete logs for jobs finished more than this many days ago"),
+    max_mb: Optional[int] = typer.Option(
+        None, "--max-mb", min=1,
+        help="Also delete the oldest finished jobs' logs until the log folder is at most this many MB "
+        "(logs of queued/running/frozen jobs count but are never deleted)",
+    ),
     dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be deleted without deleting"),
 ) -> None:
     """Delete old log files from disk.
 
     Removes logs of finished jobs (done/failed/cancelled/interrupted) finished more than --days
     ago, plus orphaned logs whose job record no longer exists (e.g. pruned from
-    the history). Never touches logs of queued, running, or frozen jobs. Reads the DB
-    directly, so it works even if the daemon isn't running.
+    the history). With --max-mb it also removes the oldest of the remaining ones until the
+    folder fits. Never touches logs of queued, running, or frozen jobs. Reads the DB
+    directly, so it works even if the daemon isn't running. The daemon can do this by itself
+    on a timer (see the README, "Automatic log cleaning").
 
     \b
     Examples:
       qur clean-logs --dry-run
       qur clean-logs --days 7
+      qur clean-logs --days 90 --max-mb 2000
     """
     log_dir = _default_log_dir()
     if not log_dir.exists():
@@ -2262,45 +2484,27 @@ def clean_logs(
         # orphaned. Never delete anything on that basis.
         _fail(f"no job database at {db_file}; refusing to clean logs (is QUEUER_DB_PATH the same as the daemon's?)")
     conn = db.connect(db_file)
-    cutoff = time.time() - days * 86400
-    to_delete: list[Path] = []
-
-    for log_file in log_dir.glob("*.log"):
-        try:
-            job_id = int(log_file.stem)
-        except ValueError:
-            continue  # not a job log, leave it alone
-
-        job = db.get_job(conn, job_id)
-        if job is None:
-            # orphaned (its row was pruned): only when it is also old, by file time
-            try:
-                if log_file.stat().st_mtime < cutoff:
-                    to_delete.append(log_file)
-            except OSError:
-                pass
-            continue
-        if job["status"] not in db.TERMINAL_STATUSES:
-            continue  # queued/running/stopped -- never touch
-        if not job["finished_at"]:
-            continue
-        finished_ts = datetime.fromisoformat(job["finished_at"]).timestamp()
-        if finished_ts < cutoff:
-            to_delete.append(log_file)
-
-    conn.close()
+    try:
+        to_delete = logclean.plan(
+            conn, log_dir, max_age_days=days, max_bytes=max_mb * 1024 * 1024 if max_mb is not None else None
+        )
+    finally:
+        conn.close()
 
     if not to_delete:
         console.print("[dim](nothing to clean)[/dim]")
         return
 
-    total_bytes = sum(f.stat().st_size for f in to_delete)
+    total_bytes = sum(size for _, size in to_delete)
     verb = "Would delete" if dry_run else "Deleting"
     console.print(f"{verb} {len(to_delete)} log(s), {total_bytes / 1024:.0f} KB")
-    for f in to_delete:
+    for f, _ in to_delete:
         console.print(f"  {f}")
-        if not dry_run:
-            f.unlink()
+    if not dry_run:
+        try:
+            logclean.delete(to_delete)
+        except OSError as e:
+            _fail(f"could not delete a log: {e}")
 
 
 # ---------------------------------------------------------------------------

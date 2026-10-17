@@ -43,11 +43,19 @@ uninstalls. `./install.sh install` / `./install.sh uninstall` skip the question.
 installing; without the flag nothing changes: a failing test still stops the install before
 the running daemon is touched.
 
+`./install.sh uninstall --yes` (or `-y`) uninstalls without any prompt, so it also works with
+no terminal (a script, ssh without a tty). It answers the safe way: the job logs are kept and
+linger stays enabled.
+
+The project path is written into the systemd unit (`ExecStart` points at the project's
+`.venv`). If you move or delete the project folder, run `./install.sh install` again from the
+new place; until then the service cannot start.
+
 **Uninstall** lists what it will remove and asks to proceed (default no), then asks
 separately whether to delete the job logs and whether to disable linger (both
 default no). It stops and disables `queuerd`, deletes the systemd unit, runs
 `uv tool uninstall queuer`, removes the shell completion files and the lines typer
-added to `~/.bashrc`, deletes the job database (queue and history), the Telegram
+added to `~/.bashrc` (the old file is kept as `~/.bashrc.queuer-bak`), deletes the job database (queue and history), the Telegram
 setup (`~/.config/queuer`, bot token included), the socket (and its private
 `/tmp/queuer-<uid>` folder if that was used) and the project `.venv`. The job database and
 logs are looked up in `~/.local/state/queuer`, the same place the daemon uses. It does not delete the project folder, uv itself, or the PATH line `uv tool
@@ -69,7 +77,7 @@ Every command also has worked examples under `qur <command> --help`, and `qur --
 prints the help for every command at once.
 
 ```
-queuer add [--channel N] [--before ID | --after ID | --now] [--depends-on IDS] [--after-any IDS] [--each V... | --array A-B] [--on-fail pause|continue] [--delay DURATION | --at TIME] [--timeout SECONDS] [--retries N [--retry-delay DURATION [--retry-backoff]]] -- <cmd...>
+queuer add [--channel N] [--before ID | --after ID | --now] [--depends-on IDS] [--after-any IDS] [--each V... | --array A-B] [--on-fail pause|continue] [--on-finish CMD] [--on-error CMD] [--delay DURATION | --at TIME] [--timeout SECONDS] [--retries N [--retry-delay DURATION [--retry-backoff]]] [--dry-run] -- <cmd...>
 queuer list [--channel N] [--full] [--json]
 queuer status [--json]
 queuer show ID|RANGE [ID|RANGE...] [--json]
@@ -79,13 +87,13 @@ queuer cancel [JOB_ID] [--channel N]
 queuer clear [--channel N]
 queuer rm ID
 queuer requeue ID
-queuer edit ID [--cmd CMD | -- <cmd...>] [--cwd DIR] [--timeout SECONDS] [--channel N] [--retries N] [--on-fail pause|continue] [--delay DURATION | --at TIME | --clear-delay] [--depends-on IDS] [--after-any IDS] [--clear-deps] [--env KEY[=VAL]]...
+queuer edit ID [--cmd CMD | -- <cmd...>] [--cwd DIR] [--timeout SECONDS] [--channel N] [--retries N] [--on-fail pause|continue] [--on-finish CMD] [--on-error CMD] [--delay DURATION | --at TIME | --clear-delay] [--depends-on IDS] [--after-any IDS] [--clear-deps] [--env KEY[=VAL]]...
 queuer pause [--channel N]
 queuer resume [--channel N]
 queuer doctor [--fix] [--json]
 queuer daemon start | stop [--yes] | restart [--yes] | status | logs [-n N] [-f]
 queuer logs ID [--tail]
-queuer clean-logs [--days N] [--dry-run]
+queuer clean-logs [--days N] [--max-mb N] [--dry-run]
 queuer connect [--export | --import STRING | --from [USER@]HOST | --add-bot | --off] [--id NAME] [--listen | --no-listen] [--list] [--remove-chat CHAT_ID] [--remove-bot [--all]] [--bot ID_OR_@NAME]
 ```
 
@@ -171,6 +179,41 @@ cancelled, skipped or interrupted — pauses its channel and sends the Telegram 
 (with `--channel N`) carries on. With `--retries`, only the final failure pauses
 (retries copy the setting). Requeued jobs and sweep jobs keep it.
 
+**Hooks (`--on-finish CMD`, `--on-error CMD`).** A hook is a shell command (run with
+`/bin/sh -c`) the daemon starts after the job's **final** outcome, for example to copy results
+when a long run ends:
+
+```bash
+qur add --on-finish 'rsync -a out/ host:results/' -- ./run.sh
+qur add --on-error 'echo "job $QUR_JOB_ID failed ($QUR_EXIT_CODE)" | mail -s queuer me' -- ./run.sh
+```
+
+- `--on-finish` runs when the job ended `done`, `failed`, or was cancelled while running;
+  `--on-error` only when it ended `failed` (non-zero exit, timeout, failed start). With
+  `--retries` only the last attempt counts (retries and requeues copy the hooks). Skipped jobs,
+  jobs cancelled while still queued, and jobs `interrupted` by a daemon stop run no hooks.
+- Order: the global hook (below), then `--on-finish`, then `--on-error`, one after another.
+- The hook runs in the job's cwd with the job's environment plus `QUR_HOOK`
+  (`post-job`/`on-finish`/`on-error`), `QUR_JOB_ID`, `QUR_STATUS`, `QUR_EXIT_CODE` (empty if
+  none), `QUR_CHANNEL`, `QUR_CWD`, `QUR_LOG`, `QUR_COMMAND` (the raw command, shell-quoted) and
+  `QUR_DURATION_SECS`.
+- It runs in the background: it never holds the channel, the next job starts at once. A hook
+  still running after 5 minutes is killed (so is one still running when the daemon stops, after
+  a few seconds' grace). Its output (first 64 KB) and exit code are appended to the **job's log**
+  (`qur logs ID` shows `[queuer] hook on-finish: ...` and `... exited 0`); a non-zero exit or a
+  timeout is also noted in the daemon journal. A failing hook never changes the job's status.
+- A hook is stored and shown in `qur show` and Telegram Details exactly as typed, so do not
+  put secrets in it (pass them through the environment, like for commands). Hooks are not
+  redacted in `qur show`. `qur edit ID --on-finish CMD` / `--on-error CMD` set them on a queued job;
+  an empty string removes one. At most 4096 characters.
+- **Global post-job hook.** Set `QUEUER_POST_JOB_HOOK='command'` in the daemon's environment
+  (`systemctl --user edit queuerd`: `[Service]` / `Environment=QUEUER_POST_JOB_HOOK=...`, then
+  `qur daemon restart`) to run one command after every job that ends `done`, `failed` or
+  `cancelled` (same rules and variables as above, `QUR_HOOK=post-job`). A bad value (too long) is
+  ignored with a warning in the journal.
+- Not done: more notifiers (email, ntfy, webhook, Matrix) as built-in, Telegram-style channels.
+  A hook can call `curl`, `mail` or `ntfy` itself.
+
 **Delayed start.** `--delay 30m` (units `s`/`m`/`h`/`d`, chainable: `1h30m`) or
 `--at 22:00` (the next time your local clock shows that; today if it is still ahead,
 else tomorrow) or `--at "2026-12-01 06:30"` (that exact local moment, which must be in
@@ -246,6 +289,25 @@ retries start as soon as they reach the front, as before.
 accepting the job — a bad command is rejected immediately, not an hour
 later when it reaches the front of the queue.
 
+`--dry-run` checks and places the job exactly as a real `add` would, then queues nothing:
+
+```
+qur add --dry-run --delay 2h --env OMP_NUM_THREADS=8 -- python train.py
+```
+
+It prints the raw command (what you typed) and the resolved command (interpreter and
+executable as absolute paths, what will really be exec'd), the working directory, the
+environment the job would get (same masking as `qur show`: copied names only, `NAME=***` for
+secret-looking names), the channel, and the queue position (`queue position: 3 (2 queued
+ahead; job 7 is running now)`; with `--now` the position on the `--now` lane and the job that
+would be frozen). It also says when the channel is paused and when a `--depends-on` job has
+already failed, so the new job would be skipped at once. The daemon does the real validation
+and placement inside a transaction that it rolls back, so every error (bad command, unknown
+`--before`/`--after`/dependency id, deadlock, bad cwd) is exactly the one a real add gives,
+no job id is used up, no worker is woken, no job is frozen and no Telegram message is sent.
+Works with every other option; a sweep (`--each`/`--array`) prints its first 5 jobs and the
+position range. The daemon must be running (the check needs the queue).
+
 `--timeout SECONDS` kills the job automatically if it runs longer than
 that (SIGTERM, then SIGKILL if it doesn't exit within a grace period),
 and marks it `failed` with `note: timed out`.
@@ -271,8 +333,40 @@ They are shown in the order you give them.
 
 Full detail on one or more jobs — both command forms, cwd, every timestamp,
 duration, exit code, timeout, auto-retry count and retry delay, extra environment (see "Environment" under
-`add`), pid, and log path. With
-`--json`, one ID prints an object; several print a list.
+`add`), peak memory and CPU time of a finished job (see "Resource accounting" below), pid, and
+log path. With `--json`, one ID prints an object; several print a list.
+
+#### Resource accounting
+
+While a job runs, the daemon samples its process from `/proc` every 0.2 s and stores the result
+when the job ends, whatever way it ends (done, failed, timed out, cancelled, interrupted).
+`qur show` then has two more rows, and the Telegram Details button the same two:
+
+```
+peak RSS   30.0 GB
+cpu time   2m14s user + 3s sys
+```
+
+- **peak RSS**: the process's high-water mark of resident memory (`VmHWM` in `/proc/PID/status`),
+  shown as KB, MB or GB. Use it to size the next DFT or LAMMPS run.
+- **cpu time**: user and system CPU seconds of the process (`utime`/`stime`). Wall time is the
+  existing `duration`.
+- The finished-job message in Telegram gets a short tail: `... · exit 0 · used 31.0 GB · 1h58m cpu`.
+  Whichever of the two was captured is shown; a job that has nothing is shown as before.
+- Raw numbers are in `qur show --json`, `qur history --json` and `qur export` as `max_rss_kb`,
+  `cpu_user_secs`, `cpu_sys_secs` (`null` = not captured). They are not in the `list` table or in
+  `history --csv`. A requeued job starts with empty usage and gets its own numbers when it runs.
+
+What it does NOT measure (read before trusting a number):
+
+- Only the process `qur` starts, not its children. `qur add -- python run.py` or `-- lmp -in in.x`
+  measures that process itself. `qur add -- ./run.sh` (or any command with shell syntax, which
+  runs under `bash -c`) measures the shell; `mpirun -np 16 lmp ...` measures `mpirun`, not the 16
+  ranks; subprocesses started by your program are not added. For those, make the real program the
+  queued command, or run an external monitor.
+- A job shorter than about 0.2 s has no numbers (it ends before the first sample). The CPU time can
+  lag the real end by up to 0.2 s, and a memory spike in the last 0.2 s may be missed.
+- Linux only (`/proc`). Where `/proc` is unreadable a job just has no numbers; it never fails.
 
 ### `wait ID|RANGE... | --channel N`
 
@@ -298,7 +392,7 @@ channel stays busy, so `--channel` on it waits until `qur resume`. A channel tha
 `{"channel", "idle", "timed_out", "exit_code"}`). It polls the daemon every 1.5 s.
 
 ```
-qur add -- ./prep.sh            # "Queued as job 40"
+qur add -- ./prep.sh            # "Queued as job 40", then echoes the command and cwd
 qur wait 40 && qur add -- ./use_prep.sh
 qur wait 31-33 --timeout 2h || echo "sweep did not finish cleanly"
 ```
@@ -323,7 +417,10 @@ the last 10.
 - `--grep TEXT`: the command you typed contains TEXT (case-insensitive; the words are joined by
   spaces, so `--grep "--lr 0.1"` works). The resolved command is not searched
 - `--limit N` / `-n N`: most rows, default 50, at most 10000
-- `--full`: resolved commands; `--json`: a JSON list of the job records
+- `--full`: resolved commands; `--json`: a JSON list of the job records; `--csv`: CSV with a header row
+  (`id, channel, status, command, cwd, origin, enqueued_at, started_at, finished_at, duration_secs,
+  exit_code, note`; UTC timestamps; a cell starting with `=`, `+`, `-` or `@` gets a leading `'` so a
+  spreadsheet does not run it as a formula). `--csv` and `--json` cannot be combined
 
 Filters combine (all must match). Exit code 0 even when nothing matches.
 
@@ -331,6 +428,21 @@ Filters combine (all must match). Exit code 0 even when nothing matches.
 qur history --status failed --since 2d
 qur history --channel 2 --grep train.py --limit 200
 qur history --status failed --status interrupted --json
+qur history --status failed --csv > failed.csv
+```
+
+### `export [--channel N] [--status S]`
+
+Prints every job row as a JSON list on stdout (oldest id first): queued, running, frozen and
+finished jobs, with commands, cwd, `env_extra`, times, exit codes, retry/dependency settings,
+resource usage (`max_rss_kb`, `cpu_user_secs`, `cpu_sys_secs`) and `depends_on`/`after_any`. No logs. `--status` (repeatable) takes any job status (`queued`,
+`running`, `stopped`, `done`, `failed`, `cancelled`, `skipped`, `interrupted`). It is a read-only
+backup/inspection dump; there is no import. Values given with `--env` are written as stored
+(unmasked), so keep the file private.
+
+```bash
+qur export > jobs.json
+qur export --channel 2 --status queued > ch2-queue.json
 ```
 
 ### `cancel [JOB_ID]`
@@ -462,7 +574,7 @@ one chat on your phone.
 ```
 ✅ done · job 12 · 2h13m
 $ python train.py --epochs 50
-bigbox [a3f9] · ch 1 · exit 0
+bigbox [a3f9] · ch 1 · exit 0 · used 31.0 GB · 2h9m cpu
 [ 🔁 Requeue ] [ ℹ️ Details ] [ 📄 Logs ]
 ```
 
@@ -478,8 +590,8 @@ paths or raw error text — use `qur show ID` on that machine for those. Secrets
 command are masked as `***` first (see [Secret redaction](#secret-redaction-telegram-only)).
 
 **Details button.** Replies with everything `qur show ID` prints (raw and
-resolved command, cwd, timestamps, duration, exit code, timeout, origin, environment, pid, log
-path, note), laid out for Telegram: bold labels, monospace commands and paths.
+resolved command, cwd, timestamps, duration, exit code, timeout, origin, peak RSS and CPU time,
+environment, pid, log path, note), laid out for Telegram: bold labels, monospace commands and paths.
 This is the one place paths leave the machine, and only to your paired chats, on
 request. `qur show` itself is unchanged. Secrets are masked as `***` here too.
 
@@ -621,15 +733,50 @@ token on all machines, send `/revoke` to @BotFather.
 - A failed send (offline, Telegram down) is logged to the daemon's journal and
   dropped. It never delays or fails a job. Messages are not queued for later.
 
-### `logs ID [-n N] [--tail]`
+### `logs ID [-n N] [--tail]` / `logs --running [--channel N]`
 
 Reads the job's log file straight off disk — this doesn't go through
 the daemon at all, so it works even if `queuerd` isn't running. A big log is
 streamed in chunks, never loaded whole. `-n N` / `--lines N` prints only the last
 N lines. `--tail` follows the file as it grows (Ctrl-C to stop); `-n 20 --tail`
-shows the last 20 lines first, then follows. Each job's log
+shows the last 20 lines first, then follows. `qur logs --running` picks the job running now
+on a channel (default 1, `--channel N` for another) so you do not need its id; it prints
+`(job N)` on stderr first, and fails with a clear message if nothing is running there. Each job's log
 is capped at 50MB; once hit, further output is dropped and a single
 `[queuer] log truncated at 50MB` marker is appended.
+
+### `clean-logs [--days N] [--max-mb N] [--dry-run]`
+
+Deletes the logs of finished jobs (done, failed, cancelled, skipped, interrupted) that ended
+more than `--days` ago (default 30), plus orphaned logs whose job row is gone from the
+history (an orphan only when its file is also older than `--days`). `--max-mb N` then also
+deletes the oldest remaining finished logs until the whole log folder is at most N MB
+(logs of queued, running and frozen jobs count towards the total but are never deleted, so
+the folder can stay above the limit while they are big). Only files named `<job id>.log`
+are considered. `--dry-run` lists what would go. It reads the database directly, so it works
+without the daemon, and refuses to run when the database is missing.
+
+#### Automatic log cleaning
+
+The daemon can run the same cleaning by itself on a timer, so you do not have to run
+`qur clean-logs` by hand. It is **off unless you set a limit**, because it deletes files.
+Set these in the daemon's environment (for example `systemctl --user edit queuerd`:
+`[Service]` / `Environment=QUEUER_LOG_MAX_AGE_DAYS=30`, then `qur daemon restart`):
+
+| Variable | Meaning |
+| --- | --- |
+| `QUEUER_LOG_MAX_AGE_DAYS=N` | delete logs of jobs finished more than N days ago (positive integer) |
+| `QUEUER_LOG_MAX_MB=N` | keep the log folder at most N MB, deleting the oldest finished logs first (positive integer) |
+| `QUEUER_LOG_CLEAN_HOURS=H` | how often to clean, in hours (positive number, may be fractional; default 6, never shorter than 1 minute) |
+
+Either limit alone is enough; with both, age is applied first and then the size limit. The
+first clean runs one minute after the daemon starts, then every `QUEUER_LOG_CLEAN_HOURS`.
+The rules are exactly those of `qur clean-logs` (same `queuer.logclean` code): unfinished
+jobs' logs are never touched and a log whose job row was pruned is judged by its file time.
+When something was deleted the daemon writes one line to its journal (`qur daemon logs`:
+`cleaned N log(s), X KB`); a failure is reported once and the timer keeps going. A bad
+value (not a positive number) is ignored with a warning in the journal. Nothing is
+deleted from the database, only log files.
 
 ## Managing the daemon
 
@@ -697,7 +844,8 @@ the first time the daemon (or `clean-logs`) opens it. A database written by a ne
 
 The database, log, socket and notification paths can be overridden with `QUEUER_DB_PATH`,
 `QUEUER_LOG_DIR`, `QUEUER_SOCKET_PATH`, `QUEUER_NOTIFY_PATH` and `QUEUER_REDACT_PATH` env vars (and `QUEUER_KEEP`, the
-number of finished jobs kept per channel, default 200) — mainly useful for
+number of finished jobs kept per channel, default 200; `QUEUER_LOG_MAX_AGE_DAYS`, `QUEUER_LOG_MAX_MB` and
+`QUEUER_LOG_CLEAN_HOURS` for automatic log cleaning, see `clean-logs`; `QUEUER_POST_JOB_HOOK`, the global post-job hook, see `add`) — mainly useful for
 running the daemon against a scratch location during manual testing,
 without touching real state.
 
@@ -807,6 +955,7 @@ For a design/architecture writeup and the phase-by-phase build plan, see
   (`cmd &`) keeps its channel busy until that child exits too. `qur cancel` kills the whole
   group.
 - Retries are opt-in per job (`--retries`), immediate unless `--retry-delay` is set, and go to the end of the queue.
+- Hooks (`--on-finish`, `--on-error`, `QUEUER_POST_JOB_HOOK`) are best-effort background commands: no retry, a 5-minute limit, and a hook still running when the daemon stops is killed. Their output goes to the job's log.
 - Notifications are Telegram-only, best-effort (a send that fails is dropped,
   not retried), and visible to Telegram. Pair one machine at a time (see
   `connect`).
@@ -817,6 +966,9 @@ For a design/architecture writeup and the phase-by-phase build plan, see
 - A job that starts a background child (`bash -c "sleep 8 & echo hi"`) stays `running`
   until that child exits too: the daemon waits for the job's output pipe to close, and
   the child holds it open. `qur cancel ID` ends the whole process group.
+- Resource accounting (`peak RSS`, `cpu time`) covers only the process `qur` starts, not its
+  children (a shell wrapper, `mpirun` and its ranks, subprocesses), is sampled every 0.2 s and is
+  Linux-only. See "Resource accounting" under `show`.
 - No sandboxing — jobs run with your own user permissions, same as
   running them directly in a shell.
 - A second `queuerd` refuses to start while one already answers on the socket

@@ -34,6 +34,7 @@ DEFAULT_KEEP = 200  # finished jobs kept per channel by the daemon (QUEUER_KEEP 
 LIST_BACKLOG = 10  # finished jobs `qur list` / the Telegram list show per channel
 MAX_HISTORY = 10000  # most rows one history query returns
 MAX_RETRY_DELAY_SECS = 30 * 86400  # longest wait before an automatic retry (also caps --retry-backoff)
+MAX_HOOK_LEN = 4096  # longest --on-finish / --on-error command (characters)
 BUSY_TIMEOUT_MS = 5000  # how long a connection waits for another one's write lock before "database is locked"
 EDIT_LOCK_SECS = 30 * 60  # an edit lock older than this is stale and ignored (a crashed editor never blocks a channel)
 MAX_SWEEP = 1000  # most jobs one `add` creates (--each/--array) and most ids one dependency list holds
@@ -67,7 +68,12 @@ CREATE TABLE IF NOT EXISTS {name} (
     not_before    TEXT,
     on_fail       TEXT NOT NULL DEFAULT 'continue' CHECK (on_fail IN ('continue','pause')),
     retry_delay_secs INTEGER,
-    retry_backoff INTEGER NOT NULL DEFAULT 0
+    retry_backoff INTEGER NOT NULL DEFAULT 0,
+    max_rss_kb    INTEGER,
+    cpu_user_secs REAL,
+    cpu_sys_secs  REAL,
+    on_finish_cmd TEXT,
+    on_error_cmd  TEXT
 );
 """
 
@@ -227,6 +233,30 @@ def _migrate_add_retry_delay(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE jobs ADD COLUMN retry_backoff INTEGER NOT NULL DEFAULT 0")
 
 
+def _migrate_add_resource_usage(conn: sqlite3.Connection) -> None:
+    """DBs created before F10 resource accounting lack `max_rss_kb` (peak RSS in
+    KB, sampled from /proc while the job ran) and `cpu_user_secs` /
+    `cpu_sys_secs`. Plain ADD COLUMN, no CHECK change. No-op once migrated."""
+    cols = [r["name"] for r in conn.execute("PRAGMA table_info(jobs)").fetchall()]
+    if "max_rss_kb" not in cols:
+        conn.execute("ALTER TABLE jobs ADD COLUMN max_rss_kb INTEGER")
+    if "cpu_user_secs" not in cols:
+        conn.execute("ALTER TABLE jobs ADD COLUMN cpu_user_secs REAL")
+    if "cpu_sys_secs" not in cols:
+        conn.execute("ALTER TABLE jobs ADD COLUMN cpu_sys_secs REAL")
+
+
+def _migrate_add_hooks(conn: sqlite3.Connection) -> None:
+    """DBs created before F12 job hooks lack `on_finish_cmd` / `on_error_cmd` (the
+    shell commands of `--on-finish` / `--on-error`; NULL = none). Plain ADD COLUMN,
+    no CHECK change. No-op once migrated."""
+    cols = [r["name"] for r in conn.execute("PRAGMA table_info(jobs)").fetchall()]
+    if "on_finish_cmd" not in cols:
+        conn.execute("ALTER TABLE jobs ADD COLUMN on_finish_cmd TEXT")
+    if "on_error_cmd" not in cols:
+        conn.execute("ALTER TABLE jobs ADD COLUMN on_error_cmd TEXT")
+
+
 # Numbered migrations, run in order, each in its own transaction that also bumps the
 # single-row `schema_version` table. To change the schema: append ONE new
 # (number, function) entry (never edit or reorder old ones) and, if a fresh DB needs the
@@ -238,6 +268,8 @@ _MIGRATIONS: tuple[tuple[int, Callable[[sqlite3.Connection], None]], ...] = (
     (2, _migrate_add_retries),
     (3, _migrate_add_deps_and_delay),
     (4, _migrate_add_retry_delay),
+    (5, _migrate_add_resource_usage),
+    (6, _migrate_add_hooks),
 )
 SCHEMA_VERSION = _MIGRATIONS[-1][0]
 
@@ -344,6 +376,23 @@ def _reindex_queue(conn: sqlite3.Connection, ordered_ids: list[int]) -> None:
 # ---------------------------------------------------------------------------
 
 
+def check_hook(value: Any, what: str) -> str | None:
+    """Validate a hook command (F12): None or an empty/blank string = no hook (None);
+    otherwise a string without NUL bytes, at most MAX_HOOK_LEN characters. Returns the
+    command as stored."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{what} must be a string")
+    if not value.strip():
+        return None
+    if "\0" in value:
+        raise ValueError(f"{what} must not contain NUL bytes")
+    if len(value) > MAX_HOOK_LEN:
+        raise ValueError(f"{what} is too long (at most {MAX_HOOK_LEN} characters)")
+    return value
+
+
 def enqueue(
     conn: sqlite3.Connection,
     *,
@@ -366,6 +415,8 @@ def enqueue(
     on_fail: str = "continue",
     retry_delay_secs: int | None = None,
     retry_backoff: bool = False,
+    on_finish_cmd: str | None = None,
+    on_error_cmd: str | None = None,
     commit: bool = True,
 ) -> int:
     """Insert a new queued job on `channel`. Returns the new job's id.
@@ -401,6 +452,9 @@ def enqueue(
     waits before it may start; `retry_backoff` doubles that wait for every
     attempt already made. Both are copied to retries and requeues.
 
+    `on_finish_cmd` / `on_error_cmd` (F12; None = none) are shell commands the daemon
+    runs after the job's final outcome (see `check_hook`); copied to retries and requeues.
+
     Nothing is written if anything is rejected. `commit=False` leaves the
     insert in the open transaction so several jobs can be added all-or-nothing
     (the caller commits, or rolls back).
@@ -413,6 +467,8 @@ def enqueue(
         raise ValueError(f"retry delay must be between 1 second and {MAX_RETRY_DELAY_SECS // 86400} days")
     if retry_backoff and retry_delay_secs is None:
         raise ValueError("retry backoff needs a retry delay")
+    on_finish_cmd = check_hook(on_finish_cmd, "on-finish command")
+    on_error_cmd = check_hook(on_error_cmd, "on-error command")
     deps = deps or {}
     if is_priority and (deps or not_before):
         raise ValueError("--now cannot be combined with dependencies or a start time")
@@ -430,8 +486,9 @@ def enqueue(
             INSERT INTO jobs
                 (channel, status, position, raw_cmd, resolved_cmd, cwd, env_extra,
                  enqueued_at, log_path, timeout_secs, is_priority, max_retries, attempt,
-                 parent_id, origin, not_before, on_fail, retry_delay_secs, retry_backoff)
-            VALUES (?, 'queued', NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 parent_id, origin, not_before, on_fail, retry_delay_secs, retry_backoff,
+                 on_finish_cmd, on_error_cmd)
+            VALUES (?, 'queued', NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 channel,
@@ -451,6 +508,8 @@ def enqueue(
                 on_fail,
                 retry_delay_secs,
                 int(retry_backoff),
+                on_finish_cmd,
+                on_error_cmd,
             ),
         )
         new_id = cur.lastrowid
@@ -645,6 +704,28 @@ def get_history(
     return out
 
 
+def get_export(
+    conn: sqlite3.Connection, *, statuses: list[str] | None = None, channel: int | None = None
+) -> list[dict[str, Any]]:
+    """F24: every job row (queued, running, frozen and finished), oldest id first, for
+    `qur export`. `statuses` (any job status; None = all) and `channel` filter it."""
+    valid = ACTIVE_STATUSES + TERMINAL_STATUSES
+    for status in statuses or []:
+        if status not in valid:
+            raise ValueError(f"unknown status {status!r}; use one of {', '.join(valid)}")
+    # only "?" placeholders are interpolated; every value below is bound as a parameter
+    sql = "SELECT * FROM jobs WHERE 1 = 1"
+    params: list[Any] = []
+    if statuses:
+        sql += f" AND status IN ({','.join('?' * len(statuses))})"  # nosec B608
+        params.extend(statuses)
+    if channel is not None:
+        sql += " AND channel = ?"
+        params.append(channel)
+    sql += " ORDER BY id ASC"
+    return [_row_to_dict(r) for r in conn.execute(sql, params)]
+
+
 def get_job(conn: sqlite3.Connection, job_id: int) -> dict[str, Any] | None:
     row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
     return _row_to_dict(row) if row else None
@@ -697,6 +778,9 @@ def mark_finished(
     exit_code: int | None = None,
     note: str | None = None,
     keep_backlog: int = 10,
+    max_rss_kb: int | None = None,
+    cpu_user_secs: float | None = None,
+    cpu_sys_secs: float | None = None,
 ) -> None:
     if status not in TERMINAL_STATUSES:
         raise ValueError(f"invalid terminal status: {status}")
@@ -706,10 +790,11 @@ def mark_finished(
     conn.execute(
         """
         UPDATE jobs
-        SET status = ?, exit_code = ?, note = ?, finished_at = ?
+        SET status = ?, exit_code = ?, note = ?, finished_at = ?,
+            max_rss_kb = ?, cpu_user_secs = ?, cpu_sys_secs = ?
         WHERE id = ?
         """,
-        (status, exit_code, note, _now(), job_id),
+        (status, exit_code, note, _now(), max_rss_kb, cpu_user_secs, cpu_sys_secs, job_id),
     )
     conn.commit()
     _prune_backlog(conn, job["channel"], keep=keep_backlog)
@@ -1024,7 +1109,7 @@ def release_edit_lock(conn: sqlite3.Connection, job_id: int, holder_pid: int | N
 # columns `edit_job` may set: a fixed whitelist, so the SET clause below is never built from input
 _EDITABLE_COLUMNS = (
     "raw_cmd", "resolved_cmd", "cwd", "env_extra", "timeout_secs", "max_retries", "on_fail",
-    "not_before", "retry_delay_secs", "retry_backoff",
+    "not_before", "retry_delay_secs", "retry_backoff", "on_finish_cmd", "on_error_cmd",
 )
 
 
@@ -1057,6 +1142,10 @@ def edit_job(
         raise ValueError(f"the edit lock on job {job_id} was lost (expired, or the daemon restarted): edit again")
     if "on_fail" in updates and updates["on_fail"] not in ON_FAIL_MODES:
         raise ValueError(f"on_fail must be one of {', '.join(ON_FAIL_MODES)}")
+    updates = dict(updates)
+    for hook_column, hook_label in (("on_finish_cmd", "on-finish command"), ("on_error_cmd", "on-error command")):
+        if hook_column in updates:
+            updates[hook_column] = check_hook(updates[hook_column], hook_label)
     deps = dict(deps) if deps is not None else None
     if deps is not None:
         for dep_id, mode in deps.items():
@@ -1148,7 +1237,7 @@ def _reorder(
 
 def requeue(conn: sqlite3.Connection, job_id: int, *, log_path: str, auto: bool = False) -> int:
     """Re-enqueue a finished job (any terminal state) with its original argv/
-    cwd/env/timeout/channel/max_retries/on_fail/retry delay, appended to the end
+    cwd/env/timeout/channel/max_retries/on_fail/retry delay/hooks, appended to the end
     of its channel's queue. Dependencies and a start time are NOT copied: the copy
     runs when it reaches the front. Returns the new job's id.
 
@@ -1186,6 +1275,8 @@ def requeue(conn: sqlite3.Connection, job_id: int, *, log_path: str, auto: bool 
         on_fail=job["on_fail"],
         retry_delay_secs=job["retry_delay_secs"],
         retry_backoff=bool(job["retry_backoff"]),
+        on_finish_cmd=job["on_finish_cmd"],
+        on_error_cmd=job["on_error_cmd"],
         not_before=not_before,
         attempt=job["attempt"] + 1 if auto else 0,
         parent_id=job_id,

@@ -13,6 +13,7 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -109,6 +110,85 @@ async def daemon(tmp_path):
         pass  # wait_for already cancelled the task
     except asyncio.CancelledError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# F10: _read_proc_usage (pure /proc parsing, no daemon needed)
+# ---------------------------------------------------------------------------
+
+def test_read_proc_usage_for_live_process():
+    from queuer.daemon import _read_proc_usage
+
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(0.5)"])
+    try:
+        time.sleep(0.1)
+        sample = _read_proc_usage(proc.pid)
+        assert sample is not None
+        rss_kb, user_secs, sys_secs = sample
+        assert rss_kb is None or rss_kb > 0
+        assert user_secs >= 0
+        assert sys_secs >= 0
+    finally:
+        proc.terminate()
+        proc.wait()
+
+
+def test_read_proc_usage_for_gone_pid_returns_none():
+    from queuer.daemon import _read_proc_usage
+
+    proc = subprocess.Popen(["true"])
+    proc.wait()  # reaped: its /proc entry is gone
+    assert _read_proc_usage(proc.pid) is None
+
+
+def test_read_proc_usage_for_this_process_has_a_peak_rss():
+    from queuer.daemon import _read_proc_usage
+
+    sample = _read_proc_usage(os.getpid())
+    assert sample is not None
+    rss_kb, user_secs, sys_secs = sample
+    assert rss_kb is not None and rss_kb > 0  # VmHWM exists for a live process
+    assert user_secs >= 0 and sys_secs >= 0
+
+
+def test_read_proc_usage_handles_a_command_name_with_spaces_and_parens(monkeypatch, tmp_path):
+    from queuer import daemon as daemon_mod
+
+    # comm = "a) (b c", utime = 250 ticks, stime = 50 ticks (fields 14 and 15)
+    stat_line = "4242 (a) (b c) S 1 4242 4242 0 -1 4194560 100 0 0 0 250 50 0 0 20 0 1 0 1000 1000 100 18446744073709551615"
+    status = "Name:\ta\nVmPeak:\t   9000 kB\nVmHWM:\t    5120 kB\nVmRSS:\t    4000 kB\n"
+    files = {"/proc/4242/stat": stat_line.encode(), "/proc/4242/status": status.encode()}
+    real_open = open
+
+    def fake_open(path, *a, **kw):
+        if str(path) in files:
+            p = tmp_path / str(path).replace("/", "_")
+            p.write_bytes(files[str(path)])
+            return real_open(p, *a, **kw)
+        return real_open(path, *a, **kw)
+
+    monkeypatch.setattr("builtins.open", fake_open)
+    monkeypatch.setattr(daemon_mod, "_CLK_TCK", 100)
+    assert daemon_mod._read_proc_usage(4242) == (5120, 2.5, 0.5)
+
+
+def test_read_proc_usage_without_a_vmhwm_line_gives_no_rss(monkeypatch, tmp_path):
+    from queuer import daemon as daemon_mod
+
+    stat_line = "7 (x) S 1 7 7 0 -1 0 0 0 0 0 100 0 0 0 20 0 1 0 1 1 1 1"
+    files = {"/proc/7/stat": stat_line.encode(), "/proc/7/status": b"Name:\tx\nState:\tZ (zombie)\n"}
+    real_open = open
+
+    def fake_open(path, *a, **kw):
+        if str(path) in files:
+            p = tmp_path / str(path).replace("/", "_")
+            p.write_bytes(files[str(path)])
+            return real_open(p, *a, **kw)
+        return real_open(path, *a, **kw)
+
+    monkeypatch.setattr("builtins.open", fake_open)
+    monkeypatch.setattr(daemon_mod, "_CLK_TCK", 100)
+    assert daemon_mod._read_proc_usage(7) == (None, 1.0, 0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -710,6 +790,112 @@ async def test_job_under_timeout_is_unaffected(daemon):
     job = await wait_for_status(daemon.socket_path, job_id, {"failed", "done"}, timeout=5.0)
     assert job["status"] == "done"
     assert job["note"] is None
+
+
+# ---------------------------------------------------------------------------
+# F10: resource accounting (peak RSS, user/system CPU time)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_resource_usage_recorded_for_a_job_that_runs_long_enough(daemon, monkeypatch):
+    monkeypatch.setattr("queuer.daemon.RESOURCE_SAMPLE_SECS", 0.02)
+    resp = await send(
+        daemon.socket_path, "add",
+        argv=[sys.executable, "-c", "import time; x = bytearray(20 * 1024 * 1024); time.sleep(0.4)"],
+        cwd=CWD,
+    )
+    job_id = resp["data"]["id"]
+
+    job = await wait_for_status(daemon.socket_path, job_id, {"done", "failed"}, timeout=10.0)
+    assert job["status"] == "done"
+    assert job["max_rss_kb"] is not None
+    assert job["max_rss_kb"] >= 20 * 1024  # at least the 20MB buffer we allocated, in KB
+    assert job["cpu_user_secs"] is not None
+    assert job["cpu_user_secs"] >= 0
+    assert job["cpu_sys_secs"] is not None
+    assert job["cpu_sys_secs"] >= 0
+
+
+@pytest.mark.asyncio
+async def test_resource_usage_recorded_on_timeout(daemon, monkeypatch):
+    monkeypatch.setattr("queuer.daemon.RESOURCE_SAMPLE_SECS", 0.02)
+    resp = await send(
+        daemon.socket_path, "add",
+        argv=[sys.executable, "-c", "import time; x = bytearray(10 * 1024 * 1024); time.sleep(10)"],
+        cwd=CWD, timeout_secs=1,
+    )
+    job_id = resp["data"]["id"]
+
+    job = await wait_for_status(daemon.socket_path, job_id, {"failed", "done"}, timeout=10.0)
+    assert job["status"] == "failed"
+    assert job["note"] == "timed out"
+    assert job["max_rss_kb"] is not None
+    assert job["max_rss_kb"] >= 10 * 1024
+
+
+@pytest.mark.asyncio
+async def test_resource_usage_absent_before_first_sample(daemon):
+    # the default sampling interval is coarse relative to `echo`'s lifetime, so a
+    # near-instant job is never sampled -- querying is never worse than "no data"
+    resp = await send(daemon.socket_path, "add", argv=["echo", "hi"], cwd=CWD)
+    job_id = resp["data"]["id"]
+    job = await wait_for_status(daemon.socket_path, job_id, {"done", "failed"})
+    assert job["status"] == "done"
+    assert job["max_rss_kb"] is None or job["max_rss_kb"] >= 0
+    # whatever it recorded (possibly nothing), it must not have crashed the job
+
+
+@pytest.mark.asyncio
+async def test_resource_usage_recorded_for_a_cancelled_job(daemon, monkeypatch):
+    monkeypatch.setattr("queuer.daemon.RESOURCE_SAMPLE_SECS", 0.02)
+    resp = await send(
+        daemon.socket_path, "add",
+        argv=[sys.executable, "-c", "import time; x = bytearray(10 * 1024 * 1024); time.sleep(30)"],
+        cwd=CWD,
+    )
+    job_id = resp["data"]["id"]
+    await wait_for_status(daemon.socket_path, job_id, {"running"})
+    await asyncio.sleep(0.6)  # let the interpreter start, allocate, and be sampled
+    assert (await send(daemon.socket_path, "cancel", id=job_id))["ok"]
+
+    job = await wait_for_status(daemon.socket_path, job_id, {"cancelled", "failed", "done"}, timeout=10.0)
+    assert job["status"] == "cancelled"
+    assert job["max_rss_kb"] is not None and job["max_rss_kb"] >= 10 * 1024
+
+
+@pytest.mark.asyncio
+async def test_a_queued_job_has_no_resource_usage(daemon):
+    blocker = (await send(daemon.socket_path, "add", argv=["sleep", "30"], cwd=CWD))["data"]["id"]
+    waiting = (await send(daemon.socket_path, "add", argv=["echo", "x"], cwd=CWD))["data"]["id"]
+    job = (await send(daemon.socket_path, "show", id=waiting))["data"]
+    assert job["status"] == "queued"
+    assert job["max_rss_kb"] is None and job["cpu_user_secs"] is None and job["cpu_sys_secs"] is None
+    await send(daemon.socket_path, "cancel", id=blocker)  # cleanup
+    await send(daemon.socket_path, "cancel", id=waiting)
+
+
+@pytest.mark.asyncio
+async def test_sample_usage_keeps_the_last_reading_when_the_process_is_gone(daemon, monkeypatch):
+    readings = iter([(100, 1.0, 0.5), (4096, 2.0, 0.75), None, None])
+    monkeypatch.setattr("queuer.daemon._read_proc_usage", lambda pid: next(readings, None))
+    monkeypatch.setattr("queuer.daemon.RESOURCE_SAMPLE_SECS", 0.01)
+    usage: dict = {"rss_kb": None, "cpu_user": None, "cpu_sys": None}
+    task = asyncio.create_task(daemon._sample_usage(12345, usage))
+    await asyncio.sleep(0.2)  # long enough for all four readings
+    await daemon._stop_usage_sampling(task)
+    assert usage == {"rss_kb": 4096, "cpu_user": 2.0, "cpu_sys": 0.75}
+    assert task.done()
+
+
+@pytest.mark.asyncio
+async def test_sample_usage_with_no_reading_leaves_usage_empty(daemon, monkeypatch):
+    monkeypatch.setattr("queuer.daemon._read_proc_usage", lambda pid: None)
+    monkeypatch.setattr("queuer.daemon.RESOURCE_SAMPLE_SECS", 0.01)
+    usage: dict = {"rss_kb": None, "cpu_user": None, "cpu_sys": None}
+    task = asyncio.create_task(daemon._sample_usage(12345, usage))
+    await asyncio.sleep(0.05)
+    await daemon._stop_usage_sampling(task)
+    assert usage == {"rss_kb": None, "cpu_user": None, "cpu_sys": None}
 
 
 # ---------------------------------------------------------------------------
@@ -4131,3 +4317,486 @@ async def test_a_backgrounded_child_keeps_the_channel_busy_until_it_ends(daemon)
     started = datetime.fromisoformat(shown_a["started_at"])
     finished = datetime.fromisoformat(shown_a["finished_at"])
     assert (finished - started).total_seconds() >= 1.0  # it waited for the child, not just the shell
+
+
+@pytest.mark.asyncio
+async def test_export_returns_all_rows_with_dependencies(daemon):
+    ids = await _history_fixture(daemon)
+    blocker = (await send(daemon.socket_path, "add", argv=["sleep", "30"], cwd=CWD, channel=4))["data"]["id"]
+    waiting = (await send(daemon.socket_path, "add", argv=["true"], cwd=CWD, channel=4, depends_on=[blocker]))["data"]["id"]
+    await wait_for_status(daemon.socket_path, blocker, {"running"})
+
+    resp = await send(daemon.socket_path, "export")
+    assert resp["ok"], resp
+    jobs = resp["data"]["jobs"]
+    assert [j["id"] for j in jobs] == sorted(j["id"] for j in jobs)
+    assert {j["id"] for j in jobs} == set(ids.values()) | {blocker, waiting}
+    by_id = {j["id"]: j for j in jobs}
+    assert by_id[blocker]["status"] == "running" and by_id[waiting]["status"] == "queued"
+    assert by_id[waiting]["depends_on"] == [blocker]
+    assert json.loads(by_id[ids["done1"]]["raw_cmd"]) == ["echo", "Alpha"]
+
+    only = await send(daemon.socket_path, "export", statuses=["queued"], channel=4)
+    assert [j["id"] for j in only["data"]["jobs"]] == [waiting]
+    await send(daemon.socket_path, "cancel", id=blocker)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", [
+    {"statuses": ["bogus"]}, {"statuses": "done"}, {"statuses": [1]}, {"channel": 0}, {"channel": "1"},
+])
+async def test_export_rejects_bad_arguments(daemon, bad):
+    resp = await send(daemon.socket_path, "export", **bad)
+    assert resp["ok"] is False and resp["error"]
+
+
+# ---------------------------------------------------------------------------
+# Q6: fuzzing the JSON request handler
+# ---------------------------------------------------------------------------
+
+_FUZZ_KEYS = [
+    "argv", "raw_argv", "jobs", "cwd", "path", "virtual_env", "python_path", "env", "env_pass", "channel",
+    "before", "after", "timeout_secs", "now", "max_retries", "depends_on", "after_any", "not_before",
+    "on_fail", "retry_delay_secs", "retry_backoff", "id", "pid", "statuses", "since", "grep", "limit",
+    "clear_deps", "clear_delay", "retries", "timeout", "delay", "all", "grace", "signal",
+]
+
+
+def _fuzz_value(rng):
+    """A random JSON value of a random type -- none of them can name a real executable."""
+    junk_argv = ["no-such-exe-fuzz"]
+    pool = [
+        None, True, False, 0, 1, -1, 2**63, 10**30, 1.5, float("1e300"), "", "x", "\x00", "../" * 40, "é" * 50,
+        "a" * 5000, [], {}, [1], [None], [[]], [{}], ["a", 1], {"a": 1}, {"": ""}, {"jobs": []},
+        junk_argv, [junk_argv], [{"argv": junk_argv}], [{"argv": 5, "raw_argv": None, "index": "z"}],
+        {"A": "b"}, {"1bad": "x"}, {"OK": 5}, [1, 2, 3], ["1-3", "x"], "2026-10-01", "queued",
+        ["done", "queued"], ["bogus"],
+    ]
+    return rng.choice(pool)
+
+
+@pytest.mark.asyncio
+async def test_fuzzed_requests_get_a_clean_reply_and_never_hurt_the_daemon(daemon):
+    import random
+
+    rng = random.Random(20261017)  # fixed seed: a failure reproduces
+    commands = sorted(n[len("_cmd_"):] for n in dir(Daemon) if n.startswith("_cmd_"))
+    assert "add" in commands and "history" in commands and "export" in commands
+    internal = []
+    for _ in range(400):
+        cmd = rng.choice(commands)
+        args = {rng.choice(_FUZZ_KEYS): _fuzz_value(rng) for _ in range(rng.randint(0, 6))}
+        resp = await send(daemon.socket_path, cmd, **args)
+        assert isinstance(resp, dict) and isinstance(resp.get("ok"), bool), (cmd, args, resp)
+        if resp["ok"] is False:
+            assert isinstance(resp.get("error"), str) and resp["error"], (cmd, args, resp)
+            if resp["error"].startswith("internal error"):
+                internal.append((cmd, args, resp["error"]))
+    # an "internal error" is the last-resort guard catching a handler that did not validate
+    assert internal == []
+    assert (await send(daemon.socket_path, "status"))["ok"] is True  # still alive and answering
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw", [
+    b"[]\n", b"null\n", b"5\n", b'"x"\n', b"true\n",
+    b'{"cmd": 5}\n', b'{"cmd": null}\n', b'{"cmd": "_cmd_add"}\n', b'{"cmd": "__init__"}\n',
+    b'{"cmd": "add", "args": []}\n', b'{"cmd": "add", "args": "x"}\n', b'{"args": {}}\n', b"{}\n",
+])
+async def test_malformed_request_shapes_get_ok_false(daemon, raw):
+    reader, writer = await asyncio.open_unix_connection(str(daemon.socket_path))
+    writer.write(raw)
+    await writer.drain()
+    resp = json.loads((await reader.readline()).decode())
+    writer.close()
+    await writer.wait_closed()
+    assert resp["ok"] is False and resp["error"]
+    assert (await send(daemon.socket_path, "status"))["ok"] is True
+
+
+# ---------------------------------------------------------------------------
+# F16: add --dry-run (dry_run=True on the daemon's add)
+# ---------------------------------------------------------------------------
+
+def _job_count(daemon) -> int:
+    return daemon.conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+
+
+async def _dry(daemon, argv=None, **kw) -> dict:
+    return await send(daemon.socket_path, "add", argv=argv or ["echo", "hi"], cwd=CWD, dry_run=True, **kw)
+
+
+@pytest.mark.asyncio
+async def test_dry_run_queues_nothing_and_does_not_use_up_an_id(daemon):
+    resp = await _dry(daemon, channel=3)
+    assert resp["ok"], resp
+    data = resp["data"]
+    assert data["dry_run"] is True and data["channel"] == 3 and data["cwd"] == CWD
+    assert data["jobs"][0]["raw_argv"] == ["echo", "hi"]
+    assert data["jobs"][0]["argv"][-1] == "hi" and os.path.isabs(data["jobs"][0]["argv"][0])
+    assert data["jobs"][0]["position"] == 1 and data["queued_before"] == 0
+    assert data["running_id"] is None and data["paused"] is False
+    assert _job_count(daemon) == 0
+    assert 3 not in db_module.list_channels(daemon.conn)  # the channel was not registered either
+    assert await _add(daemon, ["echo", "real"]) == 1  # the dry run did not consume job id 1
+
+
+@pytest.mark.asyncio
+async def test_dry_run_reports_the_queue_position_and_the_running_job(daemon):
+    a = await _add(daemon, ["sleep", "30"])
+    await wait_for_status(daemon.socket_path, a, {"running"})
+    b = await _add(daemon, ["sleep", "30"])
+    c = await _add(daemon, ["sleep", "30"])
+    before_count = _job_count(daemon)
+    data = (await _dry(daemon))["data"]
+    assert data["jobs"][0]["position"] == 3 and data["queued_before"] == 2 and data["running_id"] == a
+    data = (await _dry(daemon, before=c))["data"]
+    assert data["jobs"][0]["position"] == 2
+    data = (await _dry(daemon, after=b))["data"]
+    assert data["jobs"][0]["position"] == 2
+    data = (await _dry(daemon, now=True))["data"]
+    assert data["priority"] is True and data["jobs"][0]["position"] == 1 and data["running_id"] == a
+    # nothing changed: same rows, the running job was not frozen, the queue order is intact
+    assert _job_count(daemon) == before_count
+    assert (await send(daemon.socket_path, "show", id=a))["data"]["status"] == "running"
+    assert [j["id"] for j in db_module.get_queue(daemon.conn, 1)] == [b, c]
+    assert db_module.get_job(daemon.conn, b)["position"] == 0 and db_module.get_job(daemon.conn, c)["position"] == 1
+
+
+@pytest.mark.asyncio
+async def test_dry_run_reports_a_paused_channel(daemon):
+    await send(daemon.socket_path, "pause", channel=2)
+    assert (await _dry(daemon, channel=2))["data"]["paused"] is True
+    assert (await _dry(daemon, channel=1))["data"]["paused"] is False
+
+
+@pytest.mark.asyncio
+async def test_dry_run_gives_the_same_errors_as_a_real_add_and_leaves_nothing_behind(daemon):
+    a = await _add(daemon, ["sleep", "30"])
+    for kw, text in (
+        (dict(cwd="/no/such/dir"), "working directory does not exist"),
+        (dict(argv=["definitely-not-a-command-xyz"]), "not found"),
+        (dict(before=999), "not currently queued"),
+        (dict(depends_on=[999]), "does not exist"),
+        (dict(channel=-1), "channel must be a positive integer"),
+        (dict(now=True, before=a), "--now cannot be combined"),
+        (dict(retry_delay_secs=60), "--retry-delay needs --retries"),
+    ):
+        args = {"argv": ["echo", "hi"], "cwd": CWD, "dry_run": True, **kw}
+        resp = await send(daemon.socket_path, "add", **args)
+        assert resp["ok"] is False and text in resp["error"], (kw, resp)
+    assert _job_count(daemon) == 1
+    assert await _add(daemon, ["echo", "after"]) == a + 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", ["yes", 1, [], {}])
+async def test_dry_run_must_be_a_boolean(daemon, bad):
+    resp = await send(daemon.socket_path, "add", argv=["echo", "hi"], cwd=CWD, dry_run=bad)
+    assert resp["ok"] is False and "dry_run must be true or false" in resp["error"]
+    assert _job_count(daemon) == 0
+
+
+@pytest.mark.asyncio
+async def test_dry_run_false_or_missing_queues_for_real(daemon):
+    resp = await send(daemon.socket_path, "add", argv=["echo", "hi"], cwd=CWD, dry_run=False)
+    assert resp["ok"] and "dry_run" not in resp["data"] and resp["data"]["id"] == 1
+    assert _job_count(daemon) == 1
+
+
+@pytest.mark.asyncio
+async def test_dry_run_dependency_verdict(daemon):
+    a = await _add(daemon, ["false"])
+    await wait_for_status(daemon.socket_path, a, {"failed"})
+    data = (await _dry(daemon, depends_on=[a]))["data"]
+    assert data["jobs"][0]["dep_verdict"] == "failed" and data["jobs"][0]["dep_id"] == a
+    data = (await _dry(daemon, after_any=[a]))["data"]
+    assert data["jobs"][0]["dep_verdict"] == "ready"
+    assert (await _dry(daemon))["data"]["jobs"][0]["dep_verdict"] == "ready"
+    b = await _add(daemon, ["sleep", "30"])
+    data = (await _dry(daemon, depends_on=[b]))["data"]
+    assert data["jobs"][0]["dep_verdict"] == "waiting" and data["jobs"][0]["dep_id"] == b
+    assert _job_count(daemon) == 2
+    assert db_module.dep_info(daemon.conn, 3) == {"depends_on": [], "after_any": [], "waiting_on": []}
+
+
+@pytest.mark.asyncio
+async def test_dry_run_rejects_a_dependency_queued_behind_the_job(daemon):
+    a = await _add(daemon, ["sleep", "30"])
+    await wait_for_status(daemon.socket_path, a, {"running"})
+    b = await _add(daemon, ["sleep", "30"])
+    resp = await _dry(daemon, before=b, depends_on=[b])
+    assert resp["ok"] is False and "never start" in resp["error"]
+    assert [j["id"] for j in db_module.get_queue(daemon.conn, 1)] == [b]
+
+
+@pytest.mark.asyncio
+async def test_dry_run_sweep_reports_every_job_and_creates_none(daemon):
+    jobs = [{"argv": ["echo", v], "raw_argv": ["echo", v], "index": i} for i, v in enumerate("abc", 1)]
+    resp = await send(daemon.socket_path, "add", jobs=jobs, cwd=CWD, dry_run=True)
+    assert resp["ok"], resp
+    got = resp["data"]["jobs"]
+    assert [j["index"] for j in got] == [1, 2, 3] and [j["position"] for j in got] == [1, 2, 3]
+    assert "QUR_INDEX" not in resp["data"]["env"]
+    assert _job_count(daemon) == 0
+    assert await _add(daemon, ["echo", "x"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_dry_run_returns_the_environment_the_job_would_get(daemon):
+    data = (await _dry(
+        daemon, env={"FOO": "bar"}, env_pass={"OMP_NUM_THREADS": "4"}, path="/usr/bin:/bin", virtual_env="/v",
+    ))["data"]
+    env = data["env"]
+    assert env["FOO"] == "bar" and env["OMP_NUM_THREADS"] == "4" and env["PATH"] == "/usr/bin:/bin"
+    assert env["VIRTUAL_ENV"] == "/v" and env["QUR_ENV_PASSTHROUGH"] == "OMP_NUM_THREADS"
+
+
+@pytest.mark.asyncio
+async def test_dry_run_does_not_start_anything_or_send_notifications(daemon):
+    await _dry(daemon, argv=["touch", "/tmp/queuer-dry-run-should-not-exist"])
+    await asyncio.sleep(0.3)
+    assert not os.path.exists("/tmp/queuer-dry-run-should-not-exist")
+    assert daemon._current_proc == {}
+
+
+# ---------------------------------------------------------------------------
+# F12: --on-finish / --on-error hooks and the global post-job hook
+# ---------------------------------------------------------------------------
+
+async def _until(predicate, timeout: float = 5.0) -> None:
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if predicate():
+            return
+        await asyncio.sleep(0.05)
+    raise AssertionError("condition not met in time")
+
+
+def _lines(path: Path) -> list[str]:
+    return path.read_text().splitlines() if path.exists() else []
+
+
+@pytest.mark.asyncio
+async def test_on_finish_runs_after_a_done_job_with_the_qur_variables(daemon, tmp_path):
+    out = tmp_path / "hook.out"
+    hook = f'echo "$QUR_HOOK $QUR_JOB_ID $QUR_STATUS [$QUR_EXIT_CODE] $QUR_CHANNEL $QUR_CWD $QUR_LOG $FOO" > {out}'
+    a = await _add(daemon, ["echo", "hi"], channel=2, on_finish=hook, env={"FOO": "bar"})
+    await wait_for_status(daemon.socket_path, a, {"done"})
+    await _until(out.exists)
+    await _until(lambda: out.read_text().endswith("\n"))
+    assert out.read_text().strip() == f"on-finish {a} done [0] 2 {CWD} {daemon.log_dir / f'{a}.log'} bar"
+
+
+@pytest.mark.asyncio
+async def test_hook_gets_the_command_and_runs_in_the_job_cwd(daemon, tmp_path):
+    out = tmp_path / "hook.out"
+    hook = f'echo "$QUR_COMMAND|$(pwd)|[$QUR_DURATION_SECS]" > {out}'
+    a = await _add(daemon, ["sh", "-c", "exit 0"], on_finish=hook)
+    await wait_for_status(daemon.socket_path, a, {"done"})
+    await _until(lambda: out.exists() and out.read_text().endswith("\n"))
+    command, cwd, duration = out.read_text().strip().split("|")
+    assert command == "sh -c 'exit 0'" and cwd == CWD and duration.strip("[]").isdigit()
+
+
+@pytest.mark.asyncio
+async def test_on_error_runs_only_for_a_failed_job_and_on_finish_for_both(daemon, tmp_path):
+    fin, err = tmp_path / "fin", tmp_path / "err"
+    ok = await _add(daemon, ["true"], on_finish=f"echo $QUR_JOB_ID >> {fin}", on_error=f"echo $QUR_JOB_ID >> {err}")
+    await wait_for_status(daemon.socket_path, ok, {"done"})
+    await _until(lambda: _lines(fin) == [str(ok)])
+    bad = await _add(daemon, ["false"], on_finish=f"echo $QUR_JOB_ID >> {fin}", on_error=f"echo $QUR_JOB_ID >> {err}")
+    await wait_for_status(daemon.socket_path, bad, {"failed"})
+    await _until(lambda: _lines(fin) == [str(ok), str(bad)] and _lines(err) == [str(bad)])
+
+
+@pytest.mark.asyncio
+async def test_hooks_run_in_order_global_then_finish_then_error(daemon, tmp_path):
+    out = tmp_path / "order"
+    daemon.post_job_hook = f"echo $QUR_HOOK >> {out}"
+    a = await _add(daemon, ["false"], on_error=f"echo $QUR_HOOK >> {out}", on_finish=f"echo $QUR_HOOK >> {out}")
+    await wait_for_status(daemon.socket_path, a, {"failed"})
+    await _until(lambda: _lines(out) == ["post-job", "on-finish", "on-error"])
+
+
+@pytest.mark.asyncio
+async def test_global_hook_runs_for_jobs_without_their_own_hooks(daemon, tmp_path):
+    out = tmp_path / "g"
+    daemon.post_job_hook = f"echo $QUR_JOB_ID:$QUR_STATUS >> {out}"
+    a = await _add(daemon, ["true"])
+    b = await _add(daemon, ["false"])
+    await wait_for_status(daemon.socket_path, b, {"failed"})
+    await _until(lambda: _lines(out) == [f"{a}:done", f"{b}:failed"])
+
+
+@pytest.mark.asyncio
+async def test_hooks_run_only_after_the_final_outcome_of_a_retried_job(daemon, tmp_path):
+    out = tmp_path / "retry"
+    a = await _add(daemon, ["false"], max_retries=1, on_error=f"echo $QUR_JOB_ID >> {out}")
+    await wait_for_status(daemon.socket_path, a + 1, {"failed"})
+    await _until(lambda: _lines(out) == [str(a + 1)])  # the retry's failure, not the first one
+    await asyncio.sleep(0.3)
+    assert _lines(out) == [str(a + 1)]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_running_job_runs_on_finish_but_not_on_error(daemon, tmp_path):
+    fin, err = tmp_path / "fin", tmp_path / "err"
+    a = await _add(daemon, ["sleep", "30"], on_finish=f"echo $QUR_STATUS >> {fin}", on_error=f"echo x >> {err}")
+    await wait_for_status(daemon.socket_path, a, {"running"})
+    assert (await send(daemon.socket_path, "cancel", id=a))["ok"]
+    await wait_for_status(daemon.socket_path, a, {"cancelled"})
+    await _until(lambda: _lines(fin) == ["cancelled"])
+    await asyncio.sleep(0.3)
+    assert not err.exists()
+
+
+@pytest.mark.asyncio
+async def test_no_hooks_for_a_job_cancelled_while_queued_or_skipped(daemon, tmp_path):
+    out = tmp_path / "none"
+    daemon.post_job_hook = f"echo $QUR_STATUS >> {out}"
+    blocker = await _add(daemon, ["sleep", "30"])
+    await wait_for_status(daemon.socket_path, blocker, {"running"})
+    queued = await _add(daemon, ["echo", "q"], on_finish=f"echo fin >> {out}")
+    assert (await send(daemon.socket_path, "cancel", id=queued))["ok"]
+    failed = await _add(daemon, ["false"], channel=2)
+    await wait_for_status(daemon.socket_path, failed, {"failed"})
+    skipped = await _add(daemon, ["echo", "s"], channel=2, depends_on=[failed], on_finish=f"echo fin >> {out}")
+    await wait_for_status(daemon.socket_path, skipped, {"skipped"})
+    await _until(lambda: _lines(out) == ["failed"])  # only the failed job's global hook
+    await asyncio.sleep(0.3)
+    assert _lines(out) == ["failed"]
+
+
+@pytest.mark.asyncio
+async def test_a_slow_hook_does_not_hold_the_channel(daemon, tmp_path):
+    a = await _add(daemon, ["true"], on_finish="sleep 30")
+    b = await _add(daemon, ["echo", "next"])
+    await wait_for_status(daemon.socket_path, a, {"done"})
+    await wait_for_status(daemon.socket_path, b, {"done"}, timeout=3)
+    assert daemon._hook_tasks  # the hook is still running in the background
+    tasks = list(daemon._hook_tasks)
+    for task in tasks:  # cancelling kills its process (see _run_hook)
+        task.cancel()
+    await asyncio.wait(tasks, timeout=3)
+
+
+@pytest.mark.asyncio
+async def test_a_hook_that_runs_too_long_is_killed_and_the_log_says_so(daemon, monkeypatch):
+    monkeypatch.setattr("queuer.daemon.HOOK_TIMEOUT_SECS", 0.3)
+    a = await _add(daemon, ["true"], on_finish="sleep 30")
+    await wait_for_status(daemon.socket_path, a, {"done"})
+    await _until(lambda: "timed out" in _log_text(daemon, a))
+    assert "[queuer] hook on-finish: sleep 30" in _log_text(daemon, a)
+
+
+@pytest.mark.asyncio
+async def test_hook_output_and_exit_code_are_appended_to_the_job_log(daemon):
+    a = await _add(daemon, ["echo", "job-output"], on_finish="echo from-hook; echo oops >&2; exit 3")
+    await wait_for_status(daemon.socket_path, a, {"done"})
+    await _until(lambda: "hook on-finish exited" in _log_text(daemon, a))
+    log = _log_text(daemon, a)
+    assert log.index("job-output") < log.index("[queuer] hook on-finish: echo from-hook")
+    assert "from-hook\n" in log and "oops\n" in log and "[queuer] hook on-finish exited 3" in log
+    assert (await send(daemon.socket_path, "show", id=a))["data"]["status"] == "done"  # a failing hook changes nothing
+
+
+@pytest.mark.asyncio
+async def test_hook_output_is_capped(daemon, monkeypatch):
+    monkeypatch.setattr("queuer.daemon.HOOK_OUTPUT_BYTES", 100)
+    a = await _add(daemon, ["true"], on_finish="head -c 100000 /dev/zero | tr '\\0' x")
+    await wait_for_status(daemon.socket_path, a, {"done"})
+    await _until(lambda: "hook on-finish exited 0" in _log_text(daemon, a))
+    assert 100 <= _log_text(daemon, a).count("x") <= 120  # 100 kept (the hook's own header has a few x's)
+
+
+@pytest.mark.asyncio
+async def test_a_hook_that_cannot_start_is_logged_and_harmless(daemon, tmp_path):
+    work = tmp_path / "gone"
+    work.mkdir()
+    resp = await send(daemon.socket_path, "add", argv=["sleep", "0.3"], cwd=str(work), on_finish="echo hi")
+    a = resp["data"]["id"]
+    await wait_for_status(daemon.socket_path, a, {"running"})
+    work.rmdir()  # the hook's cwd disappears before it starts
+    await wait_for_status(daemon.socket_path, a, {"done"})
+    await _until(lambda: "could not start" in _log_text(daemon, a))
+    assert (await _add(daemon, ["echo", "still-alive"])) > a
+
+
+@pytest.mark.asyncio
+async def test_hooks_are_validated_by_the_daemon_and_blank_means_none(daemon):
+    for kw in (
+        {"on_finish": 5}, {"on_error": ["echo"]}, {"on_finish": "a\0b"}, {"on_error": "x" * (db_module.MAX_HOOK_LEN + 1)},
+    ):
+        resp = await send(daemon.socket_path, "add", argv=["echo", "hi"], cwd=CWD, **kw)
+        assert resp["ok"] is False and "command" in resp["error"], kw
+    assert daemon.conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
+    a = await _add(daemon, ["echo", "hi"], on_finish="   ", on_error=None)
+    job = (await send(daemon.socket_path, "show", id=a))["data"]
+    assert job["on_finish_cmd"] is None and job["on_error_cmd"] is None
+
+
+@pytest.mark.asyncio
+async def test_sweep_jobs_share_the_hooks(daemon):
+    jobs = [{"argv": ["echo", v], "raw_argv": ["echo", v], "index": i} for i, v in enumerate("ab", 1)]
+    resp = await send(daemon.socket_path, "add", jobs=jobs, cwd=CWD, on_finish="echo x", on_error="echo y")
+    assert resp["ok"], resp
+    for job_id in resp["data"]["ids"]:
+        job = (await send(daemon.socket_path, "show", id=job_id))["data"]
+        assert job["on_finish_cmd"] == "echo x" and job["on_error_cmd"] == "echo y"
+
+
+@pytest.mark.asyncio
+async def test_dry_run_reports_the_hooks_and_stores_nothing(daemon):
+    data = (await _dry(daemon, on_finish="echo done", on_error="echo bad"))["data"]
+    assert data["on_finish"] == "echo done" and data["on_error"] == "echo bad"
+    data = (await _dry(daemon))["data"]
+    assert data["on_finish"] is None and data["on_error"] is None
+    assert _job_count(daemon) == 0
+
+
+@pytest.mark.asyncio
+async def test_requeue_keeps_the_hooks(daemon):
+    a = await _add(daemon, ["true"], on_finish="echo f", on_error="echo e", channel=3)
+    await wait_for_status(daemon.socket_path, a, {"done"})
+    new_id = (await send(daemon.socket_path, "requeue", id=a))["data"]["id"]
+    new = (await send(daemon.socket_path, "show", id=new_id))["data"]
+    assert new["on_finish_cmd"] == "echo f" and new["on_error_cmd"] == "echo e"
+
+
+@pytest.mark.asyncio
+async def test_edit_sets_changes_and_removes_hooks(daemon):
+    blocker = await _add(daemon, ["sleep", "30"])
+    await wait_for_status(daemon.socket_path, blocker, {"running"})
+    b = await _add(daemon, ["echo", "b"])
+    resp = await _edit(daemon, b, on_finish="echo f", on_error="echo e")
+    assert resp["ok"] and set(resp["data"]["changed"]) == {"on-finish", "on-error"}
+    job = (await send(daemon.socket_path, "show", id=b))["data"]
+    assert job["on_finish_cmd"] == "echo f" and job["on_error_cmd"] == "echo e"
+    resp = await _edit(daemon, b, on_finish="echo f")  # same value: nothing to change
+    assert resp["ok"] is False and "nothing to change" in resp["error"]
+    resp = await _edit(daemon, b, on_finish="", on_error=None)
+    assert resp["ok"] and set(resp["data"]["changed"]) == {"on-finish", "on-error"}
+    job = (await send(daemon.socket_path, "show", id=b))["data"]
+    assert job["on_finish_cmd"] is None and job["on_error_cmd"] is None
+    resp = await _edit(daemon, b, on_finish=7)
+    assert resp["ok"] is False and "on-finish command" in resp["error"]
+
+
+def test_global_hook_comes_from_the_environment_or_the_constructor(tmp_path, monkeypatch):
+    paths = dict(db_path=tmp_path / "q.db", socket_path=tmp_path / "q.sock", log_dir=tmp_path / "logs")
+    monkeypatch.delenv("QUEUER_POST_JOB_HOOK", raising=False)
+    assert Daemon(**paths).post_job_hook is None
+    monkeypatch.setenv("QUEUER_POST_JOB_HOOK", "echo from-env")
+    assert Daemon(**paths).post_job_hook == "echo from-env"
+    assert Daemon(**paths, post_job_hook="echo explicit").post_job_hook == "echo explicit"
+    monkeypatch.setenv("QUEUER_POST_JOB_HOOK", "   ")
+    assert Daemon(**paths).post_job_hook is None
+
+
+def test_an_unusable_global_hook_is_ignored_with_a_warning(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("QUEUER_POST_JOB_HOOK", "x" * (db_module.MAX_HOOK_LEN + 1))
+    d = Daemon(db_path=tmp_path / "q.db", socket_path=tmp_path / "q.sock", log_dir=tmp_path / "logs")
+    assert d.post_job_hook is None
+    assert "ignoring QUEUER_POST_JOB_HOOK" in capsys.readouterr().err

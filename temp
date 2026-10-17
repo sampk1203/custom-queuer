@@ -1,0 +1,34 @@
+Yes, issues are finished apart from the ones you ruled out (S3, Q4, U7, U11). These features are still open in QUEUER_FEATURES.md, grouped by how useful I think they are for your LAMMPS/DFT/GPU use.
+
+Worth doing
+
+F16, --dry-run: print the resolved command, cwd, env, channel and queue position without queuing anything. It’s small and catches mistakes before a long job is queued.
+F14, log auto-clean: delete old logs by age or total size on a timer. It’s small, and it saves you from running clean-logs by hand.
+F10, resource accounting: record peak RSS and CPU time per job and show them in qur show. This is useful for sizing DFT and LAMMPS runs, and it’s small to medium.
+F12, hooks: --on-finish CMD and --on-fail CMD, for example to rsync results when a job ends. It’s small to medium.
+F11, kill signal and grace: qur cancel -s INT --grace 30, so jobs that need a clean shutdown (checkpoint writing) can stop gracefully. It’s small.
+
+Maybe
+
+F13, separate stderr log: keep the merged log and also write a stderr copy. It’s small to medium.
+F25, duplicate protection: refuse an identical command and cwd that is already queued unless --force. It’s small.
+F17, resource-aware scheduling: delay a job if free RAM or VRAM is below a threshold. It’s medium and needs care, and it’s only worth it if GPU memory clashes actually bite you.
+F9, labels and tags: this is the part of F9 still missing. It’s medium.
+F15, qur follow / qur top: a live view across jobs. It’s nice but not essential, and it’s medium.
+F24, import: the import half of export. I’d skip it.
+
+Later or probably skip
+
+F18 (cgroup limits), F20 (audit log), F22 (numeric priorities), F23 (local status page or Prometheus), F21 (multi-machine over ssh, which is large), F37 (token rotation helper), F38 (signed releases).
+
+I’d take F16, F14, F11, F12 and F10 as one batch. Tell me which to include and I’ll do them in order, with no tests run, as before. You can also drop any you don’t need.
+
+
+HOW THE OWNER WORKS (follow these)
+
+Only make edits. Do NOT run tests, CI, install.sh, systemd, or any code. The owner runs tests.
+Be fast and correct. Do not be overly cautious. No backups, no "are you sure" questions. Decide ambiguous things yourself and list them in the final summary so the owner can overrule.
+Existing tests must keep passing; never delete/weaken a test. Add tests for everything new, in the existing style (tests/conftest.py already isolates paths).
+CI runs mypy, ruff (E,F,W,B,I) and bandit on src, pytest on 3.12-3.15. Keep clean: type every new function, no unused vars. # nosec explanation goes on its own comment line above, with a bare # nosec Bxxx on the code line.
+Update README.md, CHANGELOG.md and the status tables in QUEUER_ISSUES.md / QUEUER_FEATURES.md for what you did.
+Present only the files you edited (not the whole zip), plus a short summary: what 

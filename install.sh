@@ -6,6 +6,8 @@
 #   ./install.sh install                 skip the question
 #   ./install.sh uninstall               skip the question
 #   ./install.sh install --skip-tests    install without running the test suite first
+#   ./install.sh uninstall --yes         uninstall without any prompt (no terminal needed);
+#                                        keeps the job logs and leaves linger enabled
 #
 # Order of operations, and why: bootstrap uv -> sync venv -> run full test
 # suite (unless --skip-tests) -> install CLI + shell completion -> only then touch the
@@ -31,13 +33,15 @@ ask() {  # ask "prompt" -> sets REPLY; empty when there is no terminal
 
 ACTION=""
 SKIP_TESTS=no
+ASSUME_YES=no
 for arg in "$@"; do
     case "$arg" in
         install|uninstall) ACTION="$arg" ;;
         --skip-tests) SKIP_TESTS=yes ;;
+        --yes|-y) ASSUME_YES=yes ;;
         "") ;;
         *)
-            echo "Usage: $0 [install|uninstall] [--skip-tests]" >&2
+            echo "Usage: $0 [install|uninstall] [--skip-tests] [--yes]" >&2
             exit 2
             ;;
     esac
@@ -73,15 +77,21 @@ if [ "$ACTION" = "uninstall" ]; then
     echo "It will NOT delete this project folder, uv itself, or the PATH line"
     echo "that 'uv tool update-shell' added to your shell rc."
     echo ""
-    ask "Proceed? [y/N] "
-    case "$REPLY" in y|Y|yes|YES) ;; *) echo "Cancelled. Nothing changed."; exit 0 ;; esac
+    DEL_LOGS=no
+    DEL_LINGER=no
+    if [ "$ASSUME_YES" = yes ]; then
+        echo "--yes: proceeding without questions (job logs are kept, linger stays enabled)."
+    else
+        ask "Proceed? [y/N] "
+        case "$REPLY" in y|Y|yes|YES) ;; *) echo "Cancelled. Nothing changed."; exit 0 ;; esac
 
-    ask "Also delete job logs ($STATE_DIR/logs)? [y/N] "
-    DEL_LOGS=no; case "$REPLY" in y|Y|yes|YES) DEL_LOGS=yes ;; esac
-    echo "Linger (keeps your user services running after logout) was enabled by the"
-    echo "installer. Other user services you run may rely on it."
-    ask "Disable linger for $USER? [y/N] "
-    DEL_LINGER=no; case "$REPLY" in y|Y|yes|YES) DEL_LINGER=yes ;; esac
+        ask "Also delete job logs ($STATE_DIR/logs)? [y/N] "
+        case "$REPLY" in y|Y|yes|YES) DEL_LOGS=yes ;; esac
+        echo "Linger (keeps your user services running after logout) was enabled by the"
+        echo "installer. Other user services you run may rely on it."
+        ask "Disable linger for $USER? [y/N] "
+        case "$REPLY" in y|Y|yes|YES) DEL_LINGER=yes ;; esac
+    fi
 
     echo "==> Stopping and disabling queuerd"
     systemctl --user disable --now queuerd 2>/dev/null || true
@@ -114,8 +124,10 @@ if [ "$ACTION" = "uninstall" ]; then
     echo "==> Removing shell completion"
     rm -f "${ZSH_COMP[@]}" "${FISH_COMP[@]}" "${BASH_COMP[@]}"
     if [ -f "$HOME/.bashrc" ]; then  # drop the lines typer added to .bashrc
-        sed -i -e "\|^source '$HOME/.bash_completions/qur.sh'\$|d" \
+        # -i.queuer-bak keeps the original next to the edited file (GNU and BSD sed)
+        sed -i.queuer-bak -e "\|^source '$HOME/.bash_completions/qur.sh'\$|d" \
                -e "\|^source '$HOME/.bash_completions/queuer.sh'\$|d" "$HOME/.bashrc"
+        echo "    (your old .bashrc is kept as $HOME/.bashrc.queuer-bak)"
     fi
 
     echo "==> Removing job database and Telegram setup"

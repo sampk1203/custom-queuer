@@ -974,3 +974,126 @@ def test_a_broken_user_patterns_file_does_not_break_messages(tmp_path, monkeypat
 def test_malformed_command_json_still_gives_a_message():
     assert notify.format_job(_job(raw_cmd="not json"), CFG).startswith("✅ done")
     assert notify._short_cmd(_job(raw_cmd="5")) == "-"  # a number is not an argv
+
+
+# ---------------------------------------------------------------------------
+# Q5: failures that used to be silent are reported once on stderr
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def fresh_warnings(monkeypatch):
+    monkeypatch.setattr(notify, "_WARNED", set())
+
+
+def test_warn_once_prints_a_message_only_the_first_time(fresh_warnings, capsys):
+    notify.warn_once("something broke")
+    notify.warn_once("something broke")
+    notify.warn_once("something else")
+    err = capsys.readouterr().err
+    assert err.count("something broke") == 1 and err.count("something else") == 1
+
+
+def test_load_reports_an_unusable_file_without_leaking_its_content(fresh_warnings, capsys, tmp_path):
+    path = tmp_path / "notify.json"
+    path.write_text(json.dumps({"qur_id": "a", "token": "garbage-" + TOKEN, "chat_ids": [1]}))
+    assert notify.load(path) is None
+    assert notify.load(path) is None
+    err = capsys.readouterr().err
+    assert str(path) in err and "not configured" in err and TOKEN not in err
+    assert err.count(str(path)) == 1  # once, not on every poll
+    path.write_text("not json")
+    assert notify.load(path) is None
+    assert "ValueError" in capsys.readouterr().err
+
+
+def test_load_of_a_missing_file_stays_quiet(fresh_warnings, capsys, tmp_path):
+    assert notify.load(tmp_path / "nope.json") is None
+    assert capsys.readouterr().err == ""
+
+
+def test_read_log_tail_reports_unreadable_logs_but_not_missing_ones(fresh_warnings, capsys, tmp_path):
+    assert notify.read_log_tail(tmp_path / "gone.log") is None
+    assert capsys.readouterr().err == ""
+    assert notify.read_log_tail(tmp_path) is None  # a directory: open() raises OSError
+    assert "cannot read log" in capsys.readouterr().err
+
+
+def test_answer_callback_and_edit_markup_report_failures_once(fresh_warnings, capsys, monkeypatch):
+    def boom(*a, **k):
+        raise notify.NotifyError("telegram said no")
+
+    monkeypatch.setattr(notify, "_api", boom)
+    cfg = {"token": TOKEN, "chat_ids": [1]}
+    notify.answer_callback(cfg, "cb1", "hi")
+    notify.answer_callback(cfg, "cb2", "hi")
+    notify.edit_markup(cfg, 1, 2, {})
+    err = capsys.readouterr().err
+    assert err.count("could not answer a button press") == 1 and "could not update a message" in err
+    assert TOKEN not in err
+
+
+# ---------------------------------------------------------------------------
+# F10: resource accounting in Telegram text
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "kb, text",
+    [(0, "0 KB"), (1023, "1023 KB"), (1024, "1 MB"), (20 * 1024, "20 MB"), (1024 * 1024, "1.0 GB"), (32_505_856, "31.0 GB")],
+)
+def test_fmt_mem_kb(kb, text):
+    assert notify._fmt_mem_kb(kb) == text
+
+
+def test_finished_message_shows_peak_rss_and_cpu_time(monkeypatch):
+    monkeypatch.setattr(notify.socket, "gethostname", lambda: "bigbox")
+    text = notify.format_job(_job(max_rss_kb=32_505_856, cpu_user_secs=7000.0, cpu_sys_secs=100.0), CFG)
+    assert text == (
+        "✅ done · job 12 · 2h13m\n$ python secret.py\n"
+        "bigbox [a3f9] · ch 1 · exit 0 · used 31.0 GB · 1h58m cpu"
+    )
+
+
+def test_finished_message_shows_only_the_usage_that_was_captured(monkeypatch):
+    monkeypatch.setattr(notify.socket, "gethostname", lambda: "bigbox")
+    only_mem = notify.format_job(_job(max_rss_kb=20 * 1024), CFG)
+    assert only_mem.endswith("exit 0 · used 20 MB") and "cpu" not in only_mem
+    only_cpu = notify.format_job(_job(cpu_user_secs=30.0, cpu_sys_secs=None), CFG)
+    assert only_cpu.endswith("exit 0 · 30s cpu") and "used" not in only_cpu
+
+
+def test_finished_message_has_no_usage_part_for_an_unsampled_job(monkeypatch):
+    monkeypatch.setattr(notify.socket, "gethostname", lambda: "bigbox")
+    text = notify.format_job(_job(max_rss_kb=None, cpu_user_secs=None, cpu_sys_secs=None), CFG)
+    assert text == "✅ done · job 12 · 2h13m\n$ python secret.py\nbigbox [a3f9] · ch 1 · exit 0"
+
+
+def test_failed_message_puts_usage_last(monkeypatch):
+    monkeypatch.setattr(notify.socket, "gethostname", lambda: "bigbox")
+    t = notify.format_job(
+        _job(status="failed", exit_code=-15, note="timed out", finished_at="2026-10-14T10:00:30+00:00",
+             max_rss_kb=20 * 1024, cpu_user_secs=20.0, cpu_sys_secs=1.0),
+        CFG,
+    )
+    last = t.splitlines()[-1]
+    assert last.startswith("bigbox [a3f9] · ch 1 · exit -15") and "timed out" in last
+    assert last.endswith("used 20 MB · 21s cpu")
+
+
+def test_format_details_shows_peak_rss_and_cpu_time_only_when_captured():
+    base = dict(status="done")
+    t = notify.format_details(_job(**base, max_rss_kb=32_505_856, cpu_user_secs=134.0, cpu_sys_secs=3.0), CFG)
+    assert "<b>peak RSS</b> 31.0 GB" in t
+    assert "<b>cpu time</b> 2m14s user + 3s sys" in t
+    t = notify.format_details(_job(**base, max_rss_kb=20 * 1024), CFG)
+    assert "<b>peak RSS</b> 20 MB" in t and "cpu time" not in t
+    t = notify.format_details(_job(**base, cpu_user_secs=1.0, cpu_sys_secs=None), CFG)
+    assert "<b>cpu time</b> 1s user + 0s sys" in t and "peak RSS" not in t
+    t = notify.format_details(_job(**base), CFG)
+    assert "peak RSS" not in t and "cpu time" not in t
+
+
+def test_details_show_the_hooks_only_when_set():
+    text = notify.format_details(_job(on_finish_cmd="rsync -a out/ host:", on_error_cmd="echo bad"), CFG)
+    assert "on finish" in text and "rsync -a out/ host:" in text and "on error" in text and "echo bad" in text
+    plain = notify.format_details(_job(), CFG)
+    assert "on finish" not in plain and "on error" not in plain

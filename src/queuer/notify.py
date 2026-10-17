@@ -50,6 +50,7 @@ import secrets
 import shlex
 import socket
 import stat
+import sys
 import tempfile
 import time
 import urllib.error
@@ -149,15 +150,35 @@ def normalize(raw: Any) -> dict[str, Any] | None:
     return {"qur_id": raw["qur_id"], "bots": bots}
 
 
+_WARNED: set[str] = set()
+
+
+def warn_once(msg: str) -> None:
+    """Print `msg` to stderr (the daemon's journal) the first time only, so a problem that
+    repeats on every poll or every job does not flood the log."""
+    if msg not in _WARNED:
+        _WARNED.add(msg)
+        print(f"[queuer] {msg}", file=sys.stderr)
+
+
 def load(path: Path | None = None) -> dict[str, Any] | None:
     """The saved config (canonical layout), or None if missing, unreadable
-    or incomplete."""
+    or incomplete. A file that exists but cannot be used is reported once on stderr
+    (never its content: it holds the bot token)."""
     path = path or default_path()
     try:
         raw = json.loads(path.read_text())
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return None
-    return normalize(raw)
+    except (OSError, ValueError) as e:
+        # a malformed file raises json.JSONDecodeError, a ValueError subclass: name the family
+        kind = "ValueError" if isinstance(e, ValueError) else type(e).__name__
+        warn_once(f"cannot use {path}: {kind}; treating Telegram as not configured")
+        return None
+    cfg = normalize(raw)
+    if cfg is None:
+        warn_once(f"{path} is incomplete or invalid; treating Telegram as not configured")
+    return cfg
 
 
 def save(cfg: dict[str, Any], path: Path | None = None) -> None:
@@ -638,8 +659,8 @@ def answer_callback(cfg: dict[str, Any], callback_id: str, text: str) -> None:
         if text:
             params["text"] = text[:200]
         _api(cfg["token"], "answerCallbackQuery", params)
-    except NotifyError:
-        pass
+    except NotifyError as e:
+        warn_once(f"could not answer a button press: {e}")
 
 
 def edit_markup(cfg: dict[str, Any], chat_id: int, message_id: int, markup: dict[str, Any]) -> None:
@@ -647,8 +668,8 @@ def edit_markup(cfg: dict[str, Any], chat_id: int, message_id: int, markup: dict
     can't be pressed twice). Best-effort."""
     try:
         _api(cfg["token"], "editMessageReplyMarkup", {"chat_id": chat_id, "message_id": message_id, "reply_markup": markup})
-    except NotifyError:
-        pass
+    except NotifyError as e:
+        warn_once(f"could not update a message's buttons: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -666,6 +687,28 @@ def _fmt_secs(secs: float) -> str:
         return f"{minutes}m{secs_i}s"
     hours, minutes = divmod(minutes, 60)
     return f"{hours}h{minutes}m"
+
+
+def _fmt_mem_kb(kb: float) -> str:
+    """F10: a peak-RSS reading in KB as a short human size, e.g. "31 GB"."""
+    mb = kb / 1024
+    if mb >= 1024:
+        return f"{mb / 1024:.1f} GB"
+    if mb >= 1:
+        return f"{mb:.0f} MB"
+    return f"{kb:.0f} KB"
+
+
+def _usage_line(job: dict[str, Any]) -> str | None:
+    """F10: "used 31 GB · 2m14s cpu" (whichever of peak RSS / CPU time was
+    captured -- a job that finished too fast to be sampled has neither)."""
+    parts = []
+    if job.get("max_rss_kb") is not None:
+        parts.append(f"used {_fmt_mem_kb(job['max_rss_kb'])}")
+    cpu_user, cpu_sys = job.get("cpu_user_secs"), job.get("cpu_sys_secs")
+    if cpu_user is not None or cpu_sys is not None:
+        parts.append(f"{_fmt_secs((cpu_user or 0.0) + (cpu_sys or 0.0))} cpu")
+    return " · ".join(parts) if parts else None
 
 
 def _duration(job: dict[str, Any]) -> str | None:
@@ -750,6 +793,9 @@ def format_job(job: dict[str, Any], cfg: dict[str, Any]) -> str:
     reason = _reason(job.get("note"))
     if reason and not (status == "interrupted" and reason == "daemon stopped"):  # already in the head
         parts.append(reason)
+    usage = _usage_line(job)
+    if usage:
+        parts.append(usage)
     lines.append(f"{_who(cfg)} · " + " · ".join(parts))
     return "\n".join(lines)
 
@@ -839,6 +885,11 @@ def _format_details(job: dict[str, Any], cfg: dict[str, Any], cmd_cap: int) -> s
         row("timeout", f"{job['timeout_secs']}s" if job.get("timeout_secs") else "none"),
         row("origin", origin_s),
     ]
+    if job.get("max_rss_kb") is not None:
+        lines.append(row("peak RSS", _fmt_mem_kb(job["max_rss_kb"])))
+    if job.get("cpu_user_secs") is not None or job.get("cpu_sys_secs") is not None:
+        lines.append(row("cpu time", f"{_fmt_secs(job.get('cpu_user_secs') or 0.0)} user "
+                                      f"+ {_fmt_secs(job.get('cpu_sys_secs') or 0.0)} sys"))
     if job.get("max_retries"):
         lines.append(row("auto-retries", f"{job['attempt']} of {job['max_retries']} used"))
     if job.get("retry_delay_secs"):
@@ -846,6 +897,10 @@ def _format_details(job: dict[str, Any], cfg: dict[str, Any], cmd_cap: int) -> s
         lines.append(row("retry delay", wait + (", doubling every attempt" if job.get("retry_backoff") else "")))
     if job.get("on_fail") == "pause":
         lines.append(row("on fail", "pause the channel"))
+    if job.get("on_finish_cmd"):
+        lines.append(row("on finish", job["on_finish_cmd"]))
+    if job.get("on_error_cmd"):
+        lines.append(row("on error", job["on_error_cmd"]))
     if job.get("not_before"):
         lines.append(row("not before", _local(job["not_before"])))
     if job.get("depends_on"):
@@ -965,7 +1020,10 @@ def read_log_tail(log_path: Any, lines: int = LOG_TAIL_LINES) -> str | None:
             size = f.tell()
             f.seek(max(0, size - LOG_READ_BYTES))
             data = f.read()
-    except OSError:
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        warn_once(f"cannot read log {log_path}: {type(e).__name__}")
         return None
     text = data.decode(errors="replace").replace("\r\n", "\n").replace("\r", "\n")
     text = _CTRL_RE.sub("", _ANSI_RE.sub("", text))

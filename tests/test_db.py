@@ -846,6 +846,45 @@ def test_mark_finished_accepts_interrupted_and_it_shows_in_backlog(conn):
     assert db.get_running(conn) is None
 
 
+def test_mark_finished_records_resource_usage(conn):
+    a = _mk(conn, "a")
+    db.mark_running(conn, a, pid=1, pgid=1)
+    db.mark_finished(conn, a, status="done", exit_code=0, max_rss_kb=31_457_280, cpu_user_secs=12.5, cpu_sys_secs=0.75)
+    job = db.get_job(conn, a)
+    assert job["max_rss_kb"] == 31_457_280
+    assert job["cpu_user_secs"] == 12.5
+    assert job["cpu_sys_secs"] == 0.75
+
+
+def test_mark_finished_without_resource_usage_leaves_columns_null(conn):
+    a = _mk(conn, "a")
+    db.mark_running(conn, a, pid=1, pgid=1)
+    db.mark_finished(conn, a, status="done", exit_code=0)
+    job = db.get_job(conn, a)
+    assert job["max_rss_kb"] is None
+    assert job["cpu_user_secs"] is None
+    assert job["cpu_sys_secs"] is None
+
+
+def test_export_and_history_carry_the_resource_usage(conn):
+    a = _mk(conn, "a")
+    db.mark_running(conn, a, pid=1, pgid=1)
+    db.mark_finished(conn, a, status="done", exit_code=0, max_rss_kb=2048, cpu_user_secs=3.5, cpu_sys_secs=0.5)
+    exported = db.get_export(conn)[0]
+    assert (exported["max_rss_kb"], exported["cpu_user_secs"], exported["cpu_sys_secs"]) == (2048, 3.5, 0.5)
+    hist = db.get_history(conn)[0]
+    assert (hist["max_rss_kb"], hist["cpu_user_secs"], hist["cpu_sys_secs"]) == (2048, 3.5, 0.5)
+
+
+def test_a_requeued_job_starts_without_the_old_resource_usage(conn):
+    a = _mk(conn, "a")
+    db.mark_running(conn, a, pid=1, pgid=1)
+    db.mark_finished(conn, a, status="failed", exit_code=1, max_rss_kb=2048, cpu_user_secs=3.5, cpu_sys_secs=0.5)
+    new_id = db.requeue(conn, a, log_path="/tmp/requeued.log")
+    row = db.get_job(conn, new_id)
+    assert row["max_rss_kb"] is None and row["cpu_user_secs"] is None and row["cpu_sys_secs"] is None
+
+
 def test_interrupted_job_can_be_requeued_and_cleared(conn):
     a = _mk(conn, "a", timeout_secs=30)
     db.mark_running(conn, a, pid=1, pgid=1)
@@ -1403,6 +1442,62 @@ def test_a_database_rebuilt_by_the_older_migration_gets_the_retry_columns_too(tm
     c.close()
 
 
+def test_a_database_rebuilt_by_the_older_migration_gets_the_resource_usage_columns_too(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    raw = sqlite3.connect(path)
+    raw.executescript(
+        """
+        CREATE TABLE jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel INTEGER NOT NULL DEFAULT 1,
+            status TEXT NOT NULL CHECK (status IN
+                ('queued','running','stopped','done','failed','cancelled')),
+            position INTEGER, raw_cmd TEXT NOT NULL, resolved_cmd TEXT NOT NULL,
+            cwd TEXT NOT NULL, env_extra TEXT, pid INTEGER, pgid INTEGER,
+            enqueued_at TEXT NOT NULL, started_at TEXT, finished_at TEXT,
+            exit_code INTEGER, log_path TEXT NOT NULL, note TEXT,
+            timeout_secs INTEGER, is_priority INTEGER NOT NULL DEFAULT 0,
+            max_retries INTEGER NOT NULL DEFAULT 0, attempt INTEGER NOT NULL DEFAULT 0,
+            parent_id INTEGER, origin TEXT
+        );
+        INSERT INTO jobs (status, position, raw_cmd, resolved_cmd, cwd, enqueued_at, log_path)
+        VALUES ('queued', 0, '["a"]', '["/usr/bin/a"]', '/tmp', '2026-01-01T00:00:00+00:00', '/tmp/1.log');
+        """
+    )
+    raw.commit()
+    raw.close()
+    c = db.connect(path)
+    db.init_db(c)
+    cols = [r["name"] for r in c.execute("PRAGMA table_info(jobs)").fetchall()]
+    assert cols.count("max_rss_kb") == 1
+    assert cols.count("cpu_user_secs") == 1
+    assert cols.count("cpu_sys_secs") == 1
+    assert db.get_job(c, 1)["max_rss_kb"] is None
+    c.close()
+
+
+def test_init_db_migrates_pre_resource_usage_database(tmp_path):
+    """A DB already on every column up to (and including) retry_delay_secs --
+    i.e. at schema version 4 -- just needs the new columns ADD COLUMN'd in,
+    no table rebuild. Simulates upgrading straight from F7."""
+    c = db.connect(tmp_path / "test.db")
+    db.init_db(c)
+    cols_before = [r["name"] for r in c.execute("PRAGMA table_info(jobs)").fetchall()]
+    assert "max_rss_kb" in cols_before  # fresh DB already has it; now simulate an older one
+    c.execute("ALTER TABLE jobs RENAME COLUMN max_rss_kb TO max_rss_kb_bak")
+    c.execute("ALTER TABLE jobs RENAME COLUMN cpu_user_secs TO cpu_user_secs_bak")
+    c.execute("ALTER TABLE jobs RENAME COLUMN cpu_sys_secs TO cpu_sys_secs_bak")
+    c.execute("UPDATE schema_version SET version = 4")
+    c.commit()
+    db.init_db(c)
+    assert db.get_schema_version(c) == db.SCHEMA_VERSION
+    cols = [r["name"] for r in c.execute("PRAGMA table_info(jobs)").fetchall()]
+    assert "max_rss_kb" in cols and "cpu_user_secs" in cols and "cpu_sys_secs" in cols
+    c.close()
+
+
 # ---------------------------------------------------------------------------
 # F8: edit lock + edit_job
 # ---------------------------------------------------------------------------
@@ -1770,3 +1865,103 @@ def test_two_connections_can_read_and_write(tmp_path):
     assert db.get_job(a, second) is not None
     a.close()
     b.close()
+
+
+# ---------------------------------------------------------------------------
+# F24: db.get_export
+# ---------------------------------------------------------------------------
+
+def test_export_returns_every_status_oldest_first(conn):
+    a, b, c = _mk(conn, "a"), _mk(conn, "b", channel=2), _mk(conn, "c")
+    _finish(conn, a, status="failed", exit_code=1)
+    db.mark_running(conn, b, pid=1, pgid=1)  # running; c stays queued
+    rows = db.get_export(conn)
+    assert [j["id"] for j in rows] == [a, b, c]
+    assert [j["status"] for j in rows] == ["failed", "running", "queued"]
+    assert rows[0]["raw_cmd"] and rows[0]["cwd"] == "/tmp"
+
+
+def test_export_filters_by_status_and_channel(conn):
+    a, b, c = _mk(conn, "a"), _mk(conn, "b", channel=2), _mk(conn, "c")
+    _finish(conn, a)
+    assert [j["id"] for j in db.get_export(conn, statuses=["queued"])] == [b, c]
+    assert [j["id"] for j in db.get_export(conn, statuses=["done", "queued"], channel=1)] == [a, c]
+    assert [j["id"] for j in db.get_export(conn, channel=2)] == [b]
+    assert db.get_export(conn, statuses=["running"]) == []
+
+
+def test_export_rejects_an_unknown_status(conn):
+    with pytest.raises(ValueError, match="unknown status"):
+        db.get_export(conn, statuses=["bogus"])
+
+
+# ---------------------------------------------------------------------------
+# F12: job hooks (on_finish_cmd / on_error_cmd)
+# ---------------------------------------------------------------------------
+
+def test_check_hook_normalises_and_validates():
+    assert db.check_hook(None, "x") is None
+    assert db.check_hook("", "x") is None and db.check_hook("   ", "x") is None  # blank = no hook
+    assert db.check_hook("rsync -a out/ host:", "x") == "rsync -a out/ host:"
+    for bad in (5, ["a"], True):
+        with pytest.raises(ValueError, match="must be a string"):
+            db.check_hook(bad, "on-finish command")
+    with pytest.raises(ValueError, match="NUL"):
+        db.check_hook("a\0b", "on-finish command")
+    with pytest.raises(ValueError, match="too long"):
+        db.check_hook("x" * (db.MAX_HOOK_LEN + 1), "on-finish command")
+    assert db.check_hook("x" * db.MAX_HOOK_LEN, "x")
+
+
+def test_enqueue_stores_hooks_and_defaults_to_none(conn):
+    a = _mk(conn, "a")
+    b = _mk(conn, "b", on_finish_cmd="echo finished", on_error_cmd="echo broke")
+    assert db.get_job(conn, a)["on_finish_cmd"] is None and db.get_job(conn, a)["on_error_cmd"] is None
+    job = db.get_job(conn, b)
+    assert job["on_finish_cmd"] == "echo finished" and job["on_error_cmd"] == "echo broke"
+
+
+def test_enqueue_rejects_a_bad_hook_and_writes_nothing(conn):
+    with pytest.raises(ValueError, match="on-error command"):
+        _mk(conn, "a", on_error_cmd="x" * (db.MAX_HOOK_LEN + 1))
+    with pytest.raises(ValueError, match="on-finish command"):
+        _mk(conn, "a", on_finish_cmd=3)  # type: ignore[arg-type]
+    assert db.get_queue(conn) == []
+
+
+def test_requeue_and_retry_copy_the_hooks(conn):
+    a = _mk(conn, "a", on_finish_cmd="echo f", on_error_cmd="echo e", max_retries=1)
+    db.mark_running(conn, a, pid=1, pgid=1)
+    db.mark_finished(conn, a, status="failed", exit_code=1)
+    manual = db.requeue(conn, a, log_path="/tmp/x.log")
+    auto = db.requeue(conn, a, log_path="/tmp/y.log", auto=True)
+    for new_id in (manual, auto):
+        job = db.get_job(conn, new_id)
+        assert job["on_finish_cmd"] == "echo f" and job["on_error_cmd"] == "echo e"
+
+
+def test_edit_job_sets_and_clears_hooks(conn):
+    a = _mk(conn, "a", on_finish_cmd="echo old")
+    new = db.edit_job(conn, a, updates={"on_finish_cmd": "echo new", "on_error_cmd": "echo err"})
+    assert new["on_finish_cmd"] == "echo new" and new["on_error_cmd"] == "echo err"
+    new = db.edit_job(conn, a, updates={"on_finish_cmd": "  ", "on_error_cmd": None})
+    assert new["on_finish_cmd"] is None and new["on_error_cmd"] is None  # blank / None remove the hook
+    with pytest.raises(ValueError, match="NUL"):
+        db.edit_job(conn, a, updates={"on_error_cmd": "a\0b"})
+
+
+def test_init_db_adds_the_hook_columns_to_a_pre_hooks_database(tmp_path):
+    """A DB at schema version 5 (everything but the F12 columns) gets them ADD COLUMN'd in."""
+    c = db.connect(tmp_path / "test.db")
+    db.init_db(c)
+    old = _mk(c, "old")
+    c.execute("ALTER TABLE jobs RENAME COLUMN on_finish_cmd TO on_finish_bak")
+    c.execute("ALTER TABLE jobs RENAME COLUMN on_error_cmd TO on_error_bak")
+    c.execute("UPDATE schema_version SET version = 5")
+    c.commit()
+    db.init_db(c)
+    assert db.get_schema_version(c) == db.SCHEMA_VERSION >= 6
+    cols = [r["name"] for r in c.execute("PRAGMA table_info(jobs)").fetchall()]
+    assert cols.count("on_finish_cmd") == 1 and cols.count("on_error_cmd") == 1
+    assert db.get_job(c, old)["on_finish_cmd"] is None  # old rows untouched, no hook
+    c.close()
