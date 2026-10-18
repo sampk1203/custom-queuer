@@ -3,9 +3,6 @@ name: ci
 on:
   push:
   pull_request:
-  schedule:
-    - cron: "17 5 * * 1"  # Mondays 05:17 UTC: the dependency audit catches new advisories without a push
-
 permissions:
   contents: read
 
