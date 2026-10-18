@@ -46,7 +46,7 @@ jobs:
       # by hand (or with dependabot) together with whatever the new version reports.
       - name: mypy (types)
         run: uv run --with "mypy==2.3.1" mypy
-      - name: ruff (lint, src and tests: the same two folders pyproject.toml's `src` names)
+      - name: ruff (lint src and tests)
         run: uvx ruff@0.16.8 check src tests
       - name: bandit (security lint)
         run: uvx --from "bandit[toml]==1.9.4" bandit -c pyproject.toml -r src
