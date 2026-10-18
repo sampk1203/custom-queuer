@@ -150,3 +150,19 @@ def test_usage_lines_agree_and_yes_is_documented_for_install():
     text = _text()
     assert text.count("Usage: $0 [install|uninstall] [--skip-tests] [--yes]") == 2
     assert "./install.sh install --yes" in text  # in the header comment
+
+
+def test_build_backend_pin_follows_the_uv_version_install_sh_installs():
+    """5.todo C8: `uv_build` is released together with uv, so pyproject's range must be the
+    minor series of the uv version install.sh bootstraps (a 0.12 uv with a <0.12 build backend
+    was the drift this guards against)."""
+    uv = re.search(r'UV_VERSION="(\d+)\.(\d+)\.(\d+)"', _text())
+    assert uv is not None
+    major, minor, patch = (int(g) for g in uv.groups())
+    pyproject = (SCRIPT.parent / "pyproject.toml").read_text()
+    pin = re.search(r'uv_build>=(\d+)\.(\d+)\.(\d+),<(\d+)\.(\d+)\.(\d+)"', pyproject)
+    assert pin is not None
+    low_major, low_minor, low_patch, high_major, high_minor, high_patch = (int(g) for g in pin.groups())
+    assert (low_major, low_minor) == (major, minor)
+    assert low_patch <= patch  # the bootstrapped uv is at least the lowest build backend allowed
+    assert (high_major, high_minor, high_patch) == (major, minor + 1, 0)

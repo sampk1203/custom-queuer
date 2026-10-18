@@ -1231,7 +1231,7 @@ def dep_info_bulk(conn: sqlite3.Connection, job_ids: list[int]) -> dict[int, dic
         SELECT d.job_id, d.dep_id, d.mode, j.status AS dep_status
         FROM job_deps d LEFT JOIN jobs j ON j.id = d.dep_id
         WHERE d.job_id IN ({placeholders}) ORDER BY d.job_id, d.dep_id
-        """,
+        """,  # nosec B608 - `placeholders` is only "?,?,..." built from len(job_ids); the ids are bound parameters
         job_ids,
     ).fetchall()
     for r in rows:

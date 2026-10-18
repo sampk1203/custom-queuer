@@ -519,7 +519,7 @@ async def test_cancel_on_channel_with_nothing_running_errors(daemon):
 
 @pytest.mark.asyncio
 async def test_rm_queued_job(daemon):
-    r1 = await send(daemon.socket_path, "add", argv=["sleep", "1"], cwd=CWD)
+    await send(daemon.socket_path, "add", argv=["sleep", "1"], cwd=CWD)
     r2 = await send(daemon.socket_path, "add", argv=["echo", "later"], cwd=CWD)
     await asyncio.sleep(0.1)
 
@@ -686,7 +686,7 @@ async def test_retry_stops_once_job_succeeds(daemon, tmp_path):
     r = await send(daemon.socket_path, "add", argv=["sh", "-c", script], cwd=CWD, max_retries=5)
     first = r["data"]["id"]
 
-    j1 = await wait_for_status(daemon.socket_path, first, {"failed"})
+    await wait_for_status(daemon.socket_path, first, {"failed"})
     j2 = await wait_for_status(daemon.socket_path, first + 1, {"done"})
     assert j2["attempt"] == 1
 
@@ -1689,7 +1689,7 @@ async def test_unexpected_error_in_sender_never_disturbs_the_queue(daemon, monke
 
     monkeypatch.setattr(notify, "send", boom)
     notify.save({"qur_id": "a3f9", "token": TG_TOKEN, "chat_ids": [111], "listen": False}, daemon.notify_path)
-    a = (await send(daemon.socket_path, "add", argv=["true"], cwd=CWD))["data"]["id"]
+    await send(daemon.socket_path, "add", argv=["true"], cwd=CWD)
     b = (await send(daemon.socket_path, "add", argv=["true"], cwd=CWD))["data"]["id"]
     assert (await wait_for_status(daemon.socket_path, b, {"done"}))["status"] == "done"
 
@@ -2818,11 +2818,13 @@ async def test_handlers_reject_wrong_types_cleanly(daemon, cmd, args):
 @pytest.mark.asyncio
 async def test_non_object_args_and_private_names_are_rejected(daemon):
     r, w = await asyncio.open_unix_connection(str(daemon.socket_path))
-    w.write(b'{"cmd": "add", "args": [1]}\n'); await w.drain()
+    w.write(b'{"cmd": "add", "args": [1]}\n')
+    await w.drain()
     assert json.loads(await r.readline())["ok"] is False
     w.close()
     r, w = await asyncio.open_unix_connection(str(daemon.socket_path))
-    w.write(b'{"cmd": "_x"}\n'); await w.drain()
+    w.write(b'{"cmd": "_x"}\n')
+    await w.drain()
     assert json.loads(await r.readline())["ok"] is False
     w.close()
 
@@ -3545,7 +3547,7 @@ async def test_sweep_creates_one_job_per_entry_in_order_with_qur_index(daemon):
     assert resp["ok"], resp
     ids = resp["data"]["ids"]
     assert resp["data"]["id"] == ids[0] and ids == list(range(ids[0], ids[0] + 3)) and resp["data"]["channel"] == 2
-    for job_id, n in zip(ids, (3, 4, 5)):
+    for job_id, n in zip(ids, (3, 4, 5), strict=True):
         job = await wait_for_status(daemon.socket_path, job_id, {"done", "failed"})
         assert job["status"] == "done" and job["channel"] == 2
         assert Path(job["log_path"]).read_text() == f"idx={n}\n"
@@ -3559,7 +3561,7 @@ async def test_array_is_expanded_by_the_daemon_into_one_job_per_number(daemon):
     assert resp["ok"], resp
     ids = resp["data"]["ids"]
     assert resp["data"]["id"] == ids[0] and ids == list(range(ids[0], ids[0] + 3)) and resp["data"]["channel"] == 2
-    for job_id, n in zip(ids, (3, 4, 5)):
+    for job_id, n in zip(ids, (3, 4, 5), strict=True):
         job = await wait_for_status(daemon.socket_path, job_id, {"done", "failed"})
         assert job["status"] == "done" and job["channel"] == 2
         assert Path(job["log_path"]).read_text() == f"idx={n}\n"
@@ -4071,7 +4073,7 @@ async def test_sweep_qur_index_wins_over_a_clashing_env(daemon):
     jobs = [_spec(["sh", "-c", "echo idx=$QUR_INDEX x=$X"], index=i) for i in (7, 8)]
     resp = await send(daemon.socket_path, "add", jobs=jobs, cwd=CWD, env={"QUR_INDEX": "99", "X": "1"})
     assert resp["ok"], resp
-    for job_id, n in zip(resp["data"]["ids"], (7, 8)):
+    for job_id, n in zip(resp["data"]["ids"], (7, 8), strict=True):
         job = await wait_for_status(daemon.socket_path, job_id, {"done", "failed"})
         assert Path(job["log_path"]).read_text() == f"idx={n} x=1\n"
 

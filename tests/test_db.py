@@ -26,7 +26,7 @@ def _mk(conn, name="job", channel=1, **kw):
 def _ascending(queue: list[dict]) -> bool:
     """Positions only have to order a lane: strictly increasing, not 0..n-1."""
     positions = [j["position"] for j in queue]
-    return all(x is not None for x in positions) and all(a < b for a, b in zip(positions, positions[1:]))
+    return all(x is not None for x in positions) and all(a < b for a, b in zip(positions, positions[1:], strict=False))
 
 
 # ---------------------------------------------------------------------------
@@ -325,7 +325,7 @@ def test_positions_independent_per_channel(conn):
 
 def test_running_isolated_between_channels(conn):
     a1 = _mk(conn, "a1", channel=1)
-    a2 = _mk(conn, "a2", channel=2)
+    _mk(conn, "a2", channel=2)
     db.mark_running(conn, a1, pid=1, pgid=1)
 
     assert db.get_running(conn, channel=1)["id"] == a1
@@ -1393,7 +1393,7 @@ def test_retry_backoff_doubles_the_delay_per_attempt(conn):
     for _ in range(3):
         job_id = _fail_and_retry(conn, job_id)
         waits.append(_secs_from_now(db.get_job(conn, job_id)["not_before"]))
-    for got, want in zip(waits, (60, 120, 240)):
+    for got, want in zip(waits, (60, 120, 240), strict=True):
         assert want - 5 <= got <= want
 
 

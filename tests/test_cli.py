@@ -1,13 +1,11 @@
+import json
 import shlex
 import shutil
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import click
 import pytest
-
-import json
-from datetime import datetime, timedelta, timezone
-
 from typer.testing import CliRunner
 
 from queuer import client
@@ -21,7 +19,6 @@ from queuer.cli import (
     _resolve_interpreter,
     app,
 )
-
 
 # ---------------------------------------------------------------------------
 # _needs_shell
@@ -793,7 +790,7 @@ def test_add_bot_connects_a_second_bot_and_keeps_the_first_untouched(tg2):
     assert res.exit_code == 0, res.output
     assert "https://t.me/x?start=y" in res.output  # QR/link shown for the new bot as well
     cfg = notify.load()
-    assert cfg["qur_id"] == "bigbox" and [b["token"] for b in cfg["bots"]] == [TG_TOKEN, TOKEN2 := TG_TOKEN2]
+    assert cfg["qur_id"] == "bigbox" and [b["token"] for b in cfg["bots"]] == [TG_TOKEN, TG_TOKEN2]
     assert cfg["bots"][0] == before["bots"][0]  # first bot unchanged
     assert cfg["bots"][1]["chat_ids"] == [777] and cfg["bots"][1]["username"] == "second_bot"
     assert tg2.paired[-1] == TG_TOKEN2
@@ -1059,7 +1056,9 @@ def test_clean_logs_refuses_when_db_missing(tmp_path, monkeypatch):
 
 
 def test_clean_logs_keeps_recent_orphans_and_deletes_old_ones(tmp_path, monkeypatch):
-    import os, time
+    import os
+    import time
+
     from queuer import db
 
     log_dir = tmp_path / "logs"
@@ -1155,7 +1154,9 @@ def test_before_after_help_says_position_only():
 # ---------------------------------------------------------------------------
 
 def test_clean_logs_deletes_old_interrupted_logs_but_not_running_ones(tmp_path, monkeypatch):
-    import os, time
+    import os
+    import time
+
     from queuer import db
 
     log_dir = tmp_path / "logs"
@@ -2901,7 +2902,7 @@ def test_logs_running_follows_the_job_running_on_the_channel(tmp_path, monkeypat
     calls = _capture_send(monkeypatch, _running_status(1, 7))
     res = CliRunner().invoke(app, ["logs", "--running"])
     assert res.exit_code == 0, res.output
-    assert calls == [("status", {})]
+    assert calls == [("status", {}), ("show", {"id": 7})]  # then asks where job 7's log is (5.todo L6)
     assert "hello\nworld\n" in res.output and "(job 7)" in res.output
 
 
@@ -3151,3 +3152,100 @@ def test_clean_logs_refuses_negative_days(tmp_path, monkeypatch):
     res = CliRunner().invoke(app, ["clean-logs", "--days", "-1"])
     assert res.exit_code != 0 and "-1" in res.output
     assert not (tmp_path / "logs").exists()
+
+
+# ---------------------------------------------------------------------------
+# 5.todo S5: `qur connect --import/--from` asks before saving new chats
+# ---------------------------------------------------------------------------
+
+REAL_CONFIRM_IMPORT = cli_mod._confirm_import
+
+
+@pytest.fixture(autouse=True)
+def _answer_yes_to_the_import_question(monkeypatch):
+    """The older connect tests are about pairing, not the question: they get a silent yes.
+    Tests that want the real prompt request the `real_confirm` fixture."""
+    monkeypatch.setattr(cli_mod, "_confirm_import", lambda lines, yes: None)
+
+
+@pytest.fixture
+def real_confirm(monkeypatch):
+    monkeypatch.setattr(cli_mod, "_confirm_import", REAL_CONFIRM_IMPORT)
+
+
+def test_import_destinations_lists_only_chats_not_already_set_up():
+    existing = {"qur_id": "box", "bots": [{"token": "1:aaa", "chat_ids": [5], "listen": False}]}
+    items = [("1:aaa", [5, 6]), ("2:bbb", [7])]
+    lines = cli_mod._import_destinations(items, {"1:aaa": "old_bot", "2:bbb": None}, existing)
+    assert lines == ["@old_bot (1): chat 6", "2: chat 7"]
+    assert cli_mod._import_destinations([("1:aaa", [5])], {}, existing) == []  # nothing new here
+    assert cli_mod._import_destinations([("1:aaa", [5])], {}, None) == ["1: chat 5"]
+
+
+def test_import_destinations_never_show_the_token_secret():
+    lines = cli_mod._import_destinations([("123456:SECRETHALF", [1])], {"123456:SECRETHALF": "b"}, None)
+    assert "SECRETHALF" not in "".join(lines)
+
+
+def test_confirm_import_asks_and_a_no_saves_nothing(real_confirm, monkeypatch, capsys):
+    monkeypatch.setattr(cli_mod, "_stdin_is_tty", lambda: True)
+    monkeypatch.setattr(cli_mod.typer, "confirm", lambda *a, **k: False)
+    with pytest.raises(cli_mod.typer.Exit):
+        cli_mod._confirm_import(["@b (1): chat 5"], yes=False)
+    err = capsys.readouterr().err
+    assert "send job messages" in err and "@b (1): chat 5" in err and "nothing was saved" in err
+
+
+def test_confirm_import_yes_flag_nothing_new_and_a_yes_answer_pass(real_confirm, monkeypatch, capsys):
+    monkeypatch.setattr(cli_mod, "_stdin_is_tty", lambda: False)
+    cli_mod._confirm_import(["@b (1): chat 5"], yes=True)  # --yes: no question, no terminal needed
+    cli_mod._confirm_import([], yes=False)  # nothing new: no question
+    assert capsys.readouterr().err == ""
+    monkeypatch.setattr(cli_mod, "_stdin_is_tty", lambda: True)
+    monkeypatch.setattr(cli_mod.typer, "confirm", lambda *a, **k: True)
+    cli_mod._confirm_import(["@b (1): chat 5"], yes=False)
+
+
+def test_confirm_import_without_a_terminal_needs_yes(real_confirm, monkeypatch, capsys):
+    monkeypatch.setattr(cli_mod, "_stdin_is_tty", lambda: False)
+    monkeypatch.setattr(cli_mod.typer, "confirm", lambda *a, **k: pytest.fail("must not prompt without a terminal"))
+    with pytest.raises(cli_mod.typer.Exit):
+        cli_mod._confirm_import(["@b (1): chat 5"], yes=False)
+    assert "--yes" in capsys.readouterr().err
+
+
+def _exported_string(tg) -> str:
+    runner.invoke(app, ["connect"], input=TG_TOKEN + "\n")
+    return runner.invoke(app, ["connect", "--export"]).stdout.strip().splitlines()[0]
+
+
+def test_connect_import_declined_saves_nothing_and_yes_saves(tg, real_confirm, tmp_path, monkeypatch):
+    exported = _exported_string(tg)
+    monkeypatch.setenv("QUEUER_NOTIFY_PATH", str(tmp_path / "other" / "notify.json"))  # "second machine"
+    monkeypatch.setattr(cli_mod, "_stdin_is_tty", lambda: True)
+    res = runner.invoke(app, ["connect", "--import", exported], input="n\n")
+    assert res.exit_code == 1 and "qur_test_bot" in res.output and "chat 555" in res.output
+    assert "nothing was saved" in res.output
+    assert notify.load() is None  # declined: nothing was written
+    res = runner.invoke(app, ["connect", "--import", exported], input="y\n")
+    assert res.exit_code == 0, res.output
+    assert _one()["chat_ids"] == [555]
+
+
+def test_connect_import_with_yes_needs_no_terminal_and_stdin_import_needs_yes(tg, real_confirm, tmp_path, monkeypatch):
+    exported = _exported_string(tg)
+    monkeypatch.setenv("QUEUER_NOTIFY_PATH", str(tmp_path / "other" / "notify.json"))
+    monkeypatch.setattr(cli_mod, "_stdin_is_tty", lambda: False)
+    res = runner.invoke(app, ["connect", "--import", "-"], input=exported + "\n")
+    assert res.exit_code == 1 and "--yes" in res.output
+    assert notify.load() is None
+    res = runner.invoke(app, ["connect", "--import", "-", "--yes"], input=exported + "\n")
+    assert res.exit_code == 0, res.output
+    assert _one()["chat_ids"] == [555]
+
+
+def test_connect_import_of_chats_already_set_up_asks_nothing(tg, real_confirm, monkeypatch):
+    exported = _exported_string(tg)
+    monkeypatch.setattr(cli_mod, "_stdin_is_tty", lambda: False)  # a question would fail here
+    res = runner.invoke(app, ["connect", "--import", exported])
+    assert res.exit_code == 0, res.output

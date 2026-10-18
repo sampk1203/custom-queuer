@@ -3,6 +3,8 @@ name: ci
 on:
   push:
   pull_request:
+  schedule:
+    - cron: "17 5 * * 1"  # Mondays 05:17 UTC: the dependency audit catches new advisories without a push
 
 permissions:
   contents: read
@@ -16,12 +18,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # pyproject.toml says requires-python >= 3.12, so 3.8-3.11 cannot install
-        # this project. Lower that bound first if you want to test them.
+        # pyproject.toml says requires-python >= 3.10, so 3.10 is the oldest version that can install
+        # this project. (mypy and ruff target 3.12, so 3.10/3.11 compatibility is enforced by this matrix only.)
         python-version: ["3.10","3.11","3.12", "3.13", "3.14", "3.15"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6.8.0
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install the locked environment
@@ -33,26 +35,32 @@ jobs:
     name: lint (mypy, ruff, bandit)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6.8.0
         with:
           python-version: "3.12"
       - name: Install the locked environment
         run: uv sync --locked
-      # The tools run from uv's cache with `--with`/`uvx`, so uv.lock is not touched.
+      # The tools run from uv's cache with `--with`/`uvx`, so uv.lock is not touched. Their versions
+      # are pinned (5.todo S3): a new release cannot turn CI red or run new code unreviewed; bump them
+      # by hand (or with dependabot) together with whatever the new version reports.
       - name: mypy (types)
-        run: uv run --with "mypy>=1.13" mypy
-      - name: ruff (lint)
-        run: uvx ruff check src
+        run: uv run --with "mypy==2.3.1" mypy
+      - name: ruff (lint, src and tests: the same two folders pyproject.toml's `src` names)
+        run: uvx ruff@0.16.8 check src tests
       - name: bandit (security lint)
-        run: uvx --from "bandit[toml]" bandit -c pyproject.toml -r src
+        run: uvx --from "bandit[toml]==1.9.4" bandit -c pyproject.toml -r src
 
   audit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6.8.0
       - name: Export locked runtime dependencies
         run: uv export --frozen --no-dev --no-hashes --no-emit-project -o requirements.txt
+      # 5.todo C6: the committed requirements.txt must be what uv.lock exports (after changing
+      # dependencies: run the export above, commit the file).
+      - name: requirements.txt is up to date with uv.lock
+        run: git diff --exit-code requirements.txt
       - name: Audit them for known vulnerabilities
-        run: uvx pip-audit -r requirements.txt --no-deps --disable-pip
+        run: uvx pip-audit@2.10.1 -r requirements.txt --no-deps --disable-pip

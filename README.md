@@ -107,7 +107,7 @@ queuer doctor [--fix] [--json]
 queuer daemon start | stop [--yes] | restart [--yes] | status | logs [-n N] [-f]
 queuer logs ID [--tail]
 queuer clean-logs [--days N] [--max-mb N] [--dry-run]
-queuer connect [--export | --import STRING | --from [USER@]HOST | --add-bot | --off] [--id NAME] [--listen | --no-listen] [--list] [--remove-chat CHAT_ID] [--remove-bot [--all]] [--bot ID_OR_@NAME]
+queuer connect [--export | --import STRING | --from [USER@]HOST | --add-bot | --off] [--id NAME] [--listen | --no-listen] [--yes] [--list] [--remove-chat CHAT_ID] [--remove-bot [--all]] [--bot ID_OR_@NAME]
 ```
 
 ### `add`
@@ -771,12 +771,17 @@ be set up. Without ssh, copy the string by hand:
 ```bash
 qur connect --export                  # on the first machine: prints one string
 qur connect --import qurtg1:eyJ0...   # on each other machine
-echo 'qurtg1:eyJ0...' | qur connect --import -   # same, string from stdin
+echo 'qurtg1:eyJ0...' | qur connect --import - --yes   # same, string from stdin (no terminal to ask on, so --yes)
 ```
 
 A string given on the command line is visible in `ps` and your shell history, so
 `qur connect` prints a warning. Prefer `--from user@host` (nothing to copy) or
 `--import -` (string on stdin).
+
+`--import` and `--from` also show which bot and which chats the string would make this machine send job
+messages (commands, paths, log tails) to, and ask `[y/N]` (default no) before saving anything; only chats this
+machine does not already send to are listed, and nothing is asked when there are none. `--yes` / `-y` skips the question,
+and is required when there is no terminal to ask on, which includes `--import -` (stdin is the string).
 
 Each machine gets its own id on import and is send-only (no buttons; the first
 machine keeps them). The string contains the bot token, so keep it private.
@@ -996,8 +1001,8 @@ boundary. What is enforced:
   clear error. A client that connects and sends nothing is dropped after 10 s.
 - **Timeouts and `--now`.** `--timeout` counts run time only; time a job spends frozen
   by a `--now` job does not count.
-- **Bot token.** Never appears in logs or error text. `qur connect --import -` takes the
-  setup string on stdin; on the command line it is visible in `ps` and shell history
+- **Bot token.** Never appears in logs or error text. `qur connect --import - --yes` takes the
+  setup string on stdin (an import first shows the bot and chats it will send job data to and asks); on the command line it is visible in `ps` and shell history
   (a warning is printed). The setup string and `notify.json` contain the token, so
   keep them private; `/revoke` to @BotFather invalidates it. The daemon checks
   `notify.json` and its folder (regular file, yours, no group/other access): a loose
@@ -1045,9 +1050,13 @@ notify config at a temporary folder and removes every other `QUEUER_*` variable 
 for the length of each test (so a `QUEUER_POST_JOB_HOOK` or `QUEUER_KEEP` exported in the shell that runs
 `./install.sh` is never read by a test daemon). A test that needs one sets it itself with `monkeypatch.setenv`.
 
-`.github/workflows/ci.yml` runs the same tests, and a dependency audit
-(`pip-audit` on the locked dependencies), on every push and pull request, and
-once a week so new advisories show up without a push. It needs a GitHub repo to run;
+`.github/workflows/ci.yml` runs the same tests, the lint job (mypy, `ruff check src tests`, bandit) and a dependency audit
+(`pip-audit` on the locked dependencies; it also fails when the committed `requirements.txt` is not what `uv.lock` exports:
+after changing dependencies run `uv export --frozen --no-dev --no-hashes --no-emit-project -o requirements.txt` and commit it),
+on every push and pull request, and
+once a week so new advisories show up without a push. The GitHub actions are pinned to commit SHAs and the tools to exact
+versions (mypy, ruff, bandit, pip-audit), so a new release cannot change CI behind your back: bump them by hand. The
+build backend range in `pyproject.toml` (`uv_build`) follows the uv version `install.sh` installs; a test checks it. It needs a GitHub repo to run;
 locally the commands above are the same thing.
 
 ## Known limitations (by design, not oversights)
@@ -1102,7 +1111,8 @@ qur connect --remove-chat 123456789 [--bot ID]   # all bots that have it, or jus
 qur connect --remove-bot --bot ID   # drop one bot; --all drops everything
 qur connect --export [--bot ID]     # all bots (qurtg2:) or one (qurtg1:)
 qur connect --import STRING         # adds the string's bots, send-only unless --listen
-qur connect --import -              # same, string read from stdin (keeps token out of ps/history)
+qur connect --import - --yes        # same, string read from stdin (keeps token out of ps/history)
+qur connect --import STRING --yes   # skip the "send job messages to these chats?" question
 ```
 
 `--bot` takes the numeric bot id or the @username shown by `--list`. `--import`

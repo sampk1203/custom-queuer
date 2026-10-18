@@ -2138,6 +2138,39 @@ def _bot_ids_hint(cfg: dict[str, Any]) -> str:
     return ", ".join(notify.bot_label(b) for b in cfg["bots"])
 
 
+def _import_destinations(items: list[tuple[str, list[int]]], names: dict[str, str | None], existing: dict[str, Any] | None) -> list[str]:
+    """S5: one display line per bot of an import string that names chats this machine does not
+    send to yet (`@name (bot id): chat 1, chat 2`). Empty when everything is already set up here."""
+    have: dict[str, set[int]] = {b["token"]: set(b["chat_ids"]) for b in existing["bots"]} if existing else {}
+    lines: list[str] = []
+    for token, chat_ids in items:
+        new = [c for c in chat_ids if c not in have.get(token, set())]
+        if not new:
+            continue
+        label = notify.bot_label({"token": token, "username": names.get(token)})
+        lines.append(f"{label}: " + ", ".join(f"chat {c}" for c in new))
+    return lines
+
+
+def _stdin_is_tty() -> bool:
+    return sys.stdin.isatty()
+
+
+def _confirm_import(lines: list[str], yes: bool) -> None:
+    """S5: a pasted or ssh-fetched --export string decides where this machine's job data (commands,
+    paths, log tails) goes, so show the bot and the chats and ask before saving. `--yes` skips the
+    question; without a terminal (`--import -` uses stdin) there is nobody to ask, so that needs --yes."""
+    if not lines or yes:
+        return
+    typer.echo("This will make this machine send job messages (commands, paths, log tails) to:", err=True)
+    for line in lines:
+        typer.echo(f"  {line}", err=True)
+    if not _stdin_is_tty():
+        _fail("cannot ask for confirmation without a terminal; check the chats above and run again with --yes")
+    if not typer.confirm("Send job messages to these chats?", default=False):
+        _fail("cancelled: nothing was saved")
+
+
 def _bots_for(cfg: dict[str, Any] | None, ref: str | None) -> list[dict[str, Any]]:
     """The bots a command applies to: the one named by --bot, else all."""
     if cfg is None:
@@ -2174,6 +2207,7 @@ def connect(
     add_bot: bool = typer.Option(False, "--add-bot", help="Connect one more bot to this machine: asks for its token, then pairs a phone (QR) as usual"),
     bot: Optional[str] = typer.Option(None, "--bot", metavar="BOT", help="Which connected bot a command applies to: its id or @username (shown by --list)"),
     all_: bool = typer.Option(False, "--all", help="With --remove-bot: remove every bot, i.e. forget the whole setup"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="With --import/--from: do not ask before sending job messages to the chats the string names (needed when there is no terminal, e.g. `--import -`)"),
 ) -> None:
     """Get a Telegram message when a job finishes, on any machine running qur.
 
@@ -2196,7 +2230,10 @@ def connect(
     own bot if you want its buttons to always reach it (`--add-bot` on that
     machine), and use --import/--from on the others only to send through it.
     Machines set up with --import send through the bot but show no buttons
-    (unless you pass --listen).
+    (unless you pass --listen). --import and --from first show the bot and the
+    chats the string names that this machine does not send to yet, and ask
+    [y/N] before saving, because that string decides where your job data goes;
+    --yes skips the question (and is needed for `--import -`, which has no terminal to ask on).
 
     Manage this machine: --list shows its id, host, bots and paired chat ids
     (other machines are not listed; run it on each). --id renames it.
@@ -2228,7 +2265,7 @@ def connect(
       qur connect --export
       qur connect --from sampk@laptop
       qur connect --import qurtg1:eyJ0Ijoi...
-      qur connect --import -   (string read from stdin)
+      qur connect --import - --yes   (string read from stdin; no terminal to ask on)
       qur connect --id bigbox
       qur connect --list
       qur connect --bot @laptop_bot --no-listen
@@ -2366,6 +2403,7 @@ def connect(
                 names[token] = notify.check_token(token)
             except notify.NotifyError as e:
                 _fail(f"bot token rejected by Telegram: {e}")
+        _confirm_import(_import_destinations(items, names, existing), yes)  # S5: before anything is saved
         merged: dict[str, Any] | None = existing
         imported: list[str] = []
         for token, chat_ids in items:
