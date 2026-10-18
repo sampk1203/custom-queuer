@@ -268,10 +268,10 @@ if ! command -v uv > /dev/null 2>&1; then
     # Pinned release + SHA-256 (taken from the release's own .sha256 files): a
     # tampered or cut-off download is rejected, nothing from the net is run
     # unchecked. To bump: change UV_VERSION and both hashes together.
-    UV_VERSION="0.12.24"
+    UV_VERSION="0.13.0"
     case "$(uname -s)-$(uname -m)" in
-        Linux-x86_64)  UV_ARCH=x86_64;  UV_SHA256="b4dfaef47d491a7296981f8374a4595f55dbf84e8937c8ecd2983574d8bb3da6" ;;
-        Linux-aarch64) UV_ARCH=aarch64; UV_SHA256="5231be65f496304623895dacdbf1de8504fec90303684bdf05805aa34414dd21" ;;
+        Linux-x86_64)  UV_ARCH=x86_64;  UV_SHA256="1468ebd5a5541121837c5a2817b9972ba6090fa6caa3d142620850a47fb75154" ;;
+        Linux-aarch64) UV_ARCH=aarch64; UV_SHA256="3ccfb6af6e242433eb552f7d9676abd5412c6595c497e990d9c8cb7b5bd4d2c3" ;;
         *)
             echo "ERROR: uv not found and no pinned download for $(uname -sm)." >&2
             echo "Install uv yourself (https://docs.astral.sh/uv/) and re-run this script." >&2
