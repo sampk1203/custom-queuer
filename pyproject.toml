@@ -1,6 +1,6 @@
 [project]
 name = "queuer"
-version = "0.1.0"
+version = "0.2.0"
 description = "Personal job queue: qur CLI + queuerd daemon with Telegram notifications"
 readme = "README.md"
 authors = [{ name = "Sameer Kulkarni", email = "sampk1203@gmail.com" }]
