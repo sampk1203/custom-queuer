@@ -18,7 +18,7 @@ qur = "queuer.cli:app"
 queuerd = "queuer.daemon:main"
 
 [build-system]
-requires = ["uv_build>=0.13.0,<0.14.0"]  # keep in step with UV_VERSION in install.sh (tests/test_install_sh.py checks)
+requires = ["uv_build>=0.13.1,<0.14.0"]  # keep in step with UV_VERSION in install.sh (tests/test_install_sh.py checks)
 build-backend = "uv_build"
 
 [dependency-groups]
