@@ -2274,8 +2274,11 @@ def test_add_dry_run_daemon_error_is_reported_and_exits_nonzero(monkeypatch):
 
 
 def test_add_help_mentions_dry_run():
+    import re
+
     res = runner.invoke(app, ["add", "--help"], env={"COLUMNS": "200"})
-    assert "--dry-run" in res.output
+    # CI (GitHub Actions) makes Rich emit colour codes that split "--dry-run" into styled pieces: compare plain text
+    assert "--dry-run" in re.sub(r"\x1b\[[0-9;]*m", "", res.output)
 
 
 # ---------------------------------------------------------------------------
