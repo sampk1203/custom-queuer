@@ -33,13 +33,13 @@ dev = [
 
 [tool.mypy]
 files = ["src"]
-python_version = "3.12"
+python_version = "3.10"  # = the requires-python floor, so a 3.11+ only API is caught here, not just by the CI matrix
 warn_unused_ignores = true
 warn_redundant_casts = true
 no_implicit_optional = true
 
 [tool.ruff]
-target-version = "py312"
+target-version = "py310"  # = the requires-python floor
 src = ["src", "tests"]
 
 [tool.ruff.lint]

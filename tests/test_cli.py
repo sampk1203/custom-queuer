@@ -2105,6 +2105,49 @@ def test_status_json_with_no_channels(monkeypatch):
     assert json.loads(runner.invoke(app, ["status", "--json"]).stdout) == {"channels": {}}
 
 
+# the human (non-JSON) `qur status` view
+def _started(secs=90):
+    return (datetime.now(timezone.utc) - timedelta(seconds=secs)).isoformat()
+
+
+def test_status_text_with_no_channels(monkeypatch):
+    monkeypatch.setattr(client, "send", lambda cmd, **kw: {"channels": {}})
+    res = runner.invoke(app, ["status"])
+    assert res.exit_code == 0 and "nothing has ever been queued" in res.stdout
+
+
+def test_status_text_idle_channel(monkeypatch):
+    chan = {"running": None, "frozen": None, "paused": False}
+    monkeypatch.setattr(client, "send", lambda cmd, **kw: {"channels": {"1": chan}})
+    res = runner.invoke(app, ["status"])
+    assert res.exit_code == 0
+    assert "channel 1" in res.stdout and "idle -- no job running" in res.stdout and "paused" not in res.stdout
+
+
+def test_status_text_running_job_shows_id_command_and_time(monkeypatch):
+    job = _job(5, status="running", started_at=_started(), is_priority=1)
+    chan = {"running": job, "frozen": None, "paused": False}
+    monkeypatch.setattr(client, "send", lambda cmd, **kw: {"channels": {"1": chan}})
+    res = runner.invoke(app, ["status"])
+    assert res.exit_code == 0
+    assert "#5" in res.stdout and "(priority)" in res.stdout and "echo 5" in res.stdout
+    assert "running for:" in res.stdout and "idle" not in res.stdout
+
+
+def test_status_text_paused_and_frozen_channels_in_numeric_order(monkeypatch):
+    frozen = _job(7, status="stopped", started_at=_started())
+    data = {"channels": {
+        "10": {"running": None, "frozen": None, "paused": True},
+        "2": {"running": None, "frozen": frozen, "paused": False},
+    }}
+    monkeypatch.setattr(client, "send", lambda cmd, **kw: data)
+    res = runner.invoke(app, ["status"])
+    assert res.exit_code == 0
+    assert res.stdout.index("channel 2") < res.stdout.index("channel 10")  # numeric, not "10" < "2"
+    assert "#7 frozen" in res.stdout and "paused" in res.stdout
+    assert "idle -- no job running" in res.stdout  # the paused channel 10 has nothing running or frozen
+
+
 def test_show_json_has_no_markup_even_for_bracketed_commands(monkeypatch):
     job = _job(1, raw_cmd=json.dumps(["echo", "[red]x[/red]"]))
     monkeypatch.setattr(client, "send", lambda cmd, **kw: job)
@@ -2925,6 +2968,57 @@ def test_logs_running_with_nothing_running_fails_cleanly(monkeypatch):
     assert res.exit_code == 1 and "no job is running on channel 1" in res.output
     _capture_send(monkeypatch, {"channels": {}})
     assert CliRunner().invoke(app, ["logs", "--running", "--channel", "3"]).exit_code == 1
+
+
+def _stop_after_one_poll(monkeypatch, log, appended=None):
+    """Make `logs --tail`'s idle sleep optionally append `appended` to `log` once, then raise
+    KeyboardInterrupt (the user's Ctrl-C) on the next idle poll, so the follow loop ends."""
+    polls = []
+
+    def fake_sleep(_secs):
+        polls.append(1)
+        if len(polls) == 1 and appended is not None:
+            with open(log, "a") as f:
+                f.write(appended)
+        else:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli_mod.time, "sleep", fake_sleep)
+    return polls
+
+
+def test_logs_tail_follows_from_the_end_and_prints_only_new_lines(tmp_path, monkeypatch):
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    log = log_dir / "3.log"
+    log.write_text("old line\n")
+    monkeypatch.setenv("QUEUER_LOG_DIR", str(log_dir))
+    _stop_after_one_poll(monkeypatch, log, appended="[1/10] new line\n")
+    res = CliRunner().invoke(app, ["logs", "3", "--tail"])
+    assert res.exit_code == 0, res.output
+    assert res.output == "[1/10] new line\n"  # the existing content is not replayed; brackets stay verbatim
+
+
+def test_logs_lines_with_tail_shows_the_last_lines_then_follows(tmp_path, monkeypatch):
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    log = log_dir / "4.log"
+    log.write_text("a\nb\nc\n")
+    monkeypatch.setenv("QUEUER_LOG_DIR", str(log_dir))
+    _stop_after_one_poll(monkeypatch, log, appended="d\n")
+    res = CliRunner().invoke(app, ["logs", "4", "-n", "2", "--tail"])
+    assert res.exit_code == 0, res.output
+    assert res.output == "b\nc\nd\n"
+
+
+def test_logs_tail_ends_quietly_on_ctrl_c(tmp_path, monkeypatch):
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "6.log").write_text("x\n")
+    monkeypatch.setenv("QUEUER_LOG_DIR", str(log_dir))
+    polls = _stop_after_one_poll(monkeypatch, log_dir / "6.log")
+    res = CliRunner().invoke(app, ["logs", "6", "--tail"])
+    assert res.exit_code == 0 and res.output == "" and polls == [1]
 
 
 def test_logs_needs_an_id_or_running_but_not_both(monkeypatch):

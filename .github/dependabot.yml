@@ -1,0 +1,15 @@
+# Weekly bump pull requests. The GitHub actions in .github/workflows/ci.yml are pinned to commit SHAs
+# (with the tag in a trailing comment) and the Python dependencies to uv.lock; dependabot understands both.
+# The lint/audit tool versions inside the `run:` lines of ci.yml (mypy, ruff, bandit, pip-audit) are not
+# visible to it: bump those by hand. After a dependency bump, requirements.txt must be re-exported
+# (see README, Development), or the audit job fails on purpose.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"

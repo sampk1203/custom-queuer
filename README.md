@@ -1055,7 +1055,8 @@ for the length of each test (so a `QUEUER_POST_JOB_HOOK` or `QUEUER_KEEP` export
 after changing dependencies run `uv export --frozen --no-dev --no-hashes --no-emit-project -o requirements.txt` and commit it),
 on every push and pull request, and
 once a week so new advisories show up without a push. The GitHub actions are pinned to commit SHAs and the tools to exact
-versions (mypy, ruff, bandit, pip-audit), so a new release cannot change CI behind your back: bump them by hand. The
+versions (mypy, ruff, bandit, pip-audit), so a new release cannot change CI behind your back: bump them by hand (`.github/dependabot.yml` opens weekly pull requests for the actions and the lock file, but cannot see the tool versions in the `run:` lines). mypy and ruff target Python 3.10, the
+`requires-python` floor, so a 3.11+ only API is caught by the lint job as well as by the test matrix. The
 build backend range in `pyproject.toml` (`uv_build`) follows the uv version `install.sh` installs; a test checks it. It needs a GitHub repo to run;
 locally the commands above are the same thing.
 
