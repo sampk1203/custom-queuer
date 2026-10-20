@@ -500,54 +500,6 @@ def test_connect_timeout_is_a_clean_error(tg, monkeypatch):
     assert res.exit_code == 1 and "nobody pressed Start" in res.output
 
 
-def test_export_then_import_gives_each_machine_its_own_id(tg, tmp_path, monkeypatch):
-    runner.invoke(app, ["connect"], input=TG_TOKEN + "\n")
-    a = _one()
-    exported = runner.invoke(app, ["connect", "--export"]).stdout.strip().splitlines()[0]
-    assert exported.startswith("qurtg1:")
-
-    # "second machine": a different config path
-    monkeypatch.setenv("QUEUER_NOTIFY_PATH", str(tmp_path / "other" / "notify.json"))
-    res = runner.invoke(app, ["connect", "--import", exported])
-    assert res.exit_code == 0, res.output
-    b = _one()
-    assert b["token"] == a["token"] and b["chat_ids"] == a["chat_ids"]
-    assert b["qur_id"] != a["qur_id"]  # own id per machine
-    assert any(b["qur_id"] in m[2] for m in tg)  # hello message names the new id
-
-
-def test_import_keeps_existing_qur_id(tg):
-    runner.invoke(app, ["connect"], input=TG_TOKEN + "\n")
-    cfg = _one()
-    s = notify.export_string({**cfg, "chat_ids": [555, 888]})
-    res = runner.invoke(app, ["connect", "--import", s])
-    assert res.exit_code == 0
-    after = _one()
-    assert after["qur_id"] == cfg["qur_id"] and after["chat_ids"] == [555, 888]  # a chat we lacked is added
-
-
-def test_import_garbage_fails_and_saves_nothing(tg):
-    res = runner.invoke(app, ["connect", "--import", "qurtg1:!!!"])
-    assert res.exit_code == 1 and "corrupt" in res.output
-    assert notify.load() is None
-
-
-def test_import_rejected_token_saves_nothing(tg, monkeypatch):
-    def reject(token, method, params=None, timeout=0):
-        raise notify.NotifyError("Unauthorized", 401)
-
-    monkeypatch.setattr(notify, "_api", reject)
-    s = notify.export_string({"token": TG_TOKEN, "chat_ids": [1]})
-    res = runner.invoke(app, ["connect", "--import", s])
-    assert res.exit_code == 1 and "rejected" in res.output
-    assert notify.load() is None
-
-
-def test_export_without_setup_errors(tg):
-    res = runner.invoke(app, ["connect", "--export"])
-    assert res.exit_code == 1 and "run `qur connect` first" in res.output
-
-
 def test_connect_off_removes_config(tg):
     runner.invoke(app, ["connect"], input=TG_TOKEN + "\n")
     res = runner.invoke(app, ["connect", "--off"])
@@ -555,8 +507,15 @@ def test_connect_off_removes_config(tg):
     assert runner.invoke(app, ["connect", "--off"]).exit_code == 0  # idempotent
 
 
+def test_connect_has_no_cross_device_sharing_options(tg):
+    helptext = runner.invoke(app, ["connect", "--help"]).output
+    for flag in ("--export", "--import", "--from", "--yes"):
+        assert flag not in helptext
+        assert runner.invoke(app, ["connect", flag]).exit_code != 0
+
+
 def test_connect_options_are_mutually_exclusive(tg):
-    res = runner.invoke(app, ["connect", "--export", "--off"])
+    res = runner.invoke(app, ["connect", "--list", "--off"])
     assert res.exit_code == 1 and "only one" in res.output
 
 
@@ -602,21 +561,9 @@ def test_connect_listen_toggle_keeps_everything_else(tg):
     assert _one()["listen"] is True
 
 
-def test_connect_import_is_send_only_unless_listen_given(tg, monkeypatch, tmp_path):
+def test_connect_id_and_listen_conflict_with_list_and_off(tg):
     runner.invoke(app, ["connect"], input=TG_TOKEN + "\n")
-    exported = runner.invoke(app, ["connect", "--export"]).stdout.strip().splitlines()[0]
-    monkeypatch.setenv("QUEUER_NOTIFY_PATH", str(tmp_path / "other" / "notify.json"))
-    assert runner.invoke(app, ["connect", "--import", exported, "--id", "second"]).exit_code == 0
-    cfg = _one()
-    assert cfg["listen"] is False and cfg["qur_id"] == "second"
-    assert runner.invoke(app, ["connect", "--import", exported, "--listen"]).exit_code == 0
-    cfg = _one()
-    assert cfg["listen"] is True and cfg["qur_id"] == "second"  # id kept on re-import
-
-
-def test_connect_id_and_listen_conflict_with_export_and_off(tg):
-    runner.invoke(app, ["connect"], input=TG_TOKEN + "\n")
-    for flags in (["--export", "--id", "x"], ["--off", "--no-listen"]):
+    for flags in (["--list", "--id", "x"], ["--off", "--no-listen"]):
         res = runner.invoke(app, ["connect", *flags])
         assert res.exit_code == 1 and "cannot be combined" in res.output
 
@@ -682,61 +629,11 @@ def test_connect_remove_bot_is_off(tg):
 
 def test_connect_new_modes_are_mutually_exclusive(tg):
     runner.invoke(app, ["connect"], input=TG_TOKEN + "\n")
-    for flags in (["--list", "--off"], ["--remove-chat", "555", "--export"], ["--list", "--id", "x"],
+    for flags in (["--list", "--off"], ["--remove-chat", "555", "--list"], ["--list", "--id", "x"],
                   ["--remove-chat", "555", "--no-listen"]):
         res = runner.invoke(app, ["connect", *flags])
         assert res.exit_code == 1, flags
     assert _one()["chat_ids"] == [555]
-
-
-# ---------------------------------------------------------------------------
-# connect --from (ssh pull)
-# ---------------------------------------------------------------------------
-
-def _fake_ssh(monkeypatch, *, stdout="", code=0, calls=None, raises=None):
-    import subprocess
-
-    def run(cmd, **kw):
-        if calls is not None:
-            calls.append(cmd)
-        if raises:
-            raise raises
-        return subprocess.CompletedProcess(cmd, code, stdout=stdout)
-
-    monkeypatch.setattr("queuer.cli.subprocess.run", run)
-
-
-def test_connect_from_pulls_export_over_ssh_and_imports(tg, monkeypatch):
-    s = notify.export_string({"token": TG_TOKEN, "chat_ids": [555]})
-    calls = []
-    _fake_ssh(monkeypatch, stdout=f"motd noise\n{s}\n", calls=calls)
-    res = runner.invoke(app, ["connect", "--from", "sampk@laptop", "--id", "desktop"])
-    assert res.exit_code == 0, res.output
-    assert calls[0][:3] == ["ssh", "--", "sampk@laptop"] and "qur connect --export" in calls[0][3]
-    cfg = _one()
-    assert cfg["token"] == TG_TOKEN and cfg["chat_ids"] == [555]
-    assert cfg["qur_id"] == "desktop" and cfg["listen"] is False  # send-only, the laptop keeps the buttons
-    assert tg and "[desktop]" in tg[0][2]
-
-
-@pytest.mark.parametrize("kw", [
-    {"code": 255},                       # ssh failed / qur missing remotely
-    {"stdout": "no string here\n"},      # remote not connected
-    {"raises": FileNotFoundError()},     # no ssh binary
-])
-def test_connect_from_failures_save_nothing(tg, monkeypatch, kw):
-    _fake_ssh(monkeypatch, **kw)
-    res = runner.invoke(app, ["connect", "--from", "laptop"])
-    assert res.exit_code == 1 and notify.load() is None
-
-
-def test_connect_from_rejects_option_like_target_and_conflicts(tg, monkeypatch):
-    calls = []
-    _fake_ssh(monkeypatch, calls=calls)
-    assert runner.invoke(app, ["connect", "--from", "-oProxyCommand=x"]).exit_code == 1
-    assert runner.invoke(app, ["connect", "--from", "h", "--off"]).exit_code == 1
-    assert runner.invoke(app, ["connect", "--from", "h", "--import", "qurtg1:x"]).exit_code == 1
-    assert calls == [] and notify.load() is None
 
 
 # ---------------------------------------------------------------------------
@@ -842,7 +739,7 @@ def test_pairing_another_phone_with_two_bots_needs_bot(tg2):
 def test_unknown_bot_is_a_clean_error(tg2):
     _setup_two(tg2)
     for flags in (["--bot", "nobody"], ["--bot", "nobody", "--no-listen"], ["--bot", "nobody", "--remove-chat", "555"],
-                  ["--bot", "nobody", "--remove-bot"], ["--bot", "nobody", "--export"]):
+                  ["--bot", "nobody", "--remove-bot"]):
         res = runner.invoke(app, ["connect", *flags])
         assert res.exit_code == 1 and "no connected bot matches" in res.output, flags
 
@@ -917,71 +814,9 @@ def test_remove_chat_hits_every_bot_that_has_it_or_just_the_named_one(tg2):
     assert res.exit_code == 1 and "not paired" in res.output
 
 
-def test_export_all_bots_then_import_on_another_machine(tg2, monkeypatch, tmp_path):
-    a = _setup_two(tg2)
-    out = runner.invoke(app, ["connect", "--export"])
-    exported = out.stdout.strip().splitlines()[0]
-    assert exported.startswith("qurtg2:") and "tokens" in out.output
-    monkeypatch.setenv("QUEUER_NOTIFY_PATH", str(tmp_path / "other" / "notify.json"))
-    tg2.sent.clear()
-    res = runner.invoke(app, ["connect", "--import", exported, "--id", "second"])
-    assert res.exit_code == 0, res.output
-    b = notify.load()
-    assert b["qur_id"] == "second" and [x["token"] for x in b["bots"]] == [TG_TOKEN, TG_TOKEN2]
-    assert all(x["listen"] is False and x["chat_ids"] == [555] for x in b["bots"])  # send-only
-    assert {t for t, _c, _m in tg2.sent} == {TG_TOKEN, TG_TOKEN2}  # hello through each
-    assert a["qur_id"] != b["qur_id"]
-
-
-def test_export_one_bot_uses_the_old_single_bot_format(tg2):
-    _setup_two(tg2)
-    out = runner.invoke(app, ["connect", "--export", "--bot", "second_bot"])
-    s = out.stdout.strip().splitlines()[0]
-    assert s.startswith("qurtg1:") and notify.parse_export_bots(s) == [(TG_TOKEN2, [555])]
-
-
-def test_export_skips_a_bot_with_no_chats_and_fails_if_none_has_any(tg2):
-    _setup_two(tg2)
-    runner.invoke(app, ["connect", "--remove-chat", "555", "--bot", "first_bot"])
-    s = runner.invoke(app, ["connect", "--export"]).stdout.strip().splitlines()[0]
-    assert notify.parse_export_bots(s) == [(TG_TOKEN2, [555])]
-    res = runner.invoke(app, ["connect", "--export", "--bot", "first_bot"])
-    assert res.exit_code == 1 and "nothing to export" in res.output
-
-
-def test_import_adds_new_bots_send_only_and_keeps_existing_bot_settings(tg2):
-    runner.invoke(app, ["connect", "--id", "mine"], input=TG_TOKEN + "\n")  # owns bot 1, listening
-    s = notify.export_string({"bots": [{"token": TG_TOKEN, "chat_ids": [555, 999]}, {"token": TG_TOKEN2, "chat_ids": [4]}]})
-    res = runner.invoke(app, ["connect", "--import", s])
-    assert res.exit_code == 0, res.output
-    cfg = notify.load()
-    assert cfg["qur_id"] == "mine"
-    one, two = _bot(cfg, TG_TOKEN), _bot(cfg, TG_TOKEN2)
-    assert notify.listening(one) and one["chat_ids"] == [555, 999]  # kept its button, gained a chat
-    assert two["listen"] is False and two["chat_ids"] == [4] and two["username"] == "second_bot"
-    res = runner.invoke(app, ["connect", "--import", s, "--listen"])
-    assert res.exit_code == 0 and all(notify.listening(b) for b in notify.load()["bots"])
-
-
-def test_import_with_one_rejected_token_saves_nothing(tg2):
-    s = notify.export_string({"bots": [{"token": TG_TOKEN, "chat_ids": [1]}, {"token": "111111111:AAH-unknown", "chat_ids": [2]}]})
-    res = runner.invoke(app, ["connect", "--import", s])
-    assert res.exit_code == 1 and "rejected" in res.output and notify.load() is None
-
-
-def test_from_ssh_imports_every_bot(tg2, monkeypatch):
-    s = notify.export_string({"bots": [{"token": TG_TOKEN, "chat_ids": [555]}, {"token": TG_TOKEN2, "chat_ids": [555]}]})
-    _fake_ssh(monkeypatch, stdout=f"noise\n{s}\n")
-    res = runner.invoke(app, ["connect", "--from", "sampk@laptop", "--id", "desktop"])
-    assert res.exit_code == 0, res.output
-    cfg = notify.load()
-    assert cfg["qur_id"] == "desktop" and len(cfg["bots"]) == 2 and not any(b["listen"] for b in cfg["bots"])
-
-
 @pytest.mark.parametrize("flags", [
-    ["--bot", "x", "--import", "qurtg1:x"], ["--bot", "x", "--from", "h"], ["--bot", "x", "--list"],
-    ["--bot", "x", "--add-bot"], ["--bot", "x", "--id", "y"], ["--all"], ["--all", "--export"],
-    ["--remove-bot", "--all", "--bot", "x"], ["--add-bot", "--off"], ["--add-bot", "--list"], ["--add-bot", "--import", "qurtg1:x"],
+    ["--bot", "x", "--list"], ["--bot", "x", "--add-bot"], ["--bot", "x", "--id", "y"], ["--all"], ["--all", "--list"],
+    ["--remove-bot", "--all", "--bot", "x"], ["--add-bot", "--off"], ["--add-bot", "--list"],
 ])
 def test_bad_flag_combinations_are_rejected_before_anything_happens(tg2, flags):
     runner.invoke(app, ["connect"], input=TG_TOKEN + "\n")
@@ -1004,29 +839,6 @@ def test_old_single_bot_config_file_keeps_working(tg2, tmp_path):
     assert "bots" in json.loads(path.read_text())  # rewritten in the new layout
     assert runner.invoke(app, ["connect", "--add-bot"], input=TG_TOKEN2 + "\n").exit_code == 0
     assert len(notify.load()["bots"]) == 2
-
-
-def test_import_dash_reads_string_from_stdin_without_warning(tg, tmp_path, monkeypatch):
-    runner.invoke(app, ["connect"], input=TG_TOKEN + "\n")
-    a = _one()
-    exported = runner.invoke(app, ["connect", "--export"]).stdout.strip().splitlines()[0]
-    monkeypatch.setenv("QUEUER_NOTIFY_PATH", str(tmp_path / "other" / "notify.json"))
-    res = runner.invoke(app, ["connect", "--import", "-"], input=exported + "\n")
-    assert res.exit_code == 0, res.output
-    assert _one()["token"] == a["token"]
-    assert "visible in `ps`" not in res.output
-
-
-def test_import_dash_empty_stdin_fails(tg):
-    res = runner.invoke(app, ["connect", "--import", "-"], input="")
-    assert res.exit_code == 1 and "nothing on stdin" in res.output
-
-
-def test_import_on_argv_warns(tg):
-    runner.invoke(app, ["connect"], input=TG_TOKEN + "\n")
-    s = notify.export_string(_one())
-    res = runner.invoke(app, ["connect", "--import", s])
-    assert res.exit_code == 0 and "visible in `ps`" in res.output
 
 
 # ---------------------------------------------------------------------------
@@ -3249,100 +3061,3 @@ def test_clean_logs_refuses_negative_days(tmp_path, monkeypatch):
     res = CliRunner().invoke(app, ["clean-logs", "--days", "-1"])
     assert res.exit_code != 0 and "-1" in res.output
     assert not (tmp_path / "logs").exists()
-
-
-# ---------------------------------------------------------------------------
-# 5.todo S5: `qur connect --import/--from` asks before saving new chats
-# ---------------------------------------------------------------------------
-
-REAL_CONFIRM_IMPORT = cli_mod._confirm_import
-
-
-@pytest.fixture(autouse=True)
-def _answer_yes_to_the_import_question(monkeypatch):
-    """The older connect tests are about pairing, not the question: they get a silent yes.
-    Tests that want the real prompt request the `real_confirm` fixture."""
-    monkeypatch.setattr(cli_mod, "_confirm_import", lambda lines, yes: None)
-
-
-@pytest.fixture
-def real_confirm(monkeypatch):
-    monkeypatch.setattr(cli_mod, "_confirm_import", REAL_CONFIRM_IMPORT)
-
-
-def test_import_destinations_lists_only_chats_not_already_set_up():
-    existing = {"qur_id": "box", "bots": [{"token": "1:aaa", "chat_ids": [5], "listen": False}]}
-    items = [("1:aaa", [5, 6]), ("2:bbb", [7])]
-    lines = cli_mod._import_destinations(items, {"1:aaa": "old_bot", "2:bbb": None}, existing)
-    assert lines == ["@old_bot (1): chat 6", "2: chat 7"]
-    assert cli_mod._import_destinations([("1:aaa", [5])], {}, existing) == []  # nothing new here
-    assert cli_mod._import_destinations([("1:aaa", [5])], {}, None) == ["1: chat 5"]
-
-
-def test_import_destinations_never_show_the_token_secret():
-    lines = cli_mod._import_destinations([("123456:SECRETHALF", [1])], {"123456:SECRETHALF": "b"}, None)
-    assert "SECRETHALF" not in "".join(lines)
-
-
-def test_confirm_import_asks_and_a_no_saves_nothing(real_confirm, monkeypatch, capsys):
-    monkeypatch.setattr(cli_mod, "_stdin_is_tty", lambda: True)
-    monkeypatch.setattr(cli_mod.typer, "confirm", lambda *a, **k: False)
-    with pytest.raises(cli_mod.typer.Exit):
-        cli_mod._confirm_import(["@b (1): chat 5"], yes=False)
-    err = capsys.readouterr().err
-    assert "send job messages" in err and "@b (1): chat 5" in err and "nothing was saved" in err
-
-
-def test_confirm_import_yes_flag_nothing_new_and_a_yes_answer_pass(real_confirm, monkeypatch, capsys):
-    monkeypatch.setattr(cli_mod, "_stdin_is_tty", lambda: False)
-    cli_mod._confirm_import(["@b (1): chat 5"], yes=True)  # --yes: no question, no terminal needed
-    cli_mod._confirm_import([], yes=False)  # nothing new: no question
-    assert capsys.readouterr().err == ""
-    monkeypatch.setattr(cli_mod, "_stdin_is_tty", lambda: True)
-    monkeypatch.setattr(cli_mod.typer, "confirm", lambda *a, **k: True)
-    cli_mod._confirm_import(["@b (1): chat 5"], yes=False)
-
-
-def test_confirm_import_without_a_terminal_needs_yes(real_confirm, monkeypatch, capsys):
-    monkeypatch.setattr(cli_mod, "_stdin_is_tty", lambda: False)
-    monkeypatch.setattr(cli_mod.typer, "confirm", lambda *a, **k: pytest.fail("must not prompt without a terminal"))
-    with pytest.raises(cli_mod.typer.Exit):
-        cli_mod._confirm_import(["@b (1): chat 5"], yes=False)
-    assert "--yes" in capsys.readouterr().err
-
-
-def _exported_string(tg) -> str:
-    runner.invoke(app, ["connect"], input=TG_TOKEN + "\n")
-    return runner.invoke(app, ["connect", "--export"]).stdout.strip().splitlines()[0]
-
-
-def test_connect_import_declined_saves_nothing_and_yes_saves(tg, real_confirm, tmp_path, monkeypatch):
-    exported = _exported_string(tg)
-    monkeypatch.setenv("QUEUER_NOTIFY_PATH", str(tmp_path / "other" / "notify.json"))  # "second machine"
-    monkeypatch.setattr(cli_mod, "_stdin_is_tty", lambda: True)
-    res = runner.invoke(app, ["connect", "--import", exported], input="n\n")
-    assert res.exit_code == 1 and "qur_test_bot" in res.output and "chat 555" in res.output
-    assert "nothing was saved" in res.output
-    assert notify.load() is None  # declined: nothing was written
-    res = runner.invoke(app, ["connect", "--import", exported], input="y\n")
-    assert res.exit_code == 0, res.output
-    assert _one()["chat_ids"] == [555]
-
-
-def test_connect_import_with_yes_needs_no_terminal_and_stdin_import_needs_yes(tg, real_confirm, tmp_path, monkeypatch):
-    exported = _exported_string(tg)
-    monkeypatch.setenv("QUEUER_NOTIFY_PATH", str(tmp_path / "other" / "notify.json"))
-    monkeypatch.setattr(cli_mod, "_stdin_is_tty", lambda: False)
-    res = runner.invoke(app, ["connect", "--import", "-"], input=exported + "\n")
-    assert res.exit_code == 1 and "--yes" in res.output
-    assert notify.load() is None
-    res = runner.invoke(app, ["connect", "--import", "-", "--yes"], input=exported + "\n")
-    assert res.exit_code == 0, res.output
-    assert _one()["chat_ids"] == [555]
-
-
-def test_connect_import_of_chats_already_set_up_asks_nothing(tg, real_confirm, monkeypatch):
-    exported = _exported_string(tg)
-    monkeypatch.setattr(cli_mod, "_stdin_is_tty", lambda: False)  # a question would fail here
-    res = runner.invoke(app, ["connect", "--import", exported])
-    assert res.exit_code == 0, res.output

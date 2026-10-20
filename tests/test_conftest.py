@@ -12,7 +12,7 @@ from pathlib import Path
 
 CONFTEST = Path(__file__).with_name("conftest.py")
 
-ISOLATED = ["QUEUER_DB_PATH", "QUEUER_LOG_DIR", "QUEUER_NOTIFY_PATH", "QUEUER_SOCKET_PATH"]
+ISOLATED = ["QUEUER_DB_PATH", "QUEUER_HOSTS_PATH", "QUEUER_LOG_DIR", "QUEUER_NOTIFY_PATH", "QUEUER_SOCKET_PATH"]
 
 INNER_TEST = """
 import os

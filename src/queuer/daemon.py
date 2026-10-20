@@ -35,7 +35,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NoReturn
 
-from queuer import db, jobenv, logclean, notify
+from queuer import db, hostcfg, jobenv, logclean, notify, remote, remote_notify
 from queuer.pathresolve import resolve_command
 from queuer.paths import (
     DEFAULT_GRACE_SECS,
@@ -44,6 +44,7 @@ from queuer.paths import (
     _default_socket_path,
     _fallback_socket_dir,
 )
+from queuer.remote_watch import RemoteWatcher
 
 MAX_LOG_BYTES = 50 * 1024 * 1024  # 50MB per-job log cap
 LISTEN_IDLE_SECS = 5  # recheck config when Telegram listening is off
@@ -175,6 +176,15 @@ def _read_proc_usage(pid: int) -> tuple[int | None, float, float] | None:
     except OSError:
         pass
     return rss_kb, user_secs, sys_secs
+
+
+def _env_int(name: str, default: int) -> int:
+    """A positive integer from the environment, else `default`."""
+    try:
+        value = int(os.environ.get(name, ""))
+    except ValueError:
+        return default
+    return value if value > 0 else default
 
 
 def _default_log_clean_secs() -> float:
@@ -956,6 +966,11 @@ class Daemon:
             return
         db.set_paused(self.conn, True, job["channel"])
         failed_job: dict[str, Any] = job
+        if job.get("submitted_from"):
+            self._record_event(job, "paused", False)
+            return
+        cfg = notify.load(self.notify_path)  # same rule as final events: sent only when a chat can receive it
+        self._record_event(job, "paused", cfg is not None and any(b["chat_ids"] for b in notify.bot_cfgs(cfg)))
         self._notify_text(lambda bcfg: notify.format_paused(failed_job, bcfg))
 
     def _settle_dependants(self, job_id: int) -> None:
@@ -987,11 +1002,15 @@ class Daemon:
         connect`). Config is re-read each time, so connecting needs no daemon
         restart."""
         assert self.conn is not None
-        cfg = notify.load(self.notify_path)
-        if cfg is None:
-            return
         job = db.get_job(self.conn, job_id)
         if job is None:
+            return
+        # a job sent by a host is announced by the host (remote plan, decision 11), never here
+        wants_telegram = not job.get("submitted_from")
+        cfg = notify.load(self.notify_path) if wants_telegram else None
+        telegram_sent = cfg is not None and any(b["chat_ids"] for b in notify.bot_cfgs(cfg))
+        self._record_event(job, "final", telegram_sent)
+        if cfg is None:
             return
         try:
             loop = asyncio.get_running_loop()
@@ -1005,6 +1024,31 @@ class Daemon:
             task = loop.create_task(self._send_notification(bcfg, notify.format_job(job, bcfg), markup))
             self._notify_tasks.add(task)
             task.add_done_callback(self._notify_tasks.discard)
+
+    def _record_event(self, job: dict[str, Any], kind: str, telegram_sent: bool) -> None:
+        """Append an `events` row (the feed a host polls) whatever the Telegram setup is.
+        The payload is the job row as `qur show --json` prints it, plus `telegram_sent`.
+        Never raises: the feed must not break the queue."""
+        assert self.conn is not None
+        try:
+            payload = {**self._with_deps(job), "telegram_sent": telegram_sent, "root_id": self._root_id(job)}
+            payload["env_extra"] = jobenv.mask_env_extra(payload.get("env_extra"))  # names only: values never leave
+            db.add_event(self.conn, job["id"], kind, payload)
+        except Exception as e:
+            print(f"[queuerd] could not record event for job {job.get('id')}: {type(e).__name__}: {e}", file=sys.stderr)
+
+    def _root_id(self, job: dict[str, Any]) -> int:
+        """Id of the first attempt of a retry chain (the job itself when it is not an auto-retry); a host
+        that recorded the first attempt's id (`qur run --pull --retries N`) matches the last one through it."""
+        assert self.conn is not None
+        cur, seen = job, {job["id"]}
+        while cur.get("origin") == "retry" and cur.get("parent_id") is not None and cur["parent_id"] not in seen:
+            parent = db.get_job(self.conn, cur["parent_id"])
+            if parent is None:
+                break
+            seen.add(parent["id"])
+            cur = parent
+        return int(cur["id"])
 
     def _notify_text(self, make_text: Callable[[dict[str, Any]], str]) -> None:
         """Fire-and-forget plain Telegram message through every connected bot
@@ -1061,15 +1105,35 @@ class Daemon:
             conn.close()
         return logclean.delete(files)
 
+    def _prune_events_once(self) -> int:
+        """Retention of the remote-worker event feed (QUEUER_EVENTS_KEEP, QUEUER_EVENTS_MAX_AGE_DAYS),
+        with its own DB connection so it can run in a thread."""
+        conn = db.connect(self.db_path)
+        try:
+            age = _env_int("QUEUER_EVENTS_MAX_AGE_DAYS", db.DEFAULT_EVENTS_MAX_AGE_DAYS)
+            n = db.prune_events(conn, _env_int("QUEUER_EVENTS_KEEP", db.DEFAULT_EVENTS_KEEP), age)
+            keep = _env_int("QUEUER_REMOTE_KEEP_DAYS", db.DEFAULT_REMOTE_KEEP_DAYS)
+            n += db.prune_remote(conn, keep)
+            return n + db.prune_run_files(conn, self.db_path.parent / "runs", keep)
+        finally:
+            conn.close()
+
     async def _log_cleaner(self) -> None:
-        """Timer for automatic log cleaning. Does nothing at all unless an age or size limit
-        is set. No error may escape: a failure is reported once and the timer carries on."""
-        if self.log_max_age_days is None and self.log_max_mb is None:
-            return
+        """Timer for automatic log cleaning (only when an age or size limit is set) and for
+        event-feed retention (always). No error may escape: a failure is reported once and
+        the timer carries on."""
         delay: float = LOG_CLEAN_FIRST_SECS
         while True:
             await asyncio.sleep(delay)
             delay = self.log_clean_secs
+            try:
+                await asyncio.to_thread(self._prune_events_once)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                notify.warn_once(f"event pruning failed: {type(e).__name__}: {e}")
+            if self.log_max_age_days is None and self.log_max_mb is None:
+                continue
             try:
                 count, freed = await asyncio.to_thread(self._clean_logs_once)
             except asyncio.CancelledError:
@@ -1215,10 +1279,22 @@ class Daemon:
             return
         action, qur_id, job_id = parsed
         reply = lambda text: asyncio.to_thread(notify.answer_callback, cfg, cq["id"], text)  # noqa: E731
-        if qur_id != cfg["qur_id"]:
-            await reply("this message came from another machine or an old id")
-            return
         to_chat = {**cfg, "chat_ids": [chat_id]}
+        if action not in ("ps", "pl") and qur_id != cfg["qur_id"]:
+            if action in ("rq", "rl", "cn"):
+                # chat-level pairing is not enough on a shared group: a worker action needs the PRESSING user to be
+                # a paired user (their id is a chat id in a private chat) or listed in the bot's `user_ids`
+                uid = (cq.get("from") or {}).get("id")
+                if uid not in cfg["chat_ids"] and uid not in cfg.get("user_ids", []):
+                    await reply("not allowed: add your Telegram user id to user_ids in notify.json")
+                    return
+            if not remote_notify.epoch_ok(self, qur_id, notify.callback_epoch(cq.get("data"))):
+                await reply("that button is from before the worker's database was reset; use the Status/List keys")
+                return
+        if action in ("ps", "pl") or qur_id != cfg["qur_id"]:  # machine picker, or a button of a worker (phase 5)
+            if not await remote_notify.handle_callback(self, cfg, to_chat, cq, msg, action, qur_id, job_id, reply):
+                await reply("this message came from another machine or an old id")
+            return
 
         if action == "lc":  # job_id slot carries the channel here
             data = await self._cmd_list({})
@@ -1302,6 +1378,8 @@ class Daemon:
         if action == "menu":
             await asyncio.to_thread(notify.send, to_chat, notify.hello_text(cfg), notify.menu_markup())
             return
+        if action in ("status", "list") and await remote_notify.menu(self, cfg, to_chat, action, notify.menu_machine(text)):
+            return  # workers are configured (or one was named): picker / worker views (phase 5)
         if action == "status":
             data = await self._cmd_status({})
             await asyncio.to_thread(notify.send, to_chat, notify.format_status(data, cfg), None, "HTML")
@@ -1556,6 +1634,19 @@ class Daemon:
         except sqlite3.Error as e:  # H2: locked / full / corrupt database: a clean reply, not a traceback
             return {"ok": False, "error": f"database error: {e}"}
 
+    async def _cmd_remote_check(self, args: dict[str, Any]) -> dict[str, Any]:
+        """`qur hosts check --from-daemon`: prove the DAEMON (not the user's shell) can ssh to a worker
+        with its own login (no agent, no terminal)."""
+        name = args.get("host")
+        host = hostcfg.get(name) if isinstance(name, str) and hostcfg.NAME_RE.match(name) else None
+        if host is None:
+            raise ValueError(f"unknown host: {name}")
+        try:
+            info = await asyncio.to_thread(remote.ssh_json, host, ["remote", "info", "--json"], timeout=30)
+        except remote.RemoteTransportError as e:
+            return {"ok": False, "detail": str(e)}
+        return {"ok": True, "detail": f"the daemon reached {info.get('machine_id')} ({info.get('hostname')}) with its own ssh login"}
+
     async def _cmd_add(self, args: dict[str, Any]) -> dict[str, Any]:
         """Queue one job, or -- with `jobs` (a list of {argv, raw_argv, index}, from
         `--each`; `raw_argv` may be left out when it equals `argv`) -- one independent job
@@ -1631,6 +1722,23 @@ class Daemon:
         on_error_cmd = db.check_hook(args.get("on_error"), "on-error command")
         stop_signal = db.check_stop_signal(args.get("stop_signal"), "stop signal")
         stop_grace_secs = db.check_stop_grace(args.get("stop_grace"), "stop grace")
+        run_key = db.check_run_key(args.get("run_key"))
+        job_dir = db.check_job_dir(args.get("job_dir"))
+        submitted_from = db.check_label(args.get("submitted_from"), "submitted-from label")
+        rerun_of = args.get("rerun_of")
+        if rerun_of is not None:
+            if type(rerun_of) is not int:
+                raise ValueError("rerun_of must be a job id")
+            assert self.conn is not None
+            if db.get_job(self.conn, rerun_of) is None:
+                raise ValueError(f"job {rerun_of} does not exist")
+        if run_key is not None:
+            if len(specs) != 1:
+                raise ValueError("--run-key cannot be combined with --each/--array")
+            assert self.conn is not None
+            existing = db.find_by_run_key(self.conn, run_key)
+            if existing is not None:
+                return {"id": existing["id"], "ids": [existing["id"]], "channel": existing["channel"], "existing": True}
         deps = self._dep_args(args)
         if now and deps:
             raise ValueError("--now cannot be combined with --depends-on/--after-any")
@@ -1732,6 +1840,11 @@ class Daemon:
                 on_error_cmd=on_error_cmd,
                 stop_signal=stop_signal,
                 stop_grace_secs=stop_grace_secs,
+                run_key=run_key,
+                job_dir=job_dir,
+                submitted_from=submitted_from,
+                parent_id=rerun_of,
+                origin="rerun" if rerun_of is not None else None,
                 commit=False,
                 # one deadlock search per sweep: a cycle through any job of the chain also
                 # passes through the last one (5.todo item 10)
@@ -1999,7 +2112,10 @@ class Daemon:
         job = db.get_job(self.conn, args["id"])
         if job is None:
             raise ValueError(f"job {args['id']} does not exist")
-        return self._with_deps(job)
+        info = self._with_deps(job)
+        if job.get("job_dir"):
+            info["same_dir_jobs"] = db.jobs_sharing_dir(self.conn, job["id"], job["job_dir"])
+        return info
 
     async def _cmd_states(self, args: dict[str, Any]) -> dict[str, Any]:
         """Batch state lookup for `qur wait JOBS`: `ids` (at most MAX_SWEEP job ids) in, and out
@@ -2443,6 +2559,7 @@ class Daemon:
         async with server:
             listener = asyncio.create_task(self._telegram_listener())
             cleaner = asyncio.create_task(self._log_cleaner())
+            watcher = asyncio.create_task(RemoteWatcher(self).run())  # phase 4: poll workers listed in hosts.json
             serving = asyncio.create_task(server.serve_forever())
             stop_wait = asyncio.ensure_future(self._stopping.wait())
             ended_wait = asyncio.ensure_future(self._worker_ended.wait())  # H2: also covers workers made after startup
@@ -2469,6 +2586,7 @@ class Daemon:
                     serving.cancel()
                     listener.cancel()
                     cleaner.cancel()
+                    watcher.cancel()
                 # a stop request, or a worker/server that ended: either way the daemon is going
                 # down, so running jobs are recorded as interrupted before the process exits
                 await self._shutdown(server)

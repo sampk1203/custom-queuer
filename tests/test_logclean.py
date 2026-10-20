@@ -333,7 +333,11 @@ async def test_timer_does_nothing_without_limits(tmp_path, monkeypatch):
     monkeypatch.setattr("queuer.daemon.LOG_CLEAN_FIRST_SECS", 0.01)
     d = _daemon(tmp_path, log_clean_secs=0.01)
     old = _add_finished(d, 500)
-    await asyncio.wait_for(d._log_cleaner(), timeout=2)  # returns at once: nothing configured
+    task = asyncio.create_task(d._log_cleaner())  # keeps looping now (event pruning), but cleans no logs
+    try:
+        await asyncio.sleep(0.2)
+    finally:
+        await _stop(task)
     assert (d.log_dir / f"{old}.log").exists()
 
 

@@ -134,6 +134,26 @@ def job_environment(env_extra: Mapping[str, str]) -> dict[str, str]:
     return env
 
 
+def mask_env_extra(env_extra: Any) -> Any:
+    """`env_extra` (JSON text or a dict) with every value replaced by `***`, names kept: what leaves the
+    machine in an event payload or a stored snapshot (an explicit `--env KEY=SECRET` must not travel).
+    The passthrough key only lists names, so it stays. Anything that is not a dict comes back unchanged."""
+    if not env_extra:
+        return env_extra
+    as_text = isinstance(env_extra, str)
+    if as_text:
+        try:
+            env = json.loads(env_extra)
+        except ValueError:
+            return None  # unparseable text could hold anything: drop it
+    else:
+        env = env_extra
+    if not isinstance(env, dict):
+        return env_extra
+    masked = {str(k): (v if k == PASSTHROUGH_KEY else "***") for k, v in env.items()}
+    return json.dumps(masked) if as_text else masked
+
+
 def describe(env_extra: str | Mapping[str, str] | None) -> list[str]:
     """Display lines for `qur show` and Telegram Details: `NAME` for variables copied
     automatically (and queuer's own PATH/VIRTUAL_ENV/PYTHONPATH), `NAME=***` when the name

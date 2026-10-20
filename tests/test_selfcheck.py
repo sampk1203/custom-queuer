@@ -968,3 +968,31 @@ def test_fix_changes_permissions_only(tmp_path, monkeypatch):
     assert all(p.name.endswith(("-wal", "-shm")) for p in after - set(before))
     assert _mode(path) == 0o600 and _mode(selfcheck._default_db_path()) == 0o600
     assert any(c.fixed for c in checks)
+
+
+def test_check_hosts_reports_every_step_and_the_daemon_login(monkeypatch):
+    from queuer import hostcfg, remote_cli
+
+    monkeypatch.setattr(hostcfg, "load", lambda path=None: {"version": 1, "hosts": {
+        "vm3": {"enabled": True}, "off": {"enabled": False}}})
+    seen = []
+    monkeypatch.setattr(remote_cli, "check_host", lambda n, h, expect=(): seen.append(n) or [
+        {"step": "ssh reachable", "ok": True, "detail": "login ok"},
+        {"step": "linger enabled", "ok": False, "detail": "no"},
+    ])
+    monkeypatch.setattr(client, "send", lambda cmd, **kw: {"ok": False, "detail": "Permission denied"})
+    checks = _by_name(selfcheck.check_hosts())
+    assert seen == ["vm3"]  # disabled workers are skipped
+    assert checks["host vm3: ssh reachable"].status == OK
+    assert checks["host vm3: linger enabled"].status == WARN
+    assert checks["host vm3: daemon ssh"].status == FAIL
+
+
+def test_check_hosts_unreachable_is_fail_and_skips_the_daemon(monkeypatch):
+    from queuer import hostcfg, remote_cli
+
+    monkeypatch.setattr(hostcfg, "load", lambda path=None: {"version": 1, "hosts": {"vm3": {"enabled": True}}})
+    monkeypatch.setattr(remote_cli, "check_host", lambda n, h, expect=(): [{"step": "ssh reachable", "ok": False, "detail": "timed out"}])
+    monkeypatch.setattr(client, "send", lambda *a, **k: pytest.fail("daemon must not be asked"))
+    checks = selfcheck.check_hosts()
+    assert [(c.name, c.status) for c in checks] == [("host vm3: ssh reachable", FAIL)]

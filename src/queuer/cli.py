@@ -11,7 +11,7 @@ import shlex
 import shutil
 import socket
 import stat
-import subprocess  # nosec B404 - only used for the fixed `ssh --` call below
+import subprocess  # nosec B404 - fixed argv only: the user's editor and systemctl/journalctl
 import sys
 import tempfile
 import time
@@ -38,8 +38,14 @@ from queuer.paths import (
     _default_db_path,
     _default_log_dir,
 )
+from queuer.remote_cli import RemoteGroup, hosts_app
+from queuer.remote_pull import pull_cmd
+from queuer.remote_rerun import RERUN_CONTEXT, RerunCommand, rerun_cmd
+from queuer.remote_run import RUN_CONTEXT, RunCommand, run_cmd
+from queuer.remote_worker import remote_app
 
 app = typer.Typer(
+    cls=RemoteGroup,  # `-H HOST` / `HOST:ID` forwarding (remote_cli.py)
     help="""Background job queue. Jobs on one channel run one at a time, in order; \
 different channels run in parallel (default channel: 1). `qur` is a short alias for `queuer`.
 
@@ -337,6 +343,8 @@ def _fmt_origin(job: dict[str, Any]) -> str:
         return f"retry of #{parent} ({job['attempt']}/{job['max_retries']})"
     if origin == "requeue":
         return f"requeue of #{parent}"
+    if origin == "rerun":
+        return f"rerun of #{parent}"
     return "new"
 
 
@@ -635,6 +643,10 @@ def main(
         False, "--help-all", callback=_help_all, is_eager=True,
         help="Show the help for every command, one after another, and exit.",
     ),
+    host: Optional[str] = typer.Option(
+        None, "-H", "--host", metavar="HOST", envvar="QUR_HOST",
+        help="Run the command on this worker over ssh (see `qur hosts`). `qur show vm3:42` means `qur -H vm3 show 42`.",
+    ),
 ) -> None:
     pass
 
@@ -773,6 +785,23 @@ def add(
         "command, cwd, environment, channel and the queue position it would get (and whether it would be "
         "skipped at once). Errors are the same as for a real add. Works with every other option.",
     ),
+    as_json: bool = typer.Option(
+        False, "--json", help='Print {"ids": [...]} (or the dry-run data) as JSON instead of text.',
+    ),
+    run_key: Optional[str] = typer.Option(
+        None, "--run-key", hidden=True,
+        help="Idempotency key: when a job with this key exists, its id is returned instead of queueing a duplicate.",
+    ),
+    job_dir: Optional[str] = typer.Option(
+        None, "--job-dir", hidden=True, help="The folder this job runs in (shown by `qur show`).",
+    ),
+    submitted_from: Optional[str] = typer.Option(
+        None, "--submitted-from", hidden=True,
+        help="Label of the host that sent the job; this machine then sends no Telegram message for it.",
+    ),
+    rerun_of: Optional[int] = typer.Option(
+        None, "--rerun-of", hidden=True, help="Mark this job as a rerun of job ID.",
+    ),
     now: bool = typer.Option(
         False, "--now",
         help="Jump the channel's queue: freeze (SIGSTOP) the running job and run this first. "
@@ -898,7 +927,20 @@ def add(
         stop_signal=stop_signal_name,
         stop_grace=stop_grace_secs,
         **({"dry_run": True} if dry_run else {}),
+        **({"run_key": run_key} if run_key else {}),
+        **({"job_dir": job_dir} if job_dir else {}),
+        **({"submitted_from": submitted_from} if submitted_from else {}),
+        **({"rerun_of": rerun_of} if rerun_of is not None else {}),
     )
+    if as_json:
+        if dry_run:
+            _print_json(data)
+        else:
+            out: dict[str, Any] = {"ids": data.get("ids") or [data["id"]]}
+            if data.get("existing"):
+                out["existing"] = True
+            _print_json(out)
+        return
     if dry_run:
         _render_dry_run(data, timeout)
     elif sweep is None:
@@ -1319,6 +1361,12 @@ def _render_job(job: dict[str, Any]) -> None:
     table.add_row("exit code", str(job["exit_code"]) if job["exit_code"] is not None else "-")
     table.add_row("timeout", f"{job['timeout_secs']}s" if job["timeout_secs"] else "none")
     table.add_row("origin", _fmt_origin(job))
+    if job.get("job_dir"):
+        table.add_row("job folder", escape(job["job_dir"]))
+    if job.get("submitted_from"):
+        table.add_row("submitted from", escape(job["submitted_from"]))
+    if job.get("same_dir_jobs"):
+        table.add_row("same folder as", _fmt_ids(job["same_dir_jobs"]))
     if job.get("max_rss_kb") is not None:
         table.add_row("peak RSS", _fmt_mem_kb(job["max_rss_kb"]))
     if job.get("cpu_user_secs") is not None or job.get("cpu_sys_secs") is not None:
@@ -2093,33 +2141,10 @@ def _warn_hello(bot_cfg: dict[str, Any]) -> None:
         typer.echo(f"Warning: could not send the test message ({err})", err=True)
 
 
-def _fetch_export_over_ssh(target: str) -> str:
-    """Run `qur connect --export` on `target` over ssh and return its string.
-    ssh's own prompts (password, host key) show on the terminal as usual."""
-    if not target or target.startswith("-"):
-        _fail("--from takes [user@]host")
-    # ~/.local/bin is where `uv tool` puts qur, but a non-interactive ssh
-    # shell often lacks it on PATH
-    remote = 'PATH="$HOME/.local/bin:$PATH" qur connect --export'
-    typer.echo(f"Asking {target} over ssh...", err=True)
-    try:
-        res = subprocess.run(["ssh", "--", target, remote], stdout=subprocess.PIPE, text=True, timeout=120)  # nosec B603 B607 - fixed argv, `--` guards target
-    except FileNotFoundError:
-        _fail("ssh is not installed on this machine")
-    except subprocess.TimeoutExpired:
-        _fail(f"timed out talking to {target}")
-    if res.returncode != 0:
-        _fail(f"ssh to {target} failed (exit {res.returncode}); is qur set up there? (`qur connect` on that machine first)")
-    for line in res.stdout.splitlines():
-        if line.strip().startswith((notify.EXPORT_PREFIX, notify.EXPORT_PREFIX_MULTI)):
-            return line.strip()
-    _fail(f"{target} did not return a setup string; is qur connected there?")
-
-
 def _button_state(bot: dict[str, Any], long: bool = True) -> str:
     if notify.listening(bot):
         return "on"
-    return "off (another machine should handle it)" if long else "off"
+    return "off (this machine does not handle presses)" if long else "off"
 
 
 def _connected_line(cfg: dict[str, Any], prefix: str) -> str:
@@ -2136,39 +2161,6 @@ def _connected_line(cfg: dict[str, Any], prefix: str) -> str:
 
 def _bot_ids_hint(cfg: dict[str, Any]) -> str:
     return ", ".join(notify.bot_label(b) for b in cfg["bots"])
-
-
-def _import_destinations(items: list[tuple[str, list[int]]], names: dict[str, str | None], existing: dict[str, Any] | None) -> list[str]:
-    """S5: one display line per bot of an import string that names chats this machine does not
-    send to yet (`@name (bot id): chat 1, chat 2`). Empty when everything is already set up here."""
-    have: dict[str, set[int]] = {b["token"]: set(b["chat_ids"]) for b in existing["bots"]} if existing else {}
-    lines: list[str] = []
-    for token, chat_ids in items:
-        new = [c for c in chat_ids if c not in have.get(token, set())]
-        if not new:
-            continue
-        label = notify.bot_label({"token": token, "username": names.get(token)})
-        lines.append(f"{label}: " + ", ".join(f"chat {c}" for c in new))
-    return lines
-
-
-def _stdin_is_tty() -> bool:
-    return sys.stdin.isatty()
-
-
-def _confirm_import(lines: list[str], yes: bool) -> None:
-    """S5: a pasted or ssh-fetched --export string decides where this machine's job data (commands,
-    paths, log tails) goes, so show the bot and the chats and ask before saving. `--yes` skips the
-    question; without a terminal (`--import -` uses stdin) there is nobody to ask, so that needs --yes."""
-    if not lines or yes:
-        return
-    typer.echo("This will make this machine send job messages (commands, paths, log tails) to:", err=True)
-    for line in lines:
-        typer.echo(f"  {line}", err=True)
-    if not _stdin_is_tty():
-        _fail("cannot ask for confirmation without a terminal; check the chats above and run again with --yes")
-    if not typer.confirm("Send job messages to these chats?", default=False):
-        _fail("cancelled: nothing was saved")
 
 
 def _bots_for(cfg: dict[str, Any] | None, ref: str | None) -> list[dict[str, Any]]:
@@ -2196,18 +2188,14 @@ def _bot_username(token: str, required: bool) -> str | None:
 
 @app.command()
 def connect(
-    export: bool = typer.Option(False, "--export", help="Print a string that sets up other machines (contains the bot tokens). With --bot, only that bot"),
-    import_: Optional[str] = typer.Option(None, "--import", help="Set this machine up from another machine's --export string (adds its bots to this machine's). Use `--import -` to read the string from stdin so the token stays out of ps and shell history"),
-    from_: Optional[str] = typer.Option(None, "--from", metavar="[USER@]HOST", help="Set this machine up over ssh from a machine that is already set up (no string to copy)"),
     off: bool = typer.Option(False, "--off", "--remove-bot", help="Remove a bot from this machine (--bot ID), or everything if it has only one or you pass --all"),
     list_: bool = typer.Option(False, "--list", help="Show this machine's setup: id, host, every bot with its paired chats and Requeue button on/off"),
     remove_chat: Optional[int] = typer.Option(None, "--remove-chat", metavar="CHAT_ID", help="Stop sending to one paired chat/phone (ids are shown by --list), on every bot or just --bot. Keeps the bot tokens"),
     id_: Optional[str] = typer.Option(None, "--id", help="Set this machine's id shown in messages (1-16 letters, digits, - or _)"),
-    listen: Optional[bool] = typer.Option(None, "--listen/--no-listen", help="Whether this machine handles the Requeue/Details buttons for a bot (all its bots unless --bot; only one machine per bot should; --import turns it off for new bots)"),
+    listen: Optional[bool] = typer.Option(None, "--listen/--no-listen", help="Whether this machine handles the Requeue/Details buttons for a bot (all its bots unless --bot; Telegram allows only one listener per bot)"),
     add_bot: bool = typer.Option(False, "--add-bot", help="Connect one more bot to this machine: asks for its token, then pairs a phone (QR) as usual"),
     bot: Optional[str] = typer.Option(None, "--bot", metavar="BOT", help="Which connected bot a command applies to: its id or @username (shown by --list)"),
     all_: bool = typer.Option(False, "--all", help="With --remove-bot: remove every bot, i.e. forget the whole setup"),
-    yes: bool = typer.Option(False, "--yes", "-y", help="With --import/--from: do not ask before sending job messages to the chats the string names (needed when there is no terminal, e.g. `--import -`)"),
 ) -> None:
     """Get a Telegram message when a job finishes, on any machine running qur.
 
@@ -2226,46 +2214,30 @@ def connect(
 
     One qur can use several bots at once: every message goes through every bot
     it is connected to, and presses on any of them come back to it. Telegram
-    lets only one program listen to a bot at a time, so give each machine its
-    own bot if you want its buttons to always reach it (`--add-bot` on that
-    machine), and use --import/--from on the others only to send through it.
-    Machines set up with --import send through the bot but show no buttons
-    (unless you pass --listen). --import and --from first show the bot and the
-    chats the string names that this machine does not send to yet, and ask
-    [y/N] before saving, because that string decides where your job data goes;
-    --yes skips the question (and is needed for `--import -`, which has no terminal to ask on).
+    lets only one program listen to a bot at a time, so each machine needs its
+    own bot (`qur connect` on that machine). The bot token is never copied
+    between machines by qur.
 
     Manage this machine: --list shows its id, host, bots and paired chat ids
     (other machines are not listed; run it on each). --id renames it.
     --remove-chat CHAT_ID stops one phone/account; --remove-bot (same as --off)
     removes a bot (--bot picks which; with one bot it removes the whole setup).
-    With several bots, --bot picks the one for --remove-bot, --export, --listen
+    With several bots, --bot picks the one for --remove-bot, --listen
     and for pairing another phone. The other management options cannot be
     combined with each other.
 
     One-time setup, once per bot: in Telegram open @BotFather, send /newbot,
     copy the token.
 
-    First machine: run `qur connect`, paste the token, scan the QR with your
+    Setup: run `qur connect` on the machine, paste the token, scan the QR with your
     phone, press Start. Running it again adds another phone or account (with
     several bots, say which: `qur connect --bot @my_bot`). A second bot on the
     same machine: `qur connect --add-bot`.
-
-    Other machines, easiest: `qur connect --from user@first-machine`. It logs in
-    over ssh, runs `qur connect --export` there and imports the result (all its
-    bots), so there is nothing to copy. Without ssh: run `qur connect --export`
-    on the first one, then `qur connect --import <string>` on each other one. No
-    scan needed. (Pair one machine at a time; sending from many machines at once
-    is fine.)
 
     \b
     Examples:
       qur connect
       qur connect --add-bot
-      qur connect --export
-      qur connect --from sampk@laptop
-      qur connect --import qurtg1:eyJ0Ijoi...
-      qur connect --import - --yes   (string read from stdin; no terminal to ask on)
       qur connect --id bigbox
       qur connect --list
       qur connect --bot @laptop_bot --no-listen
@@ -2273,34 +2245,24 @@ def connect(
       qur connect --remove-bot --bot @old_bot
       qur connect --remove-bot --all
     """
-    actions = [export, import_ is not None, from_ is not None, off, list_, remove_chat is not None, add_bot]
+    actions = [off, list_, remove_chat is not None, add_bot]
     if sum(actions) > 1:
-        _fail("use only one of --export, --import, --from, --off/--remove-bot, --list, --remove-chat, --add-bot")
-    if (export or off or list_ or remove_chat is not None) and (id_ is not None or listen is not None):
-        _fail("--id and --listen cannot be combined with --export, --off, --list or --remove-chat")
+        _fail("use only one of --off/--remove-bot, --list, --remove-chat, --add-bot")
+    if (off or list_ or remove_chat is not None) and (id_ is not None or listen is not None):
+        _fail("--id and --listen cannot be combined with --off, --list or --remove-chat")
     if id_ is not None and not notify.valid_qur_id(id_):
         _fail("id must be 1-16 characters: letters, digits, - or _")
-    if bot is not None and (import_ is not None or from_ is not None or list_ or add_bot or id_ is not None):
-        _fail("--bot picks an already connected bot; it cannot be combined with --import, --from, --list, --add-bot or --id")
+    if bot is not None and (list_ or add_bot or id_ is not None):
+        _fail("--bot picks an already connected bot; it cannot be combined with --list, --add-bot or --id")
     if all_ and not off:
         _fail("--all only goes with --remove-bot")
     if all_ and bot is not None:
         _fail("use either --bot or --all, not both")
 
-    if from_ is not None:
-        import_ = _fetch_export_over_ssh(from_)
-    elif import_ == "-":
-        import_ = sys.stdin.read().strip()
-        if not import_:
-            _fail("--import -: nothing on stdin")
-    elif import_ is not None:
-        typer.echo("Warning: the string holds bot tokens and is now visible in `ps` and shell history. "
-                   "Prefer `--from [user@]host` or `qur connect --import -` (string on stdin).", err=True)
-
     existing = notify.load()
 
     # --id / --listen alone: change this machine's setup, no pairing
-    if import_ is None and not add_bot and existing is not None and (id_ is not None or listen is not None):
+    if not add_bot and existing is not None and (id_ is not None or listen is not None):
         cfg: dict[str, Any] = {"qur_id": id_ or existing["qur_id"], "bots": [dict(b) for b in existing["bots"]]}
         if listen is not None:
             listen_tokens = {b["token"] for b in _bots_for(existing, bot)}
@@ -2381,53 +2343,6 @@ def connect(
         console.print("Bot [yellow]removed[/yellow] from this machine"
                       + (" (all bots)" if len(existing["bots"]) > 1 else "") + ". "
                       "To invalidate the bot token everywhere, send /revoke to @BotFather.")
-        return
-
-    if export:
-        chosen = [b for b in _bots_for(existing, bot) if b["chat_ids"]] if existing else []
-        if existing is None or not chosen:
-            _fail("nothing to export -- run `qur connect` first")
-        typer.echo(notify.export_string(existing, chosen))
-        typer.echo(f"Contains the bot token{'s' if len(chosen) > 1 else ''} -- keep it secret. "
-                   "Run `qur connect --import <string>` on another machine.", err=True)
-        return
-
-    if import_ is not None:
-        try:
-            items = notify.parse_export_bots(import_)
-        except ValueError as e:
-            _fail(str(e))
-        names: dict[str, str | None] = {}
-        for token, _chats in items:
-            try:
-                names[token] = notify.check_token(token)
-            except notify.NotifyError as e:
-                _fail(f"bot token rejected by Telegram: {e}")
-        _confirm_import(_import_destinations(items, names, existing), yes)  # S5: before anything is saved
-        merged: dict[str, Any] | None = existing
-        imported: list[str] = []
-        for token, chat_ids in items:
-            old = next((b for b in merged["bots"] if b["token"] == token), None) if merged else None
-            if old is not None:
-                # already connected: keep its settings, add any chats we lack
-                entry = {**old, "chat_ids": old["chat_ids"] + [c for c in chat_ids if c not in old["chat_ids"]]}
-                if listen is not None:
-                    entry["listen"] = listen
-            else:
-                # a bot another machine already uses: only one machine per bot
-                # can poll for button presses, so this one starts send-only
-                entry = {"token": token, "chat_ids": chat_ids, "listen": bool(listen)}
-            if names.get(token):
-                entry["username"] = names[token]
-            merged = notify.with_bot(merged, entry, id_)
-            imported.append(token)
-        if merged is None:  # items is never empty, so with_bot ran at least once
-            _fail("nothing to import")
-        notify.save(merged)
-        for bcfg in notify.bot_cfgs(merged):
-            if bcfg["token"] in imported:
-                _warn_hello(bcfg)
-        console.print(_connected_line(merged, "Connected."))
         return
 
     # pair a phone/account with a bot
@@ -2677,6 +2592,7 @@ _DOCTOR_STYLES = {OK: "green", WARN: "yellow", FAIL: "bold red"}
 def doctor(
     fix: bool = typer.Option(False, "--fix", help="Repair permission problems only (loose modes on files/folders you own); nothing else is changed"),
     as_json: bool = typer.Option(False, "--json", help="Print the results as JSON"),
+    no_hosts: bool = typer.Option(False, "--no-hosts", hidden=True, help="Skip the per-worker checks (used when a host asks a worker)"),
 ) -> None:
     """Check that queuer is set up and locked down properly.
 
@@ -2684,8 +2600,9 @@ def doctor(
     (notify.json 0600, folders 0700, no symlinks), database mode, log folder writable
     and free disk space, systemd linger, unit file (and whether it still matches what
     install.sh writes) and service state, Telegram token
-    (one getMe call, only if configured; offline is a warning), and the database
-    schema version. Every problem comes with a fix hint.
+    (one getMe call, only if configured; offline is a warning), the database
+    schema version, and, for every enabled worker in hosts.json, ssh login, remote
+    qur, protocol, daemon, jobs dir, linger and whether the daemon itself can log in. Every problem comes with a fix hint.
 
     Exit code 1 if any check FAILs (warnings do not fail), so it works in scripts.
 
@@ -2697,7 +2614,7 @@ def doctor(
     """
     from queuer import selfcheck  # heavy (pulls in the daemon module): only loaded here
 
-    checks = selfcheck.run_checks(fix=fix)
+    checks = selfcheck.run_checks(fix=fix, hosts=False) if no_hosts else selfcheck.run_checks(fix=fix)
     code = selfcheck.exit_code(checks)
     counts = selfcheck.summary(checks)
     if as_json:
@@ -2722,6 +2639,11 @@ daemon_app = typer.Typer(
     no_args_is_help=True,
 )
 app.add_typer(daemon_app, name="daemon")
+app.command("run", cls=RunCommand, context_settings=RUN_CONTEXT)(run_cmd)  # send a folder to a worker (phase 3)
+app.command("rerun", cls=RerunCommand, context_settings=RERUN_CONTEXT)(rerun_cmd)  # same folder again (phase 3B)
+app.command("pull")(pull_cmd)  # fetch a worker job folder as a tarball (phase 6)
+app.add_typer(hosts_app, name="hosts")  # workers this machine can drive (phase 2)
+app.add_typer(remote_app, name="remote", hidden=True)  # worker side of remote queuing (phase 1)
 
 
 def _run_service_tool(argv: list[str]) -> int:

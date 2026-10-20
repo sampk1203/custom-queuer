@@ -7,11 +7,9 @@ buttons. A press on a bot's message reaches the qur that polls that bot, so
 give each machine its own bot if you want its buttons to always reach it
 (Telegram allows only one `getUpdates` consumer per bot token).
 
-Any number of qurs can share one bot for *sending*. Listening is used in two
-places: `qur connect` while waiting for you to press Start after scanning the
-QR, and the machines whose bot entry has `listen` on (the default), whose
-daemon polls for button presses. Machines set up with `qur connect --import`
-get `listen` off for bots that another machine already handles.
+Listening is used in two places: `qur connect` while waiting for you to press
+Start after scanning the QR, and the daemon of a machine whose bot entry has
+`listen` on (the default), which polls for button presses.
 
 Config lives in a 0600 JSON file (it holds the bot tokens):
 
@@ -23,8 +21,9 @@ Config lives in a 0600 JSON file (it holds the bot tokens):
 single-bot layout `{"qur_id", "token", "chat_ids", "listen"}` is still read,
 and is rewritten in the layout above the next time the config is saved.
 
-`qur_id` is generated per machine (rename it with `qur connect --id`) and is
-never exported, so every qur keeps its own id in the messages it sends.
+`qur_id` is generated per machine (rename it with `qur connect --id`), so every
+qur keeps its own id in the messages it sends. Bot tokens stay on the machine
+where `qur connect` ran; qur never copies them to another machine.
 
 Most functions work on a flat single-bot view `{"qur_id", "token",
 "chat_ids", "listen"}`; `bot_cfgs` produces one per connected bot.
@@ -39,8 +38,6 @@ replace it.
 
 from __future__ import annotations
 
-import base64
-import binascii
 import contextlib
 import html
 import json
@@ -65,11 +62,13 @@ API_BASE = "https://api.telegram.org"
 SEND_TIMEOUT_SECS = 10
 POLL_SECS = 10
 PAIR_TIMEOUT_SECS = 300
-EXPORT_PREFIX = "qurtg1:"  # one bot
-EXPORT_PREFIX_MULTI = "qurtg2:"  # several bots
 TOKEN_RE = re.compile(r"^\d+:[A-Za-z0-9_-]+$")
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,16}$")
-CALLBACK_ACTIONS = ("rq", "sh", "lg", "lc", "rl", "cn")  # requeue, details, log tail, list one channel (3rd field = channel), requeue from a list, cancel
+# requeue, details, log tail, list one channel (3rd field = channel), requeue from a list, cancel,
+# machine picker: status of one machine / channel picker of one machine (3rd field unused, 0).
+# The 2nd field is the machine: this host's qur id, or a worker's id from hosts.json (phase 5).
+CALLBACK_ACTIONS = ("rq", "sh", "lg", "lc", "rl", "cn", "ps", "pl")
+EPOCH_TAG_LEN = 4
 DETAIL_CMD_MAX_CHARS = 1200  # each command in Details (halved until the message fits)
 DETAIL_FIELD_MAX_CHARS = 500  # cwd, log path, note in Details
 CMD_MAX_CHARS = 1000  # command in the finished-job message
@@ -124,6 +123,9 @@ def _clean_bot(raw: Any) -> dict[str, Any] | None:
     bot: dict[str, Any] = {"token": token, "chat_ids": list(chat_ids)}
     if isinstance(raw.get("listen"), bool):
         bot["listen"] = raw["listen"]
+    uids = raw.get("user_ids")
+    if isinstance(uids, list) and all(isinstance(u, int) and not isinstance(u, bool) for u in uids):
+        bot["user_ids"] = list(uids)  # Telegram users allowed to cancel / requeue on workers (see daemon)
     if isinstance(raw.get("username"), str) and raw["username"]:
         bot["username"] = raw["username"]
     return bot
@@ -340,71 +342,6 @@ def send_all(cfg: dict[str, Any], text: str, markup_for: Callable[[dict[str, Any
 
 
 # ---------------------------------------------------------------------------
-# export / import (tokens + chat_ids, never qur_id)
-# ---------------------------------------------------------------------------
-
-
-def export_string(cfg: dict[str, Any], bots: list[dict[str, Any]] | None = None) -> str:
-    """Setup string for other machines: one bot -> `qurtg1:` (older qurs can
-    read it), several -> `qurtg2:`. `bots` limits it to some of the config's
-    bots; bots with no paired chat are never exported."""
-    entries = cfg["bots"] if "bots" in cfg else [cfg]  # either layout; no qur_id needed
-    cleaned = [b for b in (_clean_bot(e) for e in entries) if b is not None]
-    chosen = [b for b in (bots if bots is not None else cleaned) if b["chat_ids"]]
-    if not chosen:
-        raise ValueError("nothing to export")
-    if len(chosen) == 1:
-        payload = json.dumps({"t": chosen[0]["token"], "c": chosen[0]["chat_ids"]}, separators=(",", ":"))
-        prefix = EXPORT_PREFIX
-    else:
-        payload = json.dumps({"b": [{"t": b["token"], "c": b["chat_ids"]} for b in chosen]}, separators=(",", ":"))
-        prefix = EXPORT_PREFIX_MULTI
-    return prefix + base64.urlsafe_b64encode(payload.encode()).decode().rstrip("=")
-
-
-def parse_export_bots(s: str) -> list[tuple[str, list[int]]]:
-    """Every (token, chat_ids) in an export string (`qurtg1:` or `qurtg2:`).
-    Raises ValueError on anything malformed."""
-    s = s.strip()
-    if s.startswith(EXPORT_PREFIX):
-        prefix, multi = EXPORT_PREFIX, False
-    elif s.startswith(EXPORT_PREFIX_MULTI):
-        prefix, multi = EXPORT_PREFIX_MULTI, True
-    else:
-        raise ValueError("not a qur connect export string")
-    body = s[len(prefix):]
-    try:
-        raw = base64.urlsafe_b64decode(body + "=" * (-len(body) % 4))
-        data = json.loads(raw)
-        items = [(b["t"], b["c"]) for b in data["b"]] if multi else [(data["t"], data["c"])]
-    except (binascii.Error, ValueError, KeyError, TypeError):
-        raise ValueError("export string is corrupt") from None
-    if not items:
-        raise ValueError("export string has no bots")
-    seen: set[str] = set()
-    for token, chat_ids in items:
-        if not (isinstance(token, str) and TOKEN_RE.match(token)):
-            raise ValueError("export string has an invalid bot token")
-        if not (isinstance(chat_ids, list) and chat_ids
-                and all(isinstance(c, int) and not isinstance(c, bool) for c in chat_ids)):
-            raise ValueError("export string has no valid chat ids")
-        if token in seen:
-            raise ValueError("export string lists the same bot twice")
-        seen.add(token)
-    return [(t, list(c)) for t, c in items]
-
-
-def parse_export_string(s: str) -> tuple[str, list[int]]:
-    """Inverse of export_string for a one-bot string. Raises ValueError on
-    anything malformed, or if the string holds several bots (use
-    parse_export_bots)."""
-    items = parse_export_bots(s)
-    if len(items) != 1:
-        raise ValueError("export string has several bots")
-    return items[0]
-
-
-# ---------------------------------------------------------------------------
 # Telegram HTTP
 # ---------------------------------------------------------------------------
 
@@ -497,7 +434,10 @@ def hello_text(cfg: dict[str, Any]) -> str:
     return f"🔗 connected\n{_who(cfg)}"
 
 
-def _who(cfg: dict[str, Any]) -> str:
+def _who(cfg: dict[str, Any], machine: str | None = None) -> str:
+    """Which machine a message is about: this one, or (`machine`) a worker the host is announcing for."""
+    if machine:
+        return machine
     return f"{socket.gethostname()} [{cfg['qur_id']}]"
 
 
@@ -601,7 +541,10 @@ def pairing_active(path: Path | None = None) -> bool:
 
 
 def _button(cfg: dict[str, Any], job_id: int, action: str, text: str) -> dict[str, str]:
-    return {"text": text, "callback_data": f"{action}:{cfg['qur_id']}:{job_id}"}
+    """`cfg["epoch"]` (a worker's database epoch, 4 chars kept) is appended so a press made after a worker
+    database reset is refused. Longest callback_data: 2+1+16+1+job id+1+4, far under Telegram's 64 bytes."""
+    tag = f":{cfg['epoch'][:EPOCH_TAG_LEN]}" if cfg.get("epoch") else ""
+    return {"text": text, "callback_data": f"{action}:{cfg['qur_id']}:{job_id}{tag}"}
 
 
 def details_markup(cfg: dict[str, Any], job_id: int) -> dict[str, Any]:
@@ -651,8 +594,24 @@ def menu_markup() -> dict[str, Any]:
 
 
 def parse_menu(text: Any) -> str | None:
-    """"status", "list" or "menu" for a menu key / slash command, else None."""
-    return MENU_ACTIONS.get(text.strip()) if isinstance(text, str) else None
+    """"status", "list" or "menu" for a menu key / slash command, else None. `/status vm3` and
+    `/list vm3` (a machine after the command) count as "status" / "list"."""
+    if not isinstance(text, str):
+        return None
+    text = text.strip()
+    if text in MENU_ACTIONS:
+        return MENU_ACTIONS[text]
+    first, _, rest = text.partition(" ")
+    return MENU_ACTIONS[first] if first in ("/status", "/list") and rest.strip() else None
+
+
+def menu_machine(text: Any) -> str | None:
+    """The machine named after `/status` or `/list` ("vm3" in `/status vm3`), else None."""
+    if not isinstance(text, str):
+        return None
+    first, _, rest = text.strip().partition(" ")
+    rest = rest.strip()
+    return rest if first in ("/status", "/list") and rest else None
 
 
 def parse_callback(data: Any) -> tuple[str, str, int] | None:
@@ -660,9 +619,20 @@ def parse_callback(data: Any) -> tuple[str, str, int] | None:
     if not isinstance(data, str):
         return None
     parts = data.split(":")
-    if len(parts) != 3 or parts[0] not in CALLBACK_ACTIONS or not parts[2].isdecimal():
+    if len(parts) not in (3, 4) or parts[0] not in CALLBACK_ACTIONS or not parts[2].isdecimal():
+        return None
+    if len(parts) == 4 and not re.fullmatch(r"[0-9a-f]{%d}" % EPOCH_TAG_LEN, parts[3]):
         return None
     return parts[0], parts[1], int(parts[2])
+
+
+def callback_epoch(data: Any) -> str | None:
+    """The worker-epoch tag of a button's callback_data (`rq:vm3:42:ab12` -> "ab12"), None when it has none."""
+    if isinstance(data, str) and data.count(":") == 3:
+        tag = data.rsplit(":", 1)[1]
+        if re.fullmatch(r"[0-9a-f]{%d}" % EPOCH_TAG_LEN, tag):
+            return tag
+    return None
 
 
 def get_updates(cfg: dict[str, Any], offset: int | None, wait: int = POLL_SECS) -> list[dict[str, Any]]:
@@ -794,7 +764,7 @@ def _command(job: dict[str, Any]) -> str | None:
     return text or None
 
 
-def format_job(job: dict[str, Any], cfg: dict[str, Any]) -> str:
+def format_job(job: dict[str, Any], cfg: dict[str, Any], machine: str | None = None) -> str:
     """Message for a finished job: status, id, duration, the command as
     typed, machine, channel, exit code. No cwd, resolved paths or raw
     notes -- `qur show <id>` on the machine has those."""
@@ -819,15 +789,15 @@ def format_job(job: dict[str, Any], cfg: dict[str, Any]) -> str:
     usage = _usage_line(job)
     if usage:
         parts.append(usage)
-    lines.append(f"{_who(cfg)} · " + " · ".join(parts))
+    lines.append(f"{_who(cfg, machine)} · " + " · ".join(parts))
     return "\n".join(lines)
 
 
-def format_paused(job: dict[str, Any], cfg: dict[str, Any]) -> str:
+def format_paused(job: dict[str, Any], cfg: dict[str, Any], machine: str | None = None) -> str:
     """Message for a channel that `--on-fail pause` just paused."""
     return (
         f"⏸ channel {job['channel']} paused after job {job['id']} failed\n"
-        f"{_who(cfg)} · resume with: qur resume --channel {job['channel']}"
+        f"{_who(cfg, machine)} · resume with: qur resume --channel {job['channel']}"
     )
 
 
@@ -851,7 +821,7 @@ def _cap(text: str, limit: int = DETAIL_FIELD_MAX_CHARS) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-def format_details(job: dict[str, Any], cfg: dict[str, Any]) -> str:
+def format_details(job: dict[str, Any], cfg: dict[str, Any], machine: str | None = None) -> str:
     """Everything `qur show` prints, as Telegram HTML (parse_mode="HTML"):
     bold labels, monospace commands/paths, all dynamic text escaped. Sent only
     to paired chats, on request (Details button). Works for any job, running
@@ -859,13 +829,13 @@ def format_details(job: dict[str, Any], cfg: dict[str, Any]) -> str:
     that cap is halved until the message fits Telegram's 4096 characters."""
     cap = DETAIL_CMD_MAX_CHARS
     while True:
-        text = _format_details(job, cfg, cap)
+        text = _format_details(job, cfg, cap, machine)
         if len(text) <= TG_MAX_CHARS or cap <= 50:
             return text
         cap //= 2
 
 
-def _format_details(job: dict[str, Any], cfg: dict[str, Any], cmd_cap: int) -> str:
+def _format_details(job: dict[str, Any], cfg: dict[str, Any], cmd_cap: int, machine: str | None = None) -> str:
     esc = html.escape
     field_cap = min(cmd_cap, DETAIL_FIELD_MAX_CHARS)
 
@@ -890,11 +860,13 @@ def _format_details(job: dict[str, Any], cfg: dict[str, Any], cmd_cap: int) -> s
         origin_s = f"retry of #{parent} ({job.get('attempt')}/{job.get('max_retries')})"
     elif origin == "requeue":
         origin_s = f"requeue of #{parent}"
+    elif origin == "rerun":
+        origin_s = f"rerun of #{parent}"
     else:
         origin_s = "new"
     lines = [
         f"{_ICONS.get(status, '•')} <b>Job #{job['id']}</b> · {esc(status)}",
-        esc(_who(cfg)),
+        esc(_who(cfg, machine)),
         "",
         row("channel", str(job["channel"])),
         row("raw command", cmd("raw_cmd"), code=True),
@@ -908,6 +880,10 @@ def _format_details(job: dict[str, Any], cfg: dict[str, Any], cmd_cap: int) -> s
         row("timeout", f"{job['timeout_secs']}s" if job.get("timeout_secs") else "none"),
         row("origin", origin_s),
     ]
+    if job.get("job_dir"):
+        lines.append(row("job folder", _cap(job["job_dir"], field_cap), code=True))
+    if job.get("submitted_from"):
+        lines.append(row("submitted from", job["submitted_from"]))
     if job.get("max_rss_kb") is not None:
         lines.append(row("peak RSS", _fmt_mem_kb(job["max_rss_kb"])))
     if job.get("cpu_user_secs") is not None or job.get("cpu_sys_secs") is not None:
@@ -987,7 +963,7 @@ def _job_line(job: dict[str, Any], icon: str, extra: str = "", limit: int = LIST
     return f"{icon} #{job['id']} <code>{html.escape(_short_cmd(job, limit))}</code>{extra}"
 
 
-def format_status(data: dict[str, Any], cfg: dict[str, Any]) -> str:
+def format_status(data: dict[str, Any], cfg: dict[str, Any], machine: str | None = None) -> str:
     """`qur status` as Telegram HTML: running job per channel, paused and
     frozen flags."""
     lines: list[str] = []
@@ -1003,10 +979,10 @@ def format_status(data: dict[str, Any], cfg: dict[str, Any]) -> str:
             lines.append(_job_line(running, "▶️", f"{pri} · running {_since(running.get('started_at'))}"))
         elif not frozen:
             lines.append("💤 idle")
-    return _fit(f"<b>Status</b> · {html.escape(_who(cfg))}", lines if lines else ["(nothing has ever been queued)"])
+    return _fit(f"<b>Status</b> · {html.escape(_who(cfg, machine))}", lines if lines else ["(nothing has ever been queued)"])
 
 
-def format_list(data: dict[str, Any], cfg: dict[str, Any], channel: int) -> str:
+def format_list(data: dict[str, Any], cfg: dict[str, Any], channel: int, machine: str | None = None) -> str:
     """`qur list` for ONE channel as Telegram HTML: running job, queue and the
     recent finished jobs. Commands are shown in full (up to LIST_CMD_MAX_CHARS)
     and shortened only as far as needed to keep every job in the message."""
@@ -1028,7 +1004,7 @@ def format_list(data: dict[str, Any], cfg: dict[str, Any], channel: int) -> str:
     limit = max(LIST_CMD_MIN_CHARS, min(LIST_CMD_MAX_CHARS, (TG_MAX_CHARS - 300) // max(1, len(entries)) - 50))
     lines = ["⏸ paused"] if chan.get("paused") else []
     lines += [_job_line(job, icon, extra, limit) for job, icon, extra in entries]
-    return _fit(f"<b>List · channel {channel}</b> · {html.escape(_who(cfg))}", lines or ["(idle, nothing yet)"])
+    return _fit(f"<b>List · channel {channel}</b> · {html.escape(_who(cfg, machine))}", lines or ["(idle, nothing yet)"])
 
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
@@ -1051,18 +1027,24 @@ def read_log_tail(log_path: Any, lines: int = LOG_TAIL_LINES) -> str | None:
     except OSError as e:
         warn_once(f"cannot read log {log_path}: {type(e).__name__}")
         return None
+    return tidy_tail(data, cut_start=size > LOG_READ_BYTES, lines=lines)
+
+
+def tidy_tail(data: bytes, *, cut_start: bool, lines: int = LOG_TAIL_LINES) -> str:
+    """The last `lines` lines of raw log bytes as clean text (also used for a worker's log, which
+    arrives over ssh). `cut_start`: `data` begins in the middle of a line, so its first line is dropped."""
     text = data.decode(errors="replace").replace("\r\n", "\n").replace("\r", "\n")
     text = _CTRL_RE.sub("", _ANSI_RE.sub("", text))
     parts = text.rstrip("\n").split("\n")
-    if size > LOG_READ_BYTES:
+    if cut_start:
         parts = parts[1:]  # the first line is cut in the middle
     return "\n".join(parts[-lines:])
 
 
-def format_log(job: dict[str, Any], tail: str | None, cfg: dict[str, Any]) -> str:
+def format_log(job: dict[str, Any], tail: str | None, cfg: dict[str, Any], machine: str | None = None) -> str:
     """Log tail for one job as Telegram HTML (<pre>). Escaping can grow the
     text, so whole lines are dropped from the front until the message fits."""
-    head = f"📄 <b>Log · job #{job['id']}</b> · {html.escape(job['status'])}\n{html.escape(_who(cfg))}\n"
+    head = f"📄 <b>Log · job #{job['id']}</b> · {html.escape(job['status'])}\n{html.escape(_who(cfg, machine))}\n"
     if tail is None:
         return head + "(no log file)"
     tail = redact.redact_text(tail.rstrip())

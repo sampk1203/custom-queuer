@@ -104,10 +104,15 @@ queuer edit ID [--cmd CMD | -- <cmd...>] [--cwd DIR] [--timeout SECONDS] [--chan
 queuer pause [--channel N]
 queuer resume [--channel N]
 queuer doctor [--fix] [--json]
+queuer hosts [list | add NAME --ssh TARGET | edit NAME | remove NAME | check [NAME] [--expect CMD] [--from-daemon] [--json]]
+queuer run HOST FOLDER [--extra PATH[:DEST]] [--venv DIR] [--setup CMD] [--require P] [--link N=P] [--worker-copy S=D] [--pull] [--wait] [--dry-run] [qur add options] -- CMD
+queuer rerun HOST:ID [--replace LOCAL[=REL]] [--edit REL] [--pull] [--wait] [--force] [-- CMD]
+queuer pull HOST:ID [--to DIR] [--exclude P] [--max-mb N] [--extract] [--file REL] [--force]
+queuer -H HOST COMMAND ...      # any command on a worker (also HOST:ID)
 queuer daemon start | stop [--yes] | restart [--yes] | status | logs [-n N] [-f]
 queuer logs ID [--tail]
 queuer clean-logs [--days N] [--max-mb N] [--dry-run]
-queuer connect [--export | --import STRING | --from [USER@]HOST | --add-bot | --off] [--id NAME] [--listen | --no-listen] [--yes] [--list] [--remove-chat CHAT_ID] [--remove-bot [--all]] [--bot ID_OR_@NAME]
+queuer connect [--add-bot | --off] [--id NAME] [--listen | --no-listen] [--list] [--remove-chat CHAT_ID] [--remove-bot [--all]] [--bot ID_OR_@NAME]
 ```
 
 ### `add`
@@ -604,6 +609,7 @@ not fail it), so it also works in scripts.
 | `unit file`, `service` | `~/.config/systemd/user/queuerd.service` exists and `systemctl --user is-active queuerd` says active | WARN |
 | `unit exec` | the unit's `ExecStart` program exists, is executable and is this project's `.venv/bin/queuerd` | no `ExecStart` or program missing (project moved or deleted) FAIL; a different project folder WARN |
 | `unit settings` | the installed unit has the restart/stop lines `install.sh` writes now (`Type`, `Restart`, `RestartSec`, `TimeoutStopSec`, `OOMPolicy=continue`) and either all or none of the hardening lines (`UMask`, `NoNewPrivileges`, `LockPersonality`, `RestrictAddressFamilies`); `hardening: none` is fine (`QUEUER_HARDEN=none`, or systemd refused `basic`) | a missing/different setting or a half-hardened unit WARN: re-run `./install.sh` |
+| `host NAME: ...` | only for enabled workers in `hosts.json`: `ssh reachable`, `remote qur found`, `protocol compatible`, `daemon running`, `same environment in every ssh session`, `jobs dir writable`, `linger enabled`, `setup works` (the `qur hosts check` steps) and `daemon ssh` (queuerd itself can log in: no terminal, no agent) | unreachable, wrong protocol, jobs dir not writable or the daemon's login refused FAIL; the rest WARN. Slow when a worker is down (up to 30 s per step); `--json` includes them |
 | `telegram ...` | only if configured: one `getMe` per bot accepts the token | rejected token (401/404) FAIL; offline or other API error WARN; not configured is OK |
 
 `--fix` repairs **permission problems only**: it chmods files and folders you own to 0600/0700.
@@ -721,9 +727,8 @@ Telegram puts no time on a button press, so after the daemon was off for more th
 `offline - press again` toast if Telegram still accepts it), never run late. Only chats you paired can use either
 button, and these are the only actions the bot accepts. Both need the daemon to listen
 to Telegram, which Telegram allows for one machine per bot: the machine that owns
-the bot (`listen` on by default) handles them, and bots added with `--import` are
-send-only and show no buttons. Change that with `qur connect --listen` /
-`--no-listen` (add `--bot` for one bot). **Best setup: one bot per machine** (see
+the bot (`listen` on by default) handles them. Turn that off with
+`qur connect --no-listen` (add `--bot` for one bot) and back on with `--listen`. **Best setup: one bot per machine** (see
 "Several bots on one machine" below), so a press always reaches the machine that
 sent the message. Old buttons stop working if you
 rename the machine, and a press is ignored if the job is not finished.
@@ -742,12 +747,12 @@ unless you add `--bot`). **Remove a bot from this machine:**
 
 **Rename this machine:** `qur connect --id bigbox` (1–16 letters, digits, `-`,
 `_`). Takes effect on the next message; nothing else changes. `--id` also works
-on first setup and with `--import`.
+on first setup.
 
 **One-time setup, once per person:** in Telegram open **@BotFather**, send
 `/newbot`, pick a name, copy the token.
 
-**First machine:**
+**Setup (on each machine):**
 
 ```bash
 qur connect          # paste the token, scan the QR with your phone, press Start
@@ -756,50 +761,19 @@ qur connect          # paste the token, scan the QR with your phone, press Start
 If the QR won't scan, open the `t.me` link printed under it. Run `qur connect` again to add another phone or
 account — every paired chat gets every message.
 
-**Every other machine** — no scan, no waiting. Easiest, over ssh:
-
-```bash
-qur connect --from sampk@laptop       # on the new machine; nothing to copy
-qur connect --from sampk@laptop --id desktop   # same, and name it
-```
-
-It runs `qur connect --export` on that machine over ssh (adding `~/.local/bin` to
-the remote PATH, since non-interactive ssh often lacks it) and imports the result.
-ssh prompts (password, host key) appear as usual. The other machine must already
-be set up. Without ssh, copy the string by hand:
-
-```bash
-qur connect --export                  # on the first machine: prints one string
-qur connect --import qurtg1:eyJ0...   # on each other machine
-echo 'qurtg1:eyJ0...' | qur connect --import - --yes   # same, string from stdin (no terminal to ask on, so --yes)
-```
-
-A string given on the command line is visible in `ps` and your shell history, so
-`qur connect` prints a warning. Prefer `--from user@host` (nothing to copy) or
-`--import -` (string on stdin).
-
-`--import` and `--from` also show which bot and which chats the string would make this machine send job
-messages (commands, paths, log tails) to, and ask `[y/N]` (default no) before saving anything; only chats this
-machine does not already send to are listed, and nothing is asked when there are none. `--yes` / `-y` skips the question,
-and is required when there is no terminal to ask on, which includes `--import -` (stdin is the string).
-
-Each machine gets its own id on import and is send-only (no buttons; the first
-machine keeps them). The string contains the bot token, so keep it private.
-
-`qur connect --off` deletes this machine's saved setup. To invalidate the bot
-token on all machines, send `/revoke` to @BotFather.
+Each machine is set up on its own with `qur connect`; qur never copies the bot
+token to another machine. `qur connect --off` deletes this machine's saved setup.
+To invalidate the bot token, send `/revoke` to @BotFather.
 
 **How it works / limits:**
 
-- Any number of machines can *send* through one bot at the same time. Listening
-  happens in two places only: the daemon on the one `listen` machine (polling for
-  Requeue presses), and the pairing step in `qur connect`. Telegram allows one
-  listener per bot token, so the daemon steps aside while `qur connect` pairs.
-  Pair **one machine at a time**; if two overlap you get a clear "another qur may
-  be pairing" error — wait and retry. That is why other machines use `--import`
-  instead of scanning.
-- If two machines both have `listen` on, they take turns killing each other's
-  polls and the button is unreliable. Turn one off with `--no-listen`.
+- Listening happens in two places only: the daemon (polling for button presses
+  while the bot's `listen` is on), and the pairing step in `qur connect`.
+  Telegram allows one listener per bot token, so the daemon steps aside while
+  `qur connect` pairs. If two pairings overlap you get a clear "another qur may
+  be pairing" error — wait and retry.
+- If two machines poll the same bot, they take turns killing each other's
+  polls and the button is unreliable. Give each machine its own bot.
 - While Telegram is unreachable the daemon retries every 30 s and logs the
   error once to the journal. A button pressed during an outage is handled when
   it is back (Telegram keeps unconfirmed presses for ~24 h).
@@ -855,6 +829,122 @@ When something was deleted the daemon writes one line to its journal (`qur daemo
 `cleaned N log(s), X KB`); a failure is reported once and the timer keeps going. A bad
 value (not a positive number) is ignored with a warning in the journal. Nothing is
 deleted from the database, only log files.
+
+## Remote workers
+
+Run jobs on other machines (a VM, a GPU box) from one place. Every machine runs the same queuer as its own independent instance (own daemon, own queue); the machine you drive is the **worker** for that connection and the one you sit at is the **host**. The host holds the Telegram bot and the ssh login; the worker needs neither a bot nor the host's address. The host must be able to reach the worker, never the reverse: every connection is started by the host, and the worker never opens one or records the host's IP.
+
+Setup, five steps:
+
+1. On the worker: run `install.sh` (it also enables linger, so the daemon survives logout).
+2. Put the host's **public** key in the worker's `~/.ssh/authorized_keys` yourself. qur never creates, copies, reads, prints or forwards keys.
+3. On the host, once by hand: `ssh vm3` and answer `yes` to the host-key question. qur runs ssh with `BatchMode=yes`, which cannot ask, so an unknown host key fails with "Host key verification failed" (reported as a refused login).
+4. On the host: `qur hosts add vm3 --ssh vm3` (an alias from `~/.ssh/config`, or `[user@]host`; `ssh_options` can add `-i KEY`).
+5. `qur hosts check vm3 --expect lmp` (ssh, protocol, daemon, jobs dir, linger, your environment).
+
+The **daemon** (not your shell) runs the polling `ssh`, without a terminal or agent: the login must work without a passphrase or agent (`qur hosts check vm3 --from-daemon` proves it; `qur doctor` runs it too). Then:
+
+```
+qur run vm3 ./lammps-run -- lmp -in in.lammps     # send the folder, queue the command there
+qur show vm3:42   qur logs vm3:42 --tail          # any qur command works with HOST:ID or -H vm3
+qur pull vm3:42                                   # the finished folder, as a .tar.gz
+```
+
+**Environment layers** (later ones win), all on the worker, inside `bash -lc`: the host's `setup` command, `--venv`, `--setup`, then the folder's own `qur-env.sh`. Nothing is taken from the host's shell.
+
+**Restart a job with one file replaced** (a LAMMPS restart, say): `qur rerun vm3:42 --replace ./in.restart -- lmp -in in.restart` sends only that file into the same folder (the old one is kept in `.qur-prev/<time>/`), so the run carries on from the files already there.
+
+**Files that live on the worker** (potentials, models, restart files) are not re-sent: `--require PATH` fails the run early if a path is missing, `--link NAME=PATH` links it into the job folder, `--worker-copy SRC=DEST` copies it there once.
+
+Limits: nothing is reported while the host is off (the next poll catches up from its cursor); alerts can lag by up to `poll_secs`; host and worker need compatible `protocol` numbers (`qur hosts check` shows it); the stats are measured on the worker; `--each` / `--array` are not available through `qur run`; `qur rerun` only adds or replaces files (never deletes or merges); `uv run --project` is not supported (use `--venv` or `--setup`). The sections below are the details.
+
+## Remote workers (host side)
+
+A host drives workers over ssh; the worker is the machine being driven, and only the host ever opens the connection. qur never creates, copies, reads or prints SSH keys: put the host's *public* key in the worker's `authorized_keys` yourself. The host daemon runs without a terminal, so it needs a login that works without a passphrase or agent (your existing key through `~/.ssh/config` does).
+
+**Trust model.** The ssh login gives the host a full shell on the worker, and the daemon's login has no passphrase, so whoever controls the host account controls every worker it is configured for. The list of `qur remote ...` commands is not a security boundary: it only keeps qur itself from forwarding free text, while `qur -H HOST ...` and raw ssh can run anything. Treat each worker as trusted by the host and the host account as the key to all of them; use a dedicated key per worker, and keep `hosts.json` at mode 600 (its `ssh_options` and `setup` run commands). In the other direction a worker is not trusted: what it sends is size-capped, shown with control characters removed, and never written outside the pull folder. If you need more, restrict the worker's `authorized_keys` entry for the daemon's key with a `command=` wrapper that only allows `qur remote ...` (qur does not set this up).
+
+```
+qur hosts add vm3 --ssh vm3 --setup 'source ~/venvs/md/bin/activate'   # ssh alias or [user@]host
+qur hosts check vm3 --expect lmp             # ssh, remote qur, protocol, daemon, jobs dir, linger, setup
+qur hosts                                    # list (also: edit, remove, --json)
+qur -H vm3 list                              # ANY qur command on the worker (also QUR_HOST=vm3)
+qur show vm3:42    qur logs vm3:42 --tail    # HOST:ID = -H vm3 + id (ranges and lists work: vm3:31-33)
+```
+
+### `run HOST FOLDER -- CMD`
+
+```
+qur run vm3 ./lammps-run -- lmp -in in.lammps
+qur run vm3 ./job --venv ~/venvs/md --retries 2 --wait -- python train.py
+qur run vm3 ./job --link model.pt=/data/models/llzo.pt --require /data/potentials -- lmp -in in.x
+qur run --resume                   # continue the newest interrupted run
+```
+
+Packs FOLDER (plus every `--extra PATH[:DEST]`) into a tar.gz, sends it to a new `NAME-<time>-<rand>` folder under the worker's jobs dir, and queues the command there on the worker's own queue. HOST and FOLDER come first; every `qur add` option is forwarded verbatim (`--depends-on` means worker job ids). `--each` / `--array` are refused. Key files (`.ssh`, private keys, `*.pem`, `*.key`) are never sent, and `.env`, `.netrc`, `.aws`, `.git` and similar stay home unless `--include-sensitive`; a `.qurignore` in FOLDER (one glob per line) leaves out more. The environment is built on the worker, in this order: the host's `setup`, `--venv`, `--setup`, then `qur-env.sh` from the folder; a failing step aborts before anything is queued. `--require`, `--link` and `--worker-copy` use files already on the worker. `--dry-run` sends nothing. Each run has a key and a record in the host database (`created`, `sent`, `prepared`, `queued`); after a dropped link `qur run --resume [KEY]` continues without duplicating the folder or the job. `--pull` makes the daemon pull the folder when the job ends (see `pull` below).
+
+`hosts.json` (0600, `~/.config/queuer/`, or `QUEUER_HOSTS_PATH`) holds `ssh`, `id`, `jobs_dir`, `setup`, `pull_dir`, `pull_exclude`, `poll_secs`, `ssh_options` (e.g. `["-i", "~/.ssh/qur_vm3"]`, passed to `ssh` only) and `enabled`. `HOST:ID` is rewritten only for `show logs cancel requeue wait rm edit`, only before `--`, only when the whole argument matches a configured host, and never in `qur add` arguments. Two hosts in one command is an error. `edit` and `logs --tail` get a terminal; `--json` output does not.
+
+### `rerun HOST:ID`: same folder again
+
+```
+qur rerun vm3:42 --replace ./in.restart -- lmp -in in.restart   # send one file, run something else in the same folder
+qur rerun vm3:42 --edit in.lammps                               # fetch, open in $EDITOR, send back if changed, run again
+qur rerun vm3:42 --depends-on 42 -- lmp -in in.next             # queue behind the running job (command only)
+qur rerun --resume                                              # continue an interrupted rerun
+```
+
+Queues a new worker job in the folder job 42 already used; nothing but the files you name is sent, and nothing is deleted: a replaced file is first moved to `.qur-prev/<time>/` in the folder. Without `-- CMD` the original command runs again; the original channel, retries, timeout, hooks and explicit `--env` values are kept unless you give them again (secret-looking `--env` names are not carried: give them again). `qur show` on the worker lists every job that used the folder. It is refused (exit 6) while another queued, running or being-edited job uses the folder, unless the new job is chained with `--depends-on` and replaces no files, or you pass `--force`. `--dry-run` prints the files, the backup location, the command and the queue position and changes nothing. How it differs from the others: **requeue** (CLI or Telegram button) runs the same command again, nothing replaced; **rerun** replaces or edits files and/or the command first, in the same folder; **run** is a brand-new folder.
+
+### `pull HOST:ID`: bring the folder back
+
+```
+qur pull vm3:42                                  # -> ~/qur-results/vm3/<folder>.tar.gz
+qur pull vm3:42 --to ~/results --extract         # also unpack next to it
+qur pull vm3:42 --exclude '*.lammpstrj' --max-mb 2000
+qur pull vm3:42 --file log.lammps --to .         # one file, no tarball (5 MB unless --max-mb)
+qur run vm3 ./job --pull -- python train.py      # pulled automatically when the job ends
+```
+
+Runs `qur remote pack` on the worker and streams to `<name>.tar.gz.part`; the file is checked (gzip CRC and a full listing) and only then renamed, so an interrupted or corrupt transfer never leaves a tarball. An existing tarball is never replaced without `--force`. `pull_dir` (default `~/qur-results/<host id>/`) and `pull_exclude` come from `hosts.json`; `--exclude` adds to them and `--no-default-excludes` ignores them. Key files are never packed. It is a host command (not forwarded by `-H`). With `--pull` on `run` / `rerun` the daemon pulls when the job ends `done` or `failed` (not cancelled or skipped), one pull per host at a time, then sends "pulled to PATH (SIZE)" to Telegram; a failed pull is reported and retried at the next poll, three tries in all. Automatic pulls of a rerun are named `<folder>-<job id>.tar.gz`.
+
+### Whose environment?
+
+Always the worker's. `qur add` runs on the worker inside `bash -lc`, after the host `setup`, `--venv`, `--setup` and the folder's `qur-env.sh`, so PATH, VIRTUAL_ENV, LD_LIBRARY_PATH, CUDA_* and the other captured variables are those of that shell, and the command is resolved against that PATH. Nothing is taken from the host's shell (a bare `--env KEY` also reads KEY on the worker). One thing to know: many ssh clients send `LANG` / `LC_*` by default (`SendEnv` in `ssh_config`), so the worker may record the host's locale; set it in `setup` (`export LANG=...`) if that matters. `rerun` captures everything fresh and never reuses the old job's copies.
+
+### Watching workers
+
+`queuerd` polls every enabled worker over ssh (`poll_secs`, default 15 s; backoff to 5 min while it is down) and announces its jobs on the host's Telegram under the worker's id, with the stats measured on the worker (peak RSS, CPU time, duration, exit code). A job a host sent is announced only by the host; a job started directly on a worker follows that worker's own Telegram, and the host announces it only if the worker has none. A new worker starts at its latest event, so old history is never replayed. After a sleeping laptop wakes, more than `QUEUER_REMOTE_BURST` (8) finished jobs give one summary message and then only the failed ones. "vm3 unreachable since HH:MM" (after `QUEUER_REMOTE_UNREACHABLE_SECS`, default 600) and "reachable again" are each sent once; a worker running another protocol version is marked incompatible and reported once. If the host is off, nothing is reported until it is back; the worker keeps running and the next poll catches up.
+
+```
+qur remote list [vm3] [--json]     # jobs seen finishing, from the cache (marked stale while the worker is down)
+qur show vm3:42                    # live; if vm3 cannot be reached, the cached snapshot with its stats
+qur hosts check vm3 --from-daemon  # prove the daemon (not your shell) can log in to the worker
+```
+
+### Telegram per machine
+
+The same chat drives every machine. With at least one enabled worker the 📊 Status / 📋 List keys first ask which machine (this host or a worker id from `hosts.json`); `/status vm3` and `/list vm3` skip the question (`/status here` = this host). The host's Status also ends with one line per worker (running / queued counts, or "unreachable"). A worker's List, Details and Logs run over ssh when you press the button (the button answers "fetching…" first); Requeue and Cancel run `qur requeue ID` / `qur cancel ID` on the worker, with the same "already requeued" / "not finished" rules as local jobs. Finished-job messages of a worker carry Requeue / Details / Logs like the host's own. Worker text goes through the same escaping and secret redaction as local text, and a worker that does not answer gives "vm3 unreachable". Buttons carry the machine in `ACTION:MACHINE:ID` (`rq:vm3:42`); if a worker id equals this host's qur id, the host wins, so keep worker ids distinct from `qur connect --id`.
+
+## Remote workers (worker side)
+
+A worker is a normal queuer; a host drives it over ssh with the hidden `qur remote` commands. Received job folders live in the `jobs_dir` of the host's `hosts.json` entry (default `~/qur-jobs`); the host passes it to `receive` and `gc` itself, and every other command accepts any folder that `receive` made (it carries a `.qur-received` marker), so the worker's own `QUEUER_JOBS_DIR` is not needed for them.
+
+**Which environment the worker's qur sees over ssh.** A command the host runs over ssh (polling, `qur pull`, `qur rerun`, `qur -H ...`) is `bash -c '...'`, a non-login, non-interactive shell, whatever the account's login shell is (fish and csh work too). `qur run` queues in `bash -lc` so that your profile, `setup` and venv apply. A variable exported only in `~/.profile`, or only in a systemd override of `queuerd`, is therefore seen by `qur run` but not by polling: for example a `QUEUER_DB_PATH` on a cluster would make polling read an empty default database. `qur hosts check` compares the two (`same environment in every ssh session`) and says what differs. Export `QUEUER_DB_PATH` / `QUEUER_SOCKET_PATH` where non-login ssh commands read them (the top of `~/.bashrc`, above the `case $- in *i*)` guard); `QUEUER_JOBS_DIR` is not needed, the host sends its `jobs_dir`. A login profile that prints text is tolerated by `qur run` (it finds the JSON answer after the text). Keep `~/.bashrc` silent for non-interactive shells, though: `qur pull` streams binary data over a plain ssh command, and text printed before it would corrupt the download.
+
+| Command | What it does |
+|---|---|
+| `qur remote info --json` | protocol, versions, machine id, jobs dir, database epoch |
+| `qur remote events --after SEQ --json` | final outcomes and paused channels since SEQ |
+| `qur remote find --run-key KEY --json` | the job queued with that key, or `{}` |
+| `qur remote receive --name NAME [--run-key KEY] < in.tar.gz` | extract into a new `NAME-<time>-<rand>` folder (hostile archives are refused) |
+| `qur remote pack ID > out.tar.gz` | tar.gz of a job's folder (never keys; `.env`, `.netrc`, `.aws`, `.git` only with `--include-sensitive`; `--max-mb` counts uncompressed bytes) |
+| `qur remote prepare --dir D [--require P] [--link N=P] [--copy SRC=DEST]` | check / link / copy files already on the worker |
+| `qur remote update --job ID < files.tar.gz` | add or replace files; replaced ones go to `.qur-prev/<time>/` |
+| `qur remote cat --job ID REL` | one file of the job folder |
+| `qur remote gc [--older-than 7d] [--delete] [--force-completed]` | interrupted uploads (deleted with `--delete`) and finished folders without a job row (kept unless `--force-completed`) |
+
+Exit codes: 0 ok, 2 not found, 3 too big, 4 bad arguments, 5 required path missing, 6 folder in use. `qur add` also takes `--json`, and the hidden `--run-key`, `--job-dir`, `--submitted-from` and `--rerun-of`.
 
 ## Managing the daemon
 
@@ -1001,10 +1091,10 @@ boundary. What is enforced:
   clear error. A client that connects and sends nothing is dropped after 10 s.
 - **Timeouts and `--now`.** `--timeout` counts run time only; time a job spends frozen
   by a `--now` job does not count.
-- **Bot token.** Never appears in logs or error text. `qur connect --import - --yes` takes the
-  setup string on stdin (an import first shows the bot and chats it will send job data to and asks); on the command line it is visible in `ps` and shell history
-  (a warning is printed). The setup string and `notify.json` contain the token, so
-  keep them private; `/revoke` to @BotFather invalidates it. The daemon checks
+- **Bot token.** Never appears in logs or error text. It is typed at a hidden prompt
+  and lives only in `notify.json` on the machine that ran `qur connect`; qur never
+  copies it to another machine. `notify.json` contains the token, so
+  keep it private; `/revoke` to @BotFather invalidates it. The daemon checks
   `notify.json` and its folder (regular file, yours, no group/other access): a loose
   mode is tightened to 600/700 and logged, a symlink or someone else's file is logged as
   a warning. `qur connect --list` prints the same warning. Anything running as **you**
@@ -1110,13 +1200,8 @@ qur connect --bot @second_bot       # pair another phone with one bot (needed wh
 qur connect --bot @second_bot --no-listen   # per-bot buttons (no --bot = all bots)
 qur connect --remove-chat 123456789 [--bot ID]   # all bots that have it, or just one
 qur connect --remove-bot --bot ID   # drop one bot; --all drops everything
-qur connect --export [--bot ID]     # all bots (qurtg2:) or one (qurtg1:)
-qur connect --import STRING         # adds the string's bots, send-only unless --listen
-qur connect --import - --yes        # same, string read from stdin (keeps token out of ps/history)
-qur connect --import STRING --yes   # skip the "send job messages to these chats?" question
 ```
 
-`--bot` takes the numeric bot id or the @username shown by `--list`. `--import`
-and `--from` merge into what the machine already has. Old single-bot
+`--bot` takes the numeric bot id or the @username shown by `--list`. Old single-bot
 `notify.json` files keep working and are rewritten in the new layout on the
 next change. Pairing a phone pauses button polling for all bots while it runs.

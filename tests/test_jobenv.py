@@ -131,3 +131,12 @@ def test_look_alike_names_stay_readable(name):
         assert jobenv.is_secret_name(name)
     else:
         assert not jobenv.is_secret_name(name)
+
+
+def test_mask_env_extra_keeps_names_and_drops_values():
+    masked = jobenv.mask_env_extra(json.dumps({"API_KEY": "hunter2", "MODE": "fast", jobenv.PASSTHROUGH_KEY: "HOME,USER"}))
+    data = json.loads(masked)
+    assert data["API_KEY"] == "***" and data["MODE"] == "***" and data[jobenv.PASSTHROUGH_KEY] == "HOME,USER"
+    assert "hunter2" not in masked and "fast" not in masked
+    assert jobenv.mask_env_extra({"A": "b"}) == {"A": "***"}
+    assert jobenv.mask_env_extra(None) is None and jobenv.mask_env_extra("{not json") is None

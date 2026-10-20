@@ -490,12 +490,46 @@ def check_schema() -> Check:
     return Check("schema", OK, f"version {version} (current)")
 
 
+def check_hosts() -> list[Check]:
+    """F21 Phase 7: one block per enabled worker in hosts.json: ssh login, remote qur, protocol,
+    daemon, jobs dir, linger and `setup` (the `qur hosts check` steps), plus whether the DAEMON
+    (not this shell) can log in (`remote_check`). Nothing is changed; no worker configured: no checks.
+    A worker that cannot be reached is a FAIL (its jobs are not being watched), a soft step a WARN."""
+    from queuer import hostcfg, remote_cli  # not needed unless a worker is configured
+
+    problem = hostcfg.check_permissions()
+    if problem:  # hosts.json names ssh options and shell snippets qur executes: it must not be writable by others
+        return [Check("hosts.json permissions", FAIL, problem, f"chmod 600 {hostcfg.default_path()}")]
+    hosts = {n: h for n, h in hostcfg.load()["hosts"].items() if h["enabled"]}
+    hard = {"ssh reachable", "remote qur found", "protocol compatible", "jobs dir writable"}
+    out: list[Check] = []
+    for name, host in sorted(hosts.items()):
+        steps = remote_cli.check_host(name, {**host, "name": name})
+        for s in steps:
+            status = OK if s["ok"] else (FAIL if s["step"] in hard else WARN)
+            hint = "" if s["ok"] else f"qur hosts check {name}"
+            out.append(Check(f"host {name}: {s['step']}", status, str(s["detail"]), hint))
+        if not steps or not steps[0]["ok"]:
+            continue  # nothing to ask the daemon about while ssh itself fails
+        try:
+            reply = client.send("remote_check", host=name)
+        except (client.DaemonNotRunning, client.DaemonError) as e:
+            out.append(Check(f"host {name}: daemon ssh", WARN, f"cannot ask queuerd: {e}", "qur daemon start"))
+            continue
+        ok = bool(reply.get("ok"))
+        out.append(Check(
+            f"host {name}: daemon ssh", OK if ok else FAIL, str(reply.get("detail", "")),
+            "" if ok else "queuerd runs without a terminal or agent: the worker login must work without a passphrase or ssh-agent (qur hosts check --from-daemon)",
+        ))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # run everything
 # ---------------------------------------------------------------------------
 
 
-def run_checks(fix: bool = False) -> list[Check]:
+def run_checks(fix: bool = False, hosts: bool = True) -> list[Check]:
     checks: list[Check] = [check_daemon()]
     checks += check_socket(fix)
     checks += check_config(fix)
@@ -506,6 +540,8 @@ def run_checks(fix: bool = False) -> list[Check]:
     checks.append(check_linger())
     checks += check_unit()
     checks += check_telegram()
+    if hosts:
+        checks += check_hosts()
     return checks
 
 

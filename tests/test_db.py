@@ -2318,3 +2318,36 @@ def test_pausing_a_channel_before_its_first_job_still_works(conn):
     db.set_paused(conn, True, 9)  # `qur pause -c 9` before any job: not touched by registering the channel
     _mk(conn, "x", channel=9)
     assert db.get_paused(conn, 9) is True
+
+
+def test_limit_payload_shrinks_only_oversized_rows():
+    small = {"id": 1, "status": "done", "raw_cmd": "x"}
+    assert db.limit_payload(small) is small
+    big = {"id": 2, "status": "done", "note": "n" * 5000, "env_extra": "e" * 300}
+    cut = db.limit_payload(big, max_bytes=3000)
+    assert cut["truncated"] and len(cut["note"]) < 2100 and cut["id"] == 2
+    huge = {"id": 3, "status": "failed", **{f"k{i}": "v" * 1500 for i in range(50)}}
+    tiny = db.limit_payload(huge, max_bytes=2000)
+    assert tiny["truncated"] and set(tiny) <= {*db._KEEP_KEYS, "truncated"} and tiny["id"] == 3
+
+
+def test_prune_run_files_removes_only_what_resume_cannot_need(conn, tmp_path):
+    import os
+    import time
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    keys = {"queued": "a" * 32, "sent": "b" * 32, "gone": "c" * 32, "fresh": "d" * 32}
+    for k, state in (("queued", "queued"), ("sent", "sent")):
+        conn.execute("INSERT INTO remote_runs (run_key, host, kind, state, pull, created_at, updated_at) VALUES (?, 'h', 'run', ?, 0, 'x', 'x')", (keys[k], state))
+    conn.commit()
+    old = time.time() - 3 * 86400
+    for k in keys:
+        for ext in (".json", ".files.tar.gz"):
+            (runs / f"{keys[k]}{ext}").write_text("x")
+            if k != "fresh":
+                os.utime(runs / f"{keys[k]}{ext}", (old, old))
+    (runs / "notes.txt").write_text("keep")
+    assert db.prune_run_files(conn, runs, 90) == 4
+    left = {p.name for p in runs.iterdir()}
+    assert left == {f"{keys['sent']}.json", f"{keys['sent']}.files.tar.gz", f"{keys['fresh']}.json", f"{keys['fresh']}.files.tar.gz", "notes.txt"}
+    assert db.prune_run_files(conn, runs, 1) == 2  # older than the hard limit goes whatever its state

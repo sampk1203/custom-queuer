@@ -15,8 +15,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import secrets
 import signal
 import sqlite3
+import time
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -82,13 +85,66 @@ CREATE TABLE IF NOT EXISTS {name} (
     on_finish_cmd TEXT,
     on_error_cmd  TEXT,
     stop_signal   TEXT,
-    stop_grace_secs INTEGER
+    stop_grace_secs INTEGER,
+    run_key       TEXT,
+    job_dir       TEXT,
+    submitted_from TEXT
 );
 """
 
 _JOBS_TABLE = _JOBS_DDL.format(name="jobs")
 
-_SCHEMA = _JOBS_TABLE + """
+# Remote-worker tables (QUEUER_REMOTE_PLAN.md phase 1.0). All IF NOT EXISTS, so they are part of
+# _SCHEMA (fresh DB) and of their numbered migrations (old DB) without clashing.
+_EVENTS_DDL = """
+CREATE TABLE IF NOT EXISTS events (
+    seq     INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id  INTEGER,
+    kind    TEXT,
+    at      TEXT,
+    payload TEXT
+);
+"""
+
+_REMOTE_HOSTS_DDL = """
+CREATE TABLE IF NOT EXISTS remote_hosts (
+    name TEXT PRIMARY KEY,
+    epoch TEXT,
+    cursor INTEGER NOT NULL DEFAULT 0,
+    last_ok_at TEXT,
+    last_error TEXT,
+    reachable INTEGER NOT NULL DEFAULT 1,
+    unreachable_alerted INTEGER NOT NULL DEFAULT 0,
+    incompatible INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS remote_runs (
+    run_key TEXT PRIMARY KEY,
+    host TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    state TEXT NOT NULL,
+    local_folder TEXT,
+    remote_dir TEXT,
+    remote_id INTEGER,
+    parent_remote_id INTEGER,
+    pull INTEGER NOT NULL DEFAULT 0,
+    pulled_path TEXT,
+    pull_attempts INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT,
+    updated_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS remote_jobs (
+    host TEXT NOT NULL,
+    remote_id INTEGER NOT NULL,
+    status TEXT,
+    snapshot TEXT,
+    seen_at TEXT,
+    PRIMARY KEY (host, remote_id)
+);
+"""
+
+_SCHEMA = _JOBS_TABLE + _EVENTS_DDL + _REMOTE_HOSTS_DDL + """
 CREATE TABLE IF NOT EXISTS channels (
     id            INTEGER PRIMARY KEY,
     first_seen_at TEXT NOT NULL
@@ -292,6 +348,46 @@ def _migrate_add_jobs_indexes(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_backlog ON jobs (channel, status, finished_at)")
 
 
+def _migrate_add_remote_job_columns(conn: sqlite3.Connection) -> None:
+    """Remote workers (1.0): `run_key` (idempotency key of a host's `qur run`; unique when set),
+    `job_dir` (the folder a remote job runs in) and `submitted_from` (label of the host that
+    sent the job; its presence silences this machine's own Telegram messages). Plain ADD COLUMN."""
+    cols = [r["name"] for r in conn.execute("PRAGMA table_info(jobs)").fetchall()]
+    for name in ("run_key", "job_dir", "submitted_from"):
+        if name not in cols:
+            conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} TEXT")  # nosec B608 - fixed names above
+    _create_run_key_index(conn)
+
+
+def _create_run_key_index(conn: sqlite3.Connection) -> None:
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_run_key ON jobs (run_key) WHERE run_key IS NOT NULL")
+
+
+def _migrate_add_events(conn: sqlite3.Connection) -> None:
+    """Remote workers (1.0): the `events` feed a host polls (see `qur remote events`)."""
+    for stmt in _EVENTS_DDL.split(";"):
+        if stmt.strip():
+            conn.execute(stmt)
+
+
+def _migrate_add_epoch(conn: sqlite3.Connection) -> None:
+    """Remote workers (1.0): a random database id in `daemon_state`, so a host can tell a reset DB."""
+    _ensure_epoch(conn)
+
+
+def _migrate_add_remote_host_tables(conn: sqlite3.Connection) -> None:
+    """Remote workers (1.0): host-side tables (created everywhere, used only by hosts)."""
+    for stmt in _REMOTE_HOSTS_DDL.split(";"):
+        if stmt.strip():
+            conn.execute(stmt)
+
+
+def _ensure_epoch(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "INSERT OR IGNORE INTO daemon_state (key, value) VALUES ('epoch', ?)", (secrets.token_hex(4),)
+    )
+
+
 # Numbered migrations, run in order, each in its own transaction that also bumps the
 # single-row `schema_version` table. To change the schema: append ONE new
 # (number, function) entry (never edit or reorder old ones) and, if a fresh DB needs the
@@ -307,6 +403,10 @@ _MIGRATIONS: tuple[tuple[int, Callable[[sqlite3.Connection], None]], ...] = (
     (6, _migrate_add_hooks),
     (7, _migrate_add_stop_settings),
     (8, _migrate_add_jobs_indexes),
+    (9, _migrate_add_remote_job_columns),
+    (10, _migrate_add_events),
+    (11, _migrate_add_epoch),
+    (12, _migrate_add_remote_host_tables),
 )
 SCHEMA_VERSION = _MIGRATIONS[-1][0]
 
@@ -361,6 +461,8 @@ def init_db(conn: sqlite3.Connection) -> None:
     # indexes exist. Not in _SCHEMA, which runs before the migrations and would fail on an old
     # table without `is_priority`. Idempotent (CREATE INDEX IF NOT EXISTS).
     _migrate_add_jobs_indexes(conn)
+    _create_run_key_index(conn)
+    _ensure_epoch(conn)  # a fresh DB skips migration 11
     conn.commit()
 
 
@@ -537,6 +639,47 @@ def check_stop_grace(value: Any, what: str = "stop grace") -> int | None:
     return value
 
 
+MAX_RUN_KEY_LEN = 128
+
+
+def check_run_key(value: Any) -> str | None:
+    """A `--run-key` (None or blank = none): 1-128 printable characters, no whitespace or NUL."""
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str) or len(value) > MAX_RUN_KEY_LEN or any(c.isspace() or not c.isprintable() for c in value):
+        raise ValueError(f"run key must be 1-{MAX_RUN_KEY_LEN} printable characters without spaces")
+    return value
+
+
+def check_job_dir(value: Any) -> str | None:
+    """A `--job-dir` (None or blank = none): an absolute path without NUL."""
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str) or "\0" in value or not os.path.isabs(value):
+        raise ValueError("job dir must be an absolute path")
+    return value
+
+
+def check_label(value: Any, what: str) -> str | None:
+    """A short label (None or blank = none): at most 64 printable characters."""
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str) or len(value) > 64 or not value.isprintable():
+        raise ValueError(f"{what} must be at most 64 printable characters")
+    return value
+
+
+def find_by_run_key(conn: sqlite3.Connection, run_key: str) -> dict[str, Any] | None:
+    row = conn.execute("SELECT * FROM jobs WHERE run_key = ?", (run_key,)).fetchone()
+    return _row_to_dict(row) if row else None
+
+
+def jobs_sharing_dir(conn: sqlite3.Connection, job_id: int, job_dir: str) -> list[int]:
+    """Ids of the other jobs that run in `job_dir`."""
+    rows = conn.execute("SELECT id FROM jobs WHERE job_dir = ? AND id != ? ORDER BY id", (job_dir, job_id)).fetchall()
+    return [r["id"] for r in rows]
+
+
 def enqueue(
     conn: sqlite3.Connection,
     *,
@@ -563,6 +706,9 @@ def enqueue(
     on_error_cmd: str | None = None,
     stop_signal: str | None = None,
     stop_grace_secs: int | None = None,
+    run_key: str | None = None,
+    job_dir: str | None = None,
+    submitted_from: str | None = None,
     commit: bool = True,
     check_deadlock: bool = True,
 ) -> int:
@@ -606,6 +752,10 @@ def enqueue(
     signal that stops this job on `cancel` or timeout and the seconds it gets before SIGKILL
     (see `check_stop_signal`, `check_stop_grace`); copied to retries and requeues.
 
+    `run_key` (unique; a second job with the same key is rejected), `job_dir` and `submitted_from`
+    are the remote-worker fields (see QUEUER_REMOTE_PLAN.md); `job_dir` and `submitted_from` are
+    copied to retries and requeues, `run_key` never is.
+
     Nothing is written if anything is rejected. `commit=False` leaves the
     insert in the open transaction so several jobs can be added all-or-nothing
     (the caller commits, or rolls back).
@@ -627,6 +777,9 @@ def enqueue(
     on_error_cmd = check_hook(on_error_cmd, "on-error command")
     stop_signal = check_stop_signal(stop_signal)
     stop_grace_secs = check_stop_grace(stop_grace_secs)
+    run_key = check_run_key(run_key)
+    job_dir = check_job_dir(job_dir)
+    submitted_from = check_label(submitted_from, "submitted-from label")
     deps = deps or {}
     if is_priority and (deps or not_before):
         raise ValueError("--now cannot be combined with dependencies or a start time")
@@ -657,8 +810,9 @@ def enqueue(
                 (channel, status, position, raw_cmd, resolved_cmd, cwd, env_extra,
                  enqueued_at, log_path, timeout_secs, is_priority, max_retries, attempt,
                  parent_id, origin, not_before, on_fail, retry_delay_secs, retry_backoff,
-                 on_finish_cmd, on_error_cmd, stop_signal, stop_grace_secs)
-            VALUES (?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 on_finish_cmd, on_error_cmd, stop_signal, stop_grace_secs,
+                 run_key, job_dir, submitted_from)
+            VALUES (?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 channel,
@@ -683,6 +837,9 @@ def enqueue(
                 on_error_cmd,
                 stop_signal,
                 stop_grace_secs,
+                run_key,
+                job_dir,
+                submitted_from,
             ),
         )
         new_id = cur.lastrowid
@@ -1565,6 +1722,8 @@ def requeue(conn: sqlite3.Connection, job_id: int, *, log_path: str, auto: bool 
         on_error_cmd=job["on_error_cmd"],
         stop_signal=job["stop_signal"],
         stop_grace_secs=job["stop_grace_secs"],
+        job_dir=job.get("job_dir"),
+        submitted_from=job.get("submitted_from"),
         not_before=not_before,
         attempt=job["attempt"] + 1 if auto else 0,
         parent_id=job_id,
@@ -1623,3 +1782,159 @@ def set_state(conn: sqlite3.Connection, key: str, value: str) -> None:
         (key, value),
     )
     conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Event feed (remote workers, QUEUER_REMOTE_PLAN.md 1B): what a host polls
+# ---------------------------------------------------------------------------
+
+EVENT_KINDS = ("final", "paused")
+DEFAULT_EVENTS_KEEP = 2000
+DEFAULT_EVENTS_MAX_AGE_DAYS = 60
+
+
+def get_epoch(conn: sqlite3.Connection) -> str:
+    """Random id created with this database; a host that sees it change knows the DB was reset."""
+    value = get_state(conn, "epoch")
+    if value is None:  # only a database without one writes; a read-only connection never gets here
+        _ensure_epoch(conn)
+        conn.commit()
+        value = get_state(conn, "epoch")
+    assert value is not None
+    return value
+
+
+MAX_PAYLOAD_BYTES = 256 * 1024  # an event payload / cached job snapshot above this is shrunk
+_KEEP_KEYS = ("id", "status", "channel", "exit_code", "job_dir", "root_id", "origin", "parent_id", "attempt")
+
+
+def limit_payload(payload: dict[str, Any], max_bytes: int = MAX_PAYLOAD_BYTES) -> dict[str, Any]:
+    """`payload` itself when its JSON fits `max_bytes`; else every long string cut to 2000 characters; else only the
+    identifying keys (`_KEEP_KEYS`) plus `truncated: true`. Keeps one huge job row from bloating the events table or
+    the host's snapshots."""
+    if len(json.dumps(payload)) <= max_bytes:
+        return payload
+    cut = {k: (v[:2000] + "..." if isinstance(v, str) and len(v) > 2000 else v) for k, v in payload.items()}
+    if len(json.dumps(cut)) <= max_bytes:
+        return {**cut, "truncated": True}
+    return {**{k: payload[k] for k in _KEEP_KEYS if k in payload}, "truncated": True}
+
+
+def add_event(
+    conn: sqlite3.Connection,
+    job_id: int,
+    kind: str,
+    payload: dict[str, Any],
+    *,
+    commit: bool = True,
+) -> int:
+    """Append an event (`final` or `paused`) whose `payload` is the job row at that moment.
+    Returns its seq."""
+    if kind not in EVENT_KINDS:
+        raise ValueError(f"event kind must be one of {', '.join(EVENT_KINDS)}")
+    cur = conn.execute(
+        "INSERT INTO events (job_id, kind, at, payload) VALUES (?, ?, ?, ?)",
+        (job_id, kind, _now(), json.dumps(limit_payload(payload))),
+    )
+    if commit:
+        conn.commit()
+    seq = cur.lastrowid
+    assert seq is not None
+    return seq
+
+
+def get_events(conn: sqlite3.Connection, after: int = 0, limit: int = 100) -> dict[str, Any]:
+    """Events with seq > `after`, oldest first, at most `limit` (1-1000), in the shape of
+    Appendix A: {epoch, earliest_seq, last_seq, events:[{seq, kind, at, telegram_sent, job}]}.
+    `earliest_seq` / `last_seq` are 0 when there are no events."""
+    limit = max(1, min(int(limit), 1000))
+    rows = conn.execute(
+        "SELECT seq, kind, at, payload FROM events WHERE seq > ? ORDER BY seq LIMIT ?", (after, limit)
+    ).fetchall()
+    bounds = conn.execute("SELECT MIN(seq) AS lo, MAX(seq) AS hi FROM events").fetchone()
+    events: list[dict[str, Any]] = []
+    for r in rows:
+        try:
+            payload = json.loads(r["payload"])
+        except (TypeError, ValueError):
+            payload = {}
+        telegram_sent = bool(payload.pop("telegram_sent", False)) if isinstance(payload, dict) else False
+        events.append({"seq": r["seq"], "kind": r["kind"], "at": r["at"], "telegram_sent": telegram_sent, "job": payload})
+    return {
+        "protocol": 1,
+        "epoch": get_epoch(conn),
+        "earliest_seq": bounds["lo"] or 0,
+        "last_seq": bounds["hi"] or 0,
+        "events": events,
+    }
+
+
+DEFAULT_REMOTE_KEEP_DAYS = 90
+
+
+def prune_remote(conn: sqlite3.Connection, max_age_days: int = DEFAULT_REMOTE_KEEP_DAYS) -> int:
+    """Host side: drop `remote_runs` and cached `remote_jobs` older than `max_age_days`. A run that still
+    waits for its auto-pull (--pull, queued, not pulled, attempts left) and the jobs a run points at stay."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=max_age_days)).isoformat()
+    n = conn.execute(
+        "DELETE FROM remote_runs WHERE updated_at < ? "
+        "AND NOT (pull = 1 AND pulled_path IS NULL AND pull_attempts < 3 AND state = 'queued')",
+        (cutoff,),
+    ).rowcount
+    n += conn.execute(
+        "DELETE FROM remote_jobs WHERE seen_at < ? AND NOT EXISTS "
+        "(SELECT 1 FROM remote_runs r WHERE r.host = remote_jobs.host AND r.remote_id = remote_jobs.remote_id)",
+        (cutoff,),
+    ).rowcount
+    conn.commit()
+    return n
+
+
+RUN_FILE_RE = re.compile(r"^([0-9a-f]{32})\.(json|files\.tar\.gz)$")
+RUN_FILE_GRACE_DAYS = 1
+
+
+def prune_run_files(conn: sqlite3.Connection, runs_dir: Path, max_age_days: int = DEFAULT_REMOTE_KEEP_DAYS) -> int:
+    """Host side: delete the saved arguments / payload tarballs in `runs/` that `--resume` can no longer need:
+    the run is queued (it has its worker job) or has no record, and the file is a day old; or the file is
+    older than `max_age_days` whatever the state. Files of a run still being sent are kept. Returns the count."""
+    if not runs_dir.is_dir():
+        return 0
+    now = time.time()
+    states = dict(conn.execute("SELECT run_key, state FROM remote_runs").fetchall())
+    n = 0
+    for entry in runs_dir.iterdir():
+        m = RUN_FILE_RE.match(entry.name)
+        if m is None or entry.is_symlink() or not entry.is_file():
+            continue
+        try:
+            age_days = (now - entry.stat().st_mtime) / 86400
+            state = states.get(m.group(1))
+            if age_days > max_age_days or (age_days > RUN_FILE_GRACE_DAYS and state in (None, "queued")):
+                entry.unlink()
+                n += 1
+        except OSError:
+            continue
+    return n
+
+
+def forget_remote_host(conn: sqlite3.Connection, name: str) -> None:
+    """Host side: remove every cached row of a worker (`qur hosts remove`)."""
+    for table, col in (("remote_hosts", "name"), ("remote_jobs", "host"), ("remote_runs", "host")):
+        conn.execute(f"DELETE FROM {table} WHERE {col} = ?", (name,))  # nosec B608 - table names are our own constants
+    conn.commit()
+
+
+def prune_events(
+    conn: sqlite3.Connection,
+    keep: int = DEFAULT_EVENTS_KEEP,
+    max_age_days: int = DEFAULT_EVENTS_MAX_AGE_DAYS,
+) -> int:
+    """Drop events older than `max_age_days`, then all but the newest `keep`. Returns how many went."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=max_age_days)).isoformat()
+    n = conn.execute("DELETE FROM events WHERE at < ?", (cutoff,)).rowcount
+    n += conn.execute(
+        "DELETE FROM events WHERE seq <= (SELECT seq FROM events ORDER BY seq DESC LIMIT 1 OFFSET ?)", (max(keep, 1),)
+    ).rowcount
+    conn.commit()
+    return n

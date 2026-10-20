@@ -1759,7 +1759,7 @@ async def wait_calls(bot: "FakeBot", method: str, n: int, timeout: float = 5.0) 
 
 def _press(update_id, job_id, qur_id="a3f9", chat_id=111, message_id=9, action="rq"):
     return {"update_id": update_id, "callback_query": {
-        "id": f"cb{update_id}", "data": f"{action}:{qur_id}:{job_id}",
+        "id": f"cb{update_id}", "data": f"{action}:{qur_id}:{job_id}", "from": {"id": chat_id},
         "message": {"message_id": message_id, "chat": {"id": chat_id}},
     }}
 

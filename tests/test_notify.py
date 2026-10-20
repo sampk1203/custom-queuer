@@ -107,50 +107,6 @@ def test_new_qur_id_is_short_hex_and_varies():
 
 
 # ---------------------------------------------------------------------------
-# export / import
-# ---------------------------------------------------------------------------
-
-def test_export_import_roundtrip_excludes_qur_id():
-    s = notify.export_string(CFG)
-    assert s.startswith("qurtg1:")
-    assert "a3f9" not in s
-    assert notify.parse_export_string(s) == (TOKEN, [111, 222])
-
-
-def test_parse_export_tolerates_surrounding_whitespace():
-    assert notify.parse_export_string("  " + notify.export_string(CFG) + "\n")[0] == TOKEN
-
-
-@pytest.mark.parametrize(
-    "bad",
-    [
-        "",
-        "hello",
-        "qurtg1:",
-        "qurtg1:!!!notbase64!!!",
-        "qurtg1:" + "e30",  # {} -> missing keys
-    ],
-)
-def test_parse_export_rejects_garbage(bad):
-    with pytest.raises(ValueError):
-        notify.parse_export_string(bad)
-
-
-def test_parse_export_rejects_bad_token_and_empty_chats():
-    import base64
-
-    def enc(obj):
-        return "qurtg1:" + base64.urlsafe_b64encode(json.dumps(obj).encode()).decode()
-
-    with pytest.raises(ValueError):
-        notify.parse_export_string(enc({"t": "nope", "c": [1]}))
-    with pytest.raises(ValueError):
-        notify.parse_export_string(enc({"t": TOKEN, "c": []}))
-    with pytest.raises(ValueError):
-        notify.parse_export_string(enc({"t": TOKEN, "c": ["a"]}))
-
-
-# ---------------------------------------------------------------------------
 # send
 # ---------------------------------------------------------------------------
 
@@ -556,37 +512,6 @@ def test_send_all_skips_bots_without_chats(monkeypatch):
     monkeypatch.setattr(notify, "_api", lambda token, method, params=None, timeout=0: calls.append(token))
     cfg = {"qur_id": "a", "bots": [{"token": TOKEN, "chat_ids": []}, {"token": TOKEN2, "chat_ids": [5]}]}
     assert notify.send_all(cfg, "hi") == [] and calls == [TOKEN2]
-
-
-def test_export_of_two_bots_roundtrips_and_one_bot_stays_the_old_format():
-    s = notify.export_string(_two())
-    assert s.startswith("qurtg2:") and "a3f9" not in s
-    assert notify.parse_export_bots(s) == [(TOKEN, [111]), (TOKEN2, [111, 222])]
-    one = notify.export_string(_two(), [_two()["bots"][1]])
-    assert one.startswith("qurtg1:")  # older qurs can still import a one-bot string
-    assert notify.parse_export_bots(one) == [(TOKEN2, [111, 222])]
-    assert notify.parse_export_bots(notify.export_string(CFG)) == [(TOKEN, [111, 222])]
-
-
-def test_export_skips_bots_with_no_chats_and_refuses_when_nothing_left():
-    cfg = {"qur_id": "a", "bots": [{"token": TOKEN, "chat_ids": []}, {"token": TOKEN2, "chat_ids": [5]}]}
-    assert notify.parse_export_bots(notify.export_string(cfg)) == [(TOKEN2, [5])]
-    with pytest.raises(ValueError):
-        notify.export_string({"qur_id": "a", "bots": [{"token": TOKEN, "chat_ids": []}]})
-
-
-def test_parse_export_string_refuses_multi_but_parse_export_bots_rejects_garbage():
-    import base64
-
-    def enc(obj):
-        return "qurtg2:" + base64.urlsafe_b64encode(json.dumps(obj).encode()).decode()
-
-    with pytest.raises(ValueError, match="several"):
-        notify.parse_export_string(notify.export_string(_two()))
-    for bad in (enc({"b": []}), enc({"b": [{"t": TOKEN, "c": []}]}), enc({"b": [{"t": "x", "c": [1]}]}),
-                enc({"b": [{"t": TOKEN, "c": [1]}, {"t": TOKEN, "c": [2]}]}), enc({"x": 1}), "qurtg2:!!!"):
-        with pytest.raises(ValueError):
-            notify.parse_export_bots(bad)
 
 
 def test_new_buttons_and_menu():
