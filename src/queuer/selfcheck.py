@@ -23,6 +23,8 @@ import stat
 
 # only used with fixed argv (loginctl / systemctl), never a shell
 import subprocess  # nosec B404
+import threading
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -84,7 +86,7 @@ def _run(argv: list[str]) -> tuple[int, str] | None:
     missing or hangs."""
     try:
         # fixed argv built from constants in this module, no shell involved
-        res = subprocess.run(argv, capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT_SECS, check=False)  # nosec B603 B607
+        res = subprocess.run(argv, capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT_SECS, check=False)  # nosec B603
     except (OSError, subprocess.TimeoutExpired):
         return None
     return res.returncode, (res.stdout or "").strip()
@@ -490,37 +492,68 @@ def check_schema() -> Check:
     return Check("schema", OK, f"version {version} (current)")
 
 
-def check_hosts() -> list[Check]:
+HOSTS_TIMEOUT_SECS = 120  # `qur doctor` waits at most this long for ALL workers together (they are checked in parallel)
+
+
+def _check_one_host(name: str, host: dict[str, Any]) -> list[Check]:
+    """The checks for ONE worker (runs in its own thread, see `check_hosts`)."""
+    from queuer import remote_cli
+
+    hard = {"ssh reachable", "remote qur found", "protocol compatible", "jobs dir writable"}
+    out: list[Check] = []
+    steps = remote_cli.check_host(name, {**host, "name": name})
+    for s in steps:
+        status = OK if s["ok"] else (FAIL if s["step"] in hard else WARN)
+        hint = "" if s["ok"] else f"qur hosts check {name}"
+        out.append(Check(f"host {name}: {s['step']}", status, str(s["detail"]), hint))
+    if not steps or not steps[0]["ok"]:
+        return out  # nothing to ask the daemon about while ssh itself fails
+    try:
+        reply = client.send("remote_check", host=name)
+    except (client.DaemonNotRunning, client.DaemonError) as e:
+        out.append(Check(f"host {name}: daemon ssh", WARN, f"cannot ask queuerd: {e}", "qur daemon start"))
+        return out
+    ok = bool(reply.get("ok"))
+    out.append(Check(
+        f"host {name}: daemon ssh", OK if ok else FAIL, str(reply.get("detail", "")),
+        "" if ok else "queuerd runs without a terminal or agent: the worker login must work without a passphrase or ssh-agent (qur hosts check --from-daemon)",
+    ))
+    return out
+
+
+def check_hosts(timeout: float | None = None) -> list[Check]:
     """F21 Phase 7: one block per enabled worker in hosts.json: ssh login, remote qur, protocol,
     daemon, jobs dir, linger and `setup` (the `qur hosts check` steps), plus whether the DAEMON
     (not this shell) can log in (`remote_check`). Nothing is changed; no worker configured: no checks.
-    A worker that cannot be reached is a FAIL (its jobs are not being watched), a soft step a WARN."""
-    from queuer import hostcfg, remote_cli  # not needed unless a worker is configured
+    A worker that cannot be reached is a FAIL (its jobs are not being watched), a soft step a WARN.
+    The workers are checked in parallel (one thread each), so a few dead ones cost one timeout, not
+    their sum; a worker still busy after `timeout` seconds (default HOSTS_TIMEOUT_SECS) is a FAIL."""
+    from queuer import hostcfg
 
     problem = hostcfg.check_permissions()
     if problem:  # hosts.json names ssh options and shell snippets qur executes: it must not be writable by others
         return [Check("hosts.json permissions", FAIL, problem, f"chmod 600 {hostcfg.default_path()}")]
     hosts = {n: h for n, h in hostcfg.load()["hosts"].items() if h["enabled"]}
-    hard = {"ssh reachable", "remote qur found", "protocol compatible", "jobs dir writable"}
-    out: list[Check] = []
-    for name, host in sorted(hosts.items()):
-        steps = remote_cli.check_host(name, {**host, "name": name})
-        for s in steps:
-            status = OK if s["ok"] else (FAIL if s["step"] in hard else WARN)
-            hint = "" if s["ok"] else f"qur hosts check {name}"
-            out.append(Check(f"host {name}: {s['step']}", status, str(s["detail"]), hint))
-        if not steps or not steps[0]["ok"]:
-            continue  # nothing to ask the daemon about while ssh itself fails
+    results: dict[str, list[Check]] = {}
+
+    def work(name: str, host: dict[str, Any]) -> None:
         try:
-            reply = client.send("remote_check", host=name)
-        except (client.DaemonNotRunning, client.DaemonError) as e:
-            out.append(Check(f"host {name}: daemon ssh", WARN, f"cannot ask queuerd: {e}", "qur daemon start"))
-            continue
-        ok = bool(reply.get("ok"))
-        out.append(Check(
-            f"host {name}: daemon ssh", OK if ok else FAIL, str(reply.get("detail", "")),
-            "" if ok else "queuerd runs without a terminal or agent: the worker login must work without a passphrase or ssh-agent (qur hosts check --from-daemon)",
-        ))
+            results[name] = _check_one_host(name, host)
+        except Exception as e:  # one broken worker must not hide the others
+            results[name] = [Check(f"host {name}: checks", FAIL, f"the check itself failed: {type(e).__name__}: {e}", f"qur hosts check {name}")]
+
+    threads = {name: threading.Thread(target=work, args=(name, host), daemon=True) for name, host in hosts.items()}
+    for t in threads.values():
+        t.start()
+    deadline = time.monotonic() + (HOSTS_TIMEOUT_SECS if timeout is None else timeout)
+    for t in threads.values():
+        t.join(max(0.0, deadline - time.monotonic()))
+    out: list[Check] = []
+    for name in sorted(hosts):
+        done = results.get(name)
+        if done is None:
+            done = [Check(f"host {name}: checks", FAIL, "no answer in time", f"qur hosts check {name}")]
+        out += done
     return out
 
 

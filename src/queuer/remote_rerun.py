@@ -478,7 +478,12 @@ def rerun_cmd(ctx: typer.Context) -> None:
             raw_cmd = job.get("raw_cmd")
             if not spec["cmd"] and not raw_cmd:
                 _fail(f"job {host_name}:{job_id} has no recorded command (old or malformed worker row); give one after `--`")
-            cmd = spec["cmd"] or json.loads(raw_cmd)
+            cmd = spec["cmd"]
+            if not cmd:
+                try:
+                    cmd = json.loads(str(raw_cmd))
+                except ValueError:
+                    _fail(f"job {host_name}:{job_id} has an unreadable recorded command; give one after `--`")
             carried, secret = carried_options(job, spec["forward"])
             if secret:
                 typer.echo(f"      not carried (secret-looking names): {', '.join(secret)}; give --env again if the job needs them", err=True)

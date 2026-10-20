@@ -19,6 +19,7 @@ import shlex
 import subprocess  # nosec B404 - fixed argv lists only, never a shell
 import tempfile
 import threading
+import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,7 @@ DEFAULT_TIMEOUT_SECS = 60
 REMOTE_PATH = 'PATH="$HOME/.local/bin:$PATH"'  # where `install.sh` puts qur; ssh sessions often lack it
 MAX_OUTPUT_BYTES = 16 * 1024 * 1024  # most stdout one ssh call may return before it is cut off (a runaway worker)
 MAX_STDERR_BYTES = 64 * 1024  # stderr is only ever shown as text: the rest is dropped
+STALL_SECS = 300  # an upload or download that moves no byte for this long is a hung worker (see `_run_capped`)
 # One denylist for every direction (send, pack, pull, rerun --replace). Two tiers:
 #  NEVER_*     keys: never travel, no switch overrides it (decision 12)
 #  SENSITIVE_* credentials and repo data: skipped unless the user passes --include-sensitive
@@ -37,7 +39,6 @@ NEVER_PATTERNS = ("*.pem", "*.key", "*.p12", "*.pfx")
 KEY_FILE_NAMES = ("id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", "id_ecdsa_sk", "id_ed25519_sk")  # and their .pub
 SENSITIVE_DIRS = (".aws", ".git", ".kube")
 SENSITIVE_PATTERNS = (".env", ".env.*", ".netrc", ".pgpass", ".npmrc", ".pypirc", "kubeconfig")
-SECRET_EXCLUDES = (*NEVER_DIRS, *KEY_FILE_NAMES, *NEVER_PATTERNS)  # tar --exclude form, for ssh_send_tar
 
 
 def _looks_like_key(path: Path) -> bool:
@@ -77,6 +78,10 @@ class RemoteTransportError(Exception):
 
 class HostUnreachable(RemoteTransportError):
     """ssh could not connect (network, DNS, refused, timeout) or the connection dropped."""
+
+
+class StalledTransfer(Exception):
+    """Internal: ssh moved no byte for STALL_SECS. Callers turn it into HostUnreachable."""
 
 
 class AuthFailed(RemoteTransportError):
@@ -146,6 +151,7 @@ def remote_command(argv: Sequence[str], *, setup: str | None = None, raw: bool =
 
 
 _CONTROL_RE = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]")
+_LINE_BREAK_RE = re.compile("[\t\n\r\x0b\x0c\x85\u2028\u2029]+")
 _CONTROL_LINE_RE = re.compile("[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]")
 
 
@@ -155,6 +161,8 @@ def safe_text(value: Any, *, multiline: bool = False) -> str:
     newlines and tabs. Use it on everything that came from a worker before it is printed; for rich output
     follow it with `rich.markup.escape`."""
     text = value if isinstance(value, str) else str(value)
+    if not multiline:
+        text = _LINE_BREAK_RE.sub(" ", text)  # "error\ntrace" must not become "errortrace"
     return (_CONTROL_RE if multiline else _CONTROL_LINE_RE).sub("", text)
 
 
@@ -229,10 +237,14 @@ def _run_capped(
     stdout: Any = subprocess.PIPE,
     timeout: float | None = None,
     max_out: int = MAX_OUTPUT_BYTES,
+    stall_secs: float | None = None,
 ) -> tuple[int, bytes, bytes]:
     """`subprocess.run(capture_output=True)` with a ceiling: stdout beyond `max_out` bytes kills the process and
     raises RemoteError (a hostile or runaway worker must not fill this machine's memory); stderr beyond
-    MAX_STDERR_BYTES is read and dropped. Raises subprocess.TimeoutExpired like subprocess.run."""
+    MAX_STDERR_BYTES is read and dropped. Raises subprocess.TimeoutExpired like subprocess.run.
+    `stall_secs`: kill the process and raise `StalledTransfer` when no byte moved for that long (output
+    received, a file written to `stdout`, or a file given as `stdin` read by ssh). A `stdin` file that is
+    fully read no longer counts: from then on the worker is working, and only `timeout` applies."""
     if input is not None:
         stdin = subprocess.PIPE
     elif stdin is None:
@@ -244,7 +256,7 @@ def _run_capped(
     def pump(stream: Any, buf: bytearray, cap: int, fatal: bool) -> None:
         try:
             while True:
-                chunk = stream.read(65536)
+                chunk = stream.read1(65536)  # whatever has arrived: read() would wait for 64 KB or EOF, hiding progress
                 if not chunk:
                     return
                 if len(buf) + len(chunk) > cap:
@@ -278,8 +290,50 @@ def _run_capped(
         threads.append(threading.Thread(target=feed, daemon=True))
     for t in threads:
         t.start()
+    def progress() -> tuple[int, int, int]:
+        """(bytes captured, size of the `stdout` file, offset in the `stdin` file); the offset is shared with ssh"""
+        written = sent = 0
+        try:
+            if hasattr(stdout, "fileno"):
+                written = os.fstat(stdout.fileno()).st_size
+        except (OSError, ValueError):
+            pass
+        try:
+            if hasattr(stdin, "fileno"):
+                sent = os.lseek(stdin.fileno(), 0, os.SEEK_CUR)
+        except (OSError, ValueError):
+            pass
+        return len(out) + len(err), written, sent
+
+    def sending() -> bool:
+        """True while a `stdin` file still has bytes ssh has not read"""
+        try:
+            return hasattr(stdin, "fileno") and os.lseek(stdin.fileno(), 0, os.SEEK_CUR) < os.fstat(stdin.fileno()).st_size
+        except (OSError, ValueError):
+            return False
+
     try:
-        proc.wait(timeout=timeout)
+        if stall_secs is None:
+            proc.wait(timeout=timeout)
+        else:
+            started = last_move = time.monotonic()
+            last = progress()
+            while True:
+                try:
+                    proc.wait(timeout=min(1.0, stall_secs))
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+                now = time.monotonic()
+                if timeout is not None and now - started > timeout:
+                    raise subprocess.TimeoutExpired(list(cmd), timeout)
+                cur = progress()
+                if cur != last:
+                    last, last_move = cur, now
+                elif now - last_move > stall_secs and (sending() or stdin is None or not hasattr(stdin, "fileno")):
+                    proc.kill()
+                    proc.wait()
+                    raise StalledTransfer(f"no data for {stall_secs:g}s")
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
@@ -344,48 +398,6 @@ def check_protocol(data: Any) -> None:
         )
 
 
-def ssh_send_tar(
-    host: dict[str, Any],
-    folder: Path,
-    argv: Sequence[str],
-    *,
-    exclude: Sequence[str] = (),
-    timeout: float | None = None,
-    use_setup: bool = False,
-) -> tuple[int, bytes, str]:
-    """`tar czf - -C folder . | ssh host qur <argv>`: send a folder as a tar.gz on the remote
-    command's stdin. Key files (`.ssh`, `id_*`, `*.pem`, `*.key`) are never included. Returns
-    (exit code, stdout, stderr) of the remote command; a failing local tar raises RemoteError."""
-    tar_cmd = ["tar", "czf", "-", *[f"--exclude={p}" for p in (*SECRET_EXCLUDES, *exclude)], "-C", str(folder), "."]
-    cmd = ssh_argv(host, argv, use_setup=use_setup)
-    try:
-        tar = subprocess.Popen(tar_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)  # nosec B603
-        try:
-            assert tar.stdout is not None
-            ssh = subprocess.Popen(  # nosec B603
-                cmd, stdin=tar.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            )
-        except BaseException:
-            tar.kill()
-            raise
-        tar.stdout.close()  # ssh owns the pipe now; tar gets SIGPIPE if ssh dies
-        try:
-            out, err = ssh.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            ssh.kill()
-            tar.kill()
-            raise HostUnreachable(f"sending to {host['ssh']} timed out") from None
-        tar_err = _text(tar.stderr.read() if tar.stderr else b"")
-        tar_code = tar.wait()
-    except FileNotFoundError as e:
-        raise HostUnreachable(f"cannot run {e.filename}") from None
-    stderr = _text(err)
-    classify(ssh.returncode, stderr)
-    if tar_code != 0 and ssh.returncode == 0:
-        raise RemoteError(tar_code, tar_err)
-    return ssh.returncode, out, stderr
-
-
 def ssh_recv_to_file(
     host: dict[str, Any],
     argv: Sequence[str],
@@ -394,6 +406,7 @@ def ssh_recv_to_file(
     timeout: float | None = None,
     use_setup: bool = False,
     validate: Callable[[Path], None] | None = None,
+    stall_secs: float | None = STALL_SECS,
 ) -> int:
     """Run a remote stream command (`qur remote pack ID`) and write its stdout to `dest.part`
     (0600), renamed to `dest` only on success. Returns the byte count; a failure removes the
@@ -406,7 +419,7 @@ def ssh_recv_to_file(
     cmd = ssh_argv(host, argv, use_setup=use_setup)
     try:
         with os.fdopen(fd, "wb") as f:
-            code, _, err = _run_capped(cmd, stdout=f, timeout=timeout)
+            code, _, err = _run_capped(cmd, stdout=f, timeout=timeout, stall_secs=stall_secs)
         stderr = _text(err)
         classify(code, stderr)
         if code != 0:
@@ -418,6 +431,8 @@ def ssh_recv_to_file(
         return size
     except subprocess.TimeoutExpired:
         raise HostUnreachable(f"download from {host['ssh']} timed out") from None
+    except StalledTransfer as e:
+        raise HostUnreachable(f"download from {host['ssh']} stalled ({e}); the worker may be hung") from None
     except FileNotFoundError:
         raise HostUnreachable("the `ssh` command is not installed on this machine") from None
     finally:
@@ -444,15 +459,18 @@ def ssh_send_file(
     *,
     timeout: float | None = None,
     use_setup: bool = False,
+    stall_secs: float | None = STALL_SECS,
 ) -> tuple[int, bytes, str]:
     """Run `qur <argv>` on the worker with the file `path` as its stdin (a payload built by the
     caller, streamed, never held in memory). Returns (exit code, stdout, stderr)."""
     cmd = ssh_argv(host, argv, use_setup=use_setup)
     try:
         with open(path, "rb") as f:
-            code, out, err = _run_capped(cmd, stdin=f, timeout=timeout)
+            code, out, err = _run_capped(cmd, stdin=f, timeout=timeout, stall_secs=stall_secs)
     except subprocess.TimeoutExpired:
         raise HostUnreachable(f"sending to {host['ssh']} timed out") from None
+    except StalledTransfer as e:
+        raise HostUnreachable(f"sending to {host['ssh']} stalled ({e}); the worker may be hung") from None
     except FileNotFoundError:
         raise HostUnreachable("the `ssh` command is not installed on this machine") from None
     stderr = _text(err)

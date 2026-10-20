@@ -75,7 +75,7 @@ class RemoteWatcher:
         self.conn.execute("INSERT OR IGNORE INTO remote_hosts (name) VALUES (?)", (name,))
         if fields:
             sets = ", ".join(f"{k} = ?" for k in fields)
-            self.conn.execute(f"UPDATE remote_hosts SET {sets} WHERE name = ?", (*fields.values(), name))  # nosec B608 - names are our own
+            self.conn.execute(f"UPDATE remote_hosts SET {sets} WHERE name = ?", (*fields.values(), name))  # nosec B608 - column names are our own, values are bound
         self.conn.commit()
 
     def _upsert_job(self, name: str, job: dict[str, Any]) -> None:

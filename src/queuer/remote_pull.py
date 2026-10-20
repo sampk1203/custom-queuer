@@ -237,7 +237,7 @@ def pull_cmd(
             info = info[0] if isinstance(info, list) and info else info
             if isinstance(info, dict) and info.get("status") in ("running", "queued", "stopped"):
                 typer.echo(f"warning: {host['name']}:{job_id} is {info['status']}; its folder may still change, so the tarball can be incomplete", err=True)
-        except Exception:  # only a courtesy: the pull itself reports real problems
+        except Exception:  # nosec B110 - only a courtesy: the pull itself reports real problems
             pass
     try:
         if file is not None:

@@ -331,7 +331,7 @@ _RUN_COLUMNS = ("state", "remote_dir", "remote_id", "parent_remote_id")
 def _update_run(conn: sqlite3.Connection, key: str, **fields: Any) -> None:
     assert set(fields) <= set(_RUN_COLUMNS)
     sets = ", ".join(f"{k} = ?" for k in fields)
-    conn.execute(f"UPDATE remote_runs SET {sets}, updated_at = ? WHERE run_key = ?", (*fields.values(), db._now(), key))  # nosec B608 - column names are our own constants
+    conn.execute(f"UPDATE remote_runs SET {sets}, updated_at = ? WHERE run_key = ?", (*fields.values(), db._now(), key))  # nosec B608 - column names are our own constants, values are bound
     conn.commit()
 
 

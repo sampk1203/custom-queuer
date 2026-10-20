@@ -144,3 +144,15 @@ def test_resume_does_not_duplicate(worker, tmp_path):
     r = runner.invoke(app, ["rerun", "--resume", key])
     assert r.exit_code == 0 and "already queued" in r.output
     assert len(_wj("history", "--json")) == 2
+
+
+# --- P6: a malformed recorded command is an error message, not a traceback -------------------------------------
+
+
+def test_rerun_with_an_unreadable_recorded_command_says_so(worker, monkeypatch, tmp_path):
+    from queuer import remote_rerun
+
+    monkeypatch.setattr(remote_rerun, "_show", lambda host, job_id: {"job_dir": str(tmp_path), "raw_cmd": "not json {"})
+    monkeypatch.setattr(remote_rerun, "folder_users", lambda host, job: [])
+    r = runner.invoke(app, ["rerun", "vm3:1"])
+    assert r.exit_code == 1 and "unreadable recorded command" in r.output and "Traceback" not in r.output

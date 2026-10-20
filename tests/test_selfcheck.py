@@ -996,3 +996,69 @@ def test_check_hosts_unreachable_is_fail_and_skips_the_daemon(monkeypatch):
     monkeypatch.setattr(client, "send", lambda *a, **k: pytest.fail("daemon must not be asked"))
     checks = selfcheck.check_hosts()
     assert [(c.name, c.status) for c in checks] == [("host vm3: ssh reachable", FAIL)]
+
+
+# --- P6-3: workers are checked in parallel, with an overall timeout ------------------------------------------
+
+
+def _hosts(monkeypatch, names):
+    from queuer import hostcfg
+
+    monkeypatch.setattr(hostcfg, "load", lambda path=None: {"version": 1, "hosts": {n: {"enabled": True} for n in names}})
+
+
+def test_check_hosts_runs_workers_in_parallel_and_keeps_alphabetical_order(monkeypatch):
+    import threading
+
+    from queuer import remote_cli
+
+    _hosts(monkeypatch, ["vm9", "vm1", "vm5"])
+    gate = threading.Barrier(3, timeout=5)  # only passes when all three checks are running at the same time
+
+    def slow(name, host, expect=()):
+        gate.wait()
+        return [{"step": "ssh reachable", "ok": False, "detail": "down"}]
+
+    monkeypatch.setattr(remote_cli, "check_host", slow)
+    checks = selfcheck.check_hosts()
+    assert [c.name for c in checks] == ["host vm1: ssh reachable", "host vm5: ssh reachable", "host vm9: ssh reachable"]
+    assert all(c.status == FAIL for c in checks)
+
+
+def test_check_hosts_gives_up_on_a_worker_that_does_not_answer_in_time(monkeypatch):
+    import threading
+
+    from queuer import remote_cli
+
+    _hosts(monkeypatch, ["dead", "ok"])
+    release = threading.Event()
+
+    def check(name, host, expect=()):
+        if name == "dead":
+            release.wait(10)
+        return [{"step": "ssh reachable", "ok": True, "detail": "fine"}]
+
+    monkeypatch.setattr(remote_cli, "check_host", check)
+    monkeypatch.setattr(client, "send", lambda cmd, **kw: {"ok": True, "detail": "ok"})
+    try:
+        checks = _by_name(selfcheck.check_hosts(timeout=0.5))
+    finally:
+        release.set()
+    assert checks["host dead: checks"].status == FAIL and "no answer in time" in checks["host dead: checks"].detail
+    assert checks["host ok: ssh reachable"].status == OK and checks["host ok: daemon ssh"].status == OK
+
+
+def test_check_hosts_one_crashing_check_does_not_hide_the_other_workers(monkeypatch):
+    from queuer import remote_cli
+
+    _hosts(monkeypatch, ["bad", "good"])
+
+    def check(name, host, expect=()):
+        if name == "bad":
+            raise ValueError("boom")
+        return [{"step": "ssh reachable", "ok": False, "detail": "down"}]
+
+    monkeypatch.setattr(remote_cli, "check_host", check)
+    checks = _by_name(selfcheck.check_hosts())
+    assert checks["host bad: checks"].status == FAIL and "ValueError: boom" in checks["host bad: checks"].detail
+    assert checks["host good: ssh reachable"].status == FAIL

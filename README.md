@@ -842,7 +842,7 @@ Setup, five steps:
 4. On the host: `qur hosts add vm3 --ssh vm3` (an alias from `~/.ssh/config`, or `[user@]host`; `ssh_options` can add `-i KEY`).
 5. `qur hosts check vm3 --expect lmp` (ssh, protocol, daemon, jobs dir, linger, your environment).
 
-The **daemon** (not your shell) runs the polling `ssh`, without a terminal or agent: the login must work without a passphrase or agent (`qur hosts check vm3 --from-daemon` proves it; `qur doctor` runs it too). Then:
+The **daemon** (not your shell) runs the polling `ssh`, without a terminal or agent: the login must work without a passphrase or agent (`qur hosts check vm3 --from-daemon` proves it; `qur doctor` runs it too, all workers in parallel, so a few dead ones cost one timeout, not the sum). `hosts.json` must be mode 600 (its `ssh_options` and `setup` run commands): qur refuses a file others can write, and `qur doctor` reports it. Then:
 
 ```
 qur run vm3 ./lammps-run -- lmp -in in.lammps     # send the folder, queue the command there
@@ -856,7 +856,7 @@ qur pull vm3:42                                   # the finished folder, as a .t
 
 **Files that live on the worker** (potentials, models, restart files) are not re-sent: `--require PATH` fails the run early if a path is missing, `--link NAME=PATH` links it into the job folder, `--worker-copy SRC=DEST` copies it there once.
 
-Limits: nothing is reported while the host is off (the next poll catches up from its cursor); alerts can lag by up to `poll_secs`; host and worker need compatible `protocol` numbers (`qur hosts check` shows it); the stats are measured on the worker; `--each` / `--array` are not available through `qur run`; `qur rerun` only adds or replaces files (never deletes or merges); `uv run --project` is not supported (use `--venv` or `--setup`). The sections below are the details.
+A transfer that moves no byte for 5 minutes (a hung worker) is stopped and reported as unreachable, so `qur run` and automatic pulls never block forever. Limits: nothing is reported while the host is off (the next poll catches up from its cursor); alerts can lag by up to `poll_secs`; host and worker need compatible `protocol` numbers (`qur hosts check` shows it); the stats are measured on the worker; `--each` / `--array` are not available through `qur run`; `qur rerun` only adds or replaces files (never deletes or merges); `uv run --project` is not supported (use `--venv` or `--setup`). The sections below are the details.
 
 ## Remote workers (host side)
 

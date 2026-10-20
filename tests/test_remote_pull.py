@@ -235,3 +235,49 @@ def test_ssh_output_beyond_the_cap_is_refused_and_stderr_is_trimmed():
         remote._run_capped(["sh", "-c", "head -c 3000000 /dev/zero"], max_out=1024 * 1024)
     code, out, err = remote._run_capped(["sh", "-c", "echo hi; head -c 200000 /dev/zero >&2"])
     assert code == 0 and out == b"hi\n" and len(err) <= remote.MAX_STDERR_BYTES
+
+
+# --- P6-6: a transfer that moves no byte is stopped ------------------------------------------------------
+
+
+def test_stalled_output_is_killed_but_a_slow_steady_stream_is_not():
+    with pytest.raises(remote.StalledTransfer):
+        remote._run_capped(["sh", "-c", "sleep 30"], stall_secs=1)
+    code, out, _ = remote._run_capped(["sh", "-c", "for i in 1 2 3; do echo x; sleep 0.6; done"], stall_secs=1)
+    assert code == 0 and out == b"x\nx\nx\n"
+
+
+def test_stall_timeout_does_not_replace_the_overall_timeout():
+    import subprocess
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        remote._run_capped(["sh", "-c", "while :; do echo x; sleep 0.2; done"], stall_secs=5, timeout=1)
+
+
+def test_upload_stall_only_counts_while_the_payload_is_still_being_read(tmp_path):
+    payload = tmp_path / "p.tar.gz"
+    payload.write_bytes(b"\0" * (1024 * 1024))  # more than a pipe holds: a consumer that never reads cannot take it
+    with open(payload, "rb") as f, pytest.raises(remote.StalledTransfer):
+        remote._run_capped(["sh", "-c", "sleep 30"], stdin=f, stall_secs=1)
+    small = tmp_path / "s"
+    small.write_bytes(b"hello")
+    with open(small, "rb") as f:  # fully read, then the worker "works" for longer than stall_secs: fine
+        code, out, _ = remote._run_capped(["sh", "-c", "cat >/dev/null; sleep 2; echo done"], stdin=f, stall_secs=1)
+    assert code == 0 and out == b"done\n"
+
+
+def test_download_and_upload_report_a_hung_worker_as_unreachable_and_leave_no_part_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(remote, "ssh_argv", lambda host, argv, **kw: ["sh", "-c", "sleep 30"])
+    host = {"ssh": "vm3"}
+    dest = tmp_path / "out" / "x.tar.gz"
+    with pytest.raises(remote.HostUnreachable, match="stalled"):
+        remote.ssh_recv_to_file(host, ["remote", "pack", "1"], dest, stall_secs=1)
+    assert not dest.exists() and list(dest.parent.iterdir()) == []
+    payload = tmp_path / "p"
+    payload.write_bytes(b"\0" * (1024 * 1024))
+    with pytest.raises(remote.HostUnreachable, match="stalled"):
+        remote.ssh_send_file(host, payload, ["remote", "receive"], stall_secs=1)
+
+
+def test_ssh_send_tar_is_gone():
+    assert not hasattr(remote, "ssh_send_tar") and not hasattr(remote, "SECRET_EXCLUDES")
