@@ -322,7 +322,7 @@ if [ "$SKIP_TESTS" = yes ]; then
     echo "==> Skipping the test suite (--skip-tests)"
 else
     echo "==> Running test suite"
-    if ! uv run pytest -v; then
+    if ! PYTHONPATH=. uv run pytest -v; then
         echo "" >&2
         echo "ERROR: tests failed. Install aborted -- the daemon has NOT been" >&2
         echo "touched. Fix the failing tests, then re-run this script (or --skip-tests to install anyway)." >&2
