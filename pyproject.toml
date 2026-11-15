@@ -9,7 +9,7 @@ dependencies = [
     "click>=8.5.0",
     "rich>=15.0.0",
     "segno>=1.6.0",
-    "typer>=0.27.0",
+    "typer>=0.29.1",
 ]
 
 [project.scripts]
