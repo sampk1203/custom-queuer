@@ -20,5 +20,5 @@ segno==1.6.6
     # via queuer
 shellingham==1.5.4
     # via typer
-typer==0.27.3
+typer==0.29.1
     # via queuer
